@@ -49,6 +49,9 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }
 web-sys = { version = "0.3", features = ['Document', 'HtmlCollection', 'HtmlCanvasElement', 'Window'], optional = true }
 web-time = "1.1"
+# WebGPU checks more than wgpu does natively, the shaders are handed over as WGSL text with that check turned off (see the wgpu backend)
+wgpu = { version = "29", optional = true, default-features = false, features = ["wgsl"] }
+naga = { version = "29", optional = true, features = ["wgsl-out"] }
 
 [dev-dependencies]
 rand = "0.7"
@@ -68,6 +71,11 @@ glutin = { version = "0.32", default-features = false, features = ["egl"] }
 [[example]]
 name = "triangle"
 path = "examples/triangle/src/main.rs"
+
+[[example]]
+name = "wgpu_window"
+path = "examples/wgpu_window/src/main.rs"
+required-features = ["wgpu"]
 
 [[example]]
 name = "triangle_core"

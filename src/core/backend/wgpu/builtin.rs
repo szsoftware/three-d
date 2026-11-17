@@ -18,6 +18,8 @@ pub(super) enum Kind {
     DepthToColor { multisampled: bool },
     /// Writes the depth into a depth target.
     DepthToDepth { multisampled: bool },
+    /// Writes the color upside down and opaque, for a surface.
+    Present,
 }
 
 #[derive(Default)]
@@ -60,6 +62,13 @@ fn fragment(kind: Kind) -> String {
         ivec3 offset = ivec3(i & 1, (i >> 1) & 1, i >> 2);
         color += 0.125 * texelFetch(sampler3D(source_t, source_s), min(texel + offset, last), 0);
     }",
+        ),
+        Kind::Present => (
+            "texture2D",
+            "
+    ivec2 texel = ivec2(gl_FragCoord.xy);
+    texel.y = textureSize(sampler2D(source_t, source_s), 0).y - 1 - texel.y;
+    color = vec4(texelFetch(sampler2D(source_t, source_s), texel, 0).rgb, 1.0);",
         ),
         Kind::DepthToColor {
             multisampled: false,
@@ -123,14 +132,11 @@ layout(set = 0, binding = 0) uniform Uniforms { vec4 color; } uniforms;
 }
 
 impl WgpuBackend {
-    fn shader_module(&self, stage: glsl::Stage, source: &str) -> w::ShaderModule {
+    fn builtin_module(&self, stage: glsl::Stage, source: &str) -> w::ShaderModule {
         let (module, _) = parse_shader(stage, source).unwrap_or_else(|error| {
             panic!("a builtin shader of the wgpu backend is invalid: {error}")
         });
-        self.device.create_shader_module(w::ShaderModuleDescriptor {
-            label: None,
-            source: w::ShaderSource::Naga(std::borrow::Cow::Owned(module)),
-        })
+        self.shader_module(module)
     }
 
     ///
@@ -153,7 +159,7 @@ impl WgpuBackend {
             .entry((kind, format))
             .or_insert_with(|| {
                 let (sample_type, view_dimension, multisampled) = match kind {
-                    Kind::Mip2D => (
+                    Kind::Mip2D | Kind::Present => (
                         w::TextureSampleType::Float { filterable: false },
                         w::TextureViewDimension::D2,
                         false,
@@ -185,8 +191,8 @@ impl WgpuBackend {
                             count: None,
                         }],
                     });
-                let vertex = self.shader_module(glsl::Stage::Vertex, VERTEX);
-                let module = self.shader_module(glsl::Stage::Fragment, &fragment(kind));
+                let vertex = self.builtin_module(glsl::Stage::Vertex, VERTEX);
+                let module = self.builtin_module(glsl::Stage::Fragment, &fragment(kind));
                 let color_target = Some(w::ColorTargetState {
                     format,
                     blend: None,
@@ -327,9 +333,9 @@ impl WgpuBackend {
                             count: None,
                         }],
                     });
-                let vertex = self.shader_module(glsl::Stage::Vertex, VERTEX);
+                let vertex = self.builtin_module(glsl::Stage::Vertex, VERTEX);
                 let module =
-                    self.shader_module(glsl::Stage::Fragment, &clear_shader(formats.colors.len()));
+                    self.builtin_module(glsl::Stage::Fragment, &clear_shader(formats.colors.len()));
                 let pipeline_layout =
                     self.device
                         .create_pipeline_layout(&w::PipelineLayoutDescriptor {

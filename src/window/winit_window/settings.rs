@@ -12,6 +12,21 @@ pub enum HardwareAcceleration {
     Off,
 }
 
+///
+/// Which backend a window uses for rendering, see [Window::new_with_backend](super::Window::new_with_backend).
+///
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BackendPreference {
+    /// wgpu (Vulkan, Metal, DirectX 12 or WebGPU) if the crate is compiled with the `wgpu` feature and the system has a suitable adapter,
+    /// otherwise OpenGL/WebGL. A software adapter is only suitable if [HardwareAcceleration::Off] is asked for.
+    #[default]
+    Auto,
+    /// OpenGL or WebGL, the same as without a preference.
+    Gl,
+    /// wgpu, it is an error if the crate is not compiled with the `wgpu` feature or the system has no adapter.
+    Wgpu,
+}
+
 /// Settings controlling the behavior of the surface on where to draw, to present it on the screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -23,12 +38,13 @@ pub struct SurfaceSettings {
     /// Sets the number of bits in the depth buffer.
     /// A value of 0 means no depth buffer.
     /// The default value is 24.
-    /// On web, this can only be off (0) or on (>0).
+    /// On web and with the wgpu backend, this can only be off (0) or on (>0).
     pub depth_buffer: u8,
     /// Sets the number of bits in the stencil buffer.
     /// A value of 0 means no stencil buffer.
     /// The default value is 0.
     /// On web, this can only be off (0) or on (>0).
+    /// The wgpu backend has no stencil buffer.
     pub stencil_buffer: u8,
     /// Set the level of the multisampling anti-aliasing (MSAA).
     /// Must be a power-of-two. Higher = more smooth edges.
@@ -36,6 +52,7 @@ pub struct SurfaceSettings {
     /// The default value is 4.
     /// On web, this can only be off (0) or on (>0).
     /// The actual number of samples depends on browser settings.
+    /// With the wgpu backend, this can only be off (0) or on (>0), which means 4 samples.
     pub multisamples: u8,
     /// Specify whether or not hardware acceleration is preferred, required, or
     /// off. The default is [HardwareAcceleration::Preferred].

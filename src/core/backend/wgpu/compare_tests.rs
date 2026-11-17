@@ -64,10 +64,9 @@ pub(super) fn compare_with_outliers(
         }
         eprintln!("skipped, no {what}: {error}");
     };
+    // All tests share one EGL display, which is initialized and terminated with the contexts
+    super::one_gpu_test_at_a_time();
     let expected = {
-        // All tests share one EGL display, which is initialized and terminated with the contexts, so only one test at a time uses OpenGL
-        static OPENGL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _one_at_a_time = OPENGL.lock().unwrap_or_else(|e| e.into_inner());
         match gl_context() {
             Ok((context, _keep_alive)) => scenario(&context),
             Err(error) => return skip("OpenGL context", error),

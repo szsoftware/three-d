@@ -1,0 +1,493 @@
+//!
+//! The screen of the wgpu backend.
+//!
+//! The screen is a set of textures like every other render target, so everything that works on a render target works on the screen
+//! with the same conventions, including reading from it. If the backend has a surface (the part of a window that is drawn to),
+//! [WgpuBackend::present] draws the color texture of the screen to it, upside down, since the first row of a surface is the top row.
+//!
+
+// Only the window module gives a context a screen
+#![cfg_attr(not(feature = "window"), allow(dead_code, unused_imports))]
+
+use super::*;
+
+///
+/// How the screen is set up.
+///
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScreenDesc {
+    /// The size in physical pixels.
+    pub width: u32,
+    pub height: u32,
+    /// Whether the screen has a depth buffer.
+    pub depth: bool,
+    /// Whether the screen is multisampled (4 samples, the only number every WebGPU implementation knows apart from 1).
+    pub multisample: bool,
+    /// Whether presenting waits for the display.
+    pub vsync: bool,
+}
+
+pub(super) struct Screen {
+    desc: ScreenDesc,
+    /// The color with one sample, which is presented and read from.
+    color: w::Texture,
+    multisample_color: Option<w::Texture>,
+    depth: Option<w::Texture>,
+    surface: Option<(w::Surface<'static>, w::SurfaceConfiguration)>,
+}
+
+impl Screen {
+    /// The color texture that is rendered into.
+    pub(super) fn color(&self) -> &w::Texture {
+        self.multisample_color.as_ref().unwrap_or(&self.color)
+    }
+
+    pub(super) fn depth(&self) -> Option<&w::Texture> {
+        self.depth.as_ref()
+    }
+}
+
+/// Which adapter is asked for, see [WgpuBackend::request].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AdapterPreference {
+    /// Only a hardware adapter.
+    Hardware,
+    /// Whatever there is.
+    Any,
+    /// The software adapter.
+    Software,
+}
+
+impl WgpuBackend {
+    ///
+    /// Asks for an adapter and a device and creates a backend with the device.
+    /// With a surface, the adapter is one that can draw to the surface.
+    ///
+    pub async fn request(
+        instance: &w::Instance,
+        preference: AdapterPreference,
+        surface: Option<&w::Surface<'static>>,
+    ) -> Result<(Self, w::Adapter), CoreError> {
+        let adapter = instance
+            .request_adapter(&w::RequestAdapterOptions {
+                power_preference: w::PowerPreference::default(),
+                force_fallback_adapter: preference == AdapterPreference::Software,
+                compatible_surface: surface,
+            })
+            .await
+            .map_err(|e| CoreError::ContextCreation(e.to_string()))?;
+        if preference == AdapterPreference::Hardware
+            && adapter.get_info().device_type == w::DeviceType::Cpu
+        {
+            return Err(CoreError::ContextCreation(
+                "there is no hardware accelerated wgpu adapter".to_string(),
+            ));
+        }
+        let (device, queue) = adapter
+            .request_device(&w::DeviceDescriptor {
+                label: Some("three-d"),
+                // Optional features are used when the adapter has them
+                required_features: adapter.features() & w::Features::FLOAT32_FILTERABLE,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| CoreError::ContextCreation(e.to_string()))?;
+        // The device belongs to this backend, so errors can be collected for Context::error_check instead of the default, which is to panic
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let sink = errors.clone();
+        device.on_uncaptured_error(Arc::new(move |error: w::Error| {
+            let mut errors = sink.lock().unwrap_or_else(|e| e.into_inner());
+            // An application that never checks for errors must not collect them forever
+            if errors.len() < MAX_ERRORS {
+                errors.push(error.to_string());
+            }
+        }));
+        let mut backend = Self::new(device, queue);
+        backend.errors = Some(errors);
+        Ok((backend, adapter))
+    }
+
+    ///
+    /// Gives the backend a screen that is presented on the given surface. The adapter is the one the backend was created with.
+    ///
+    pub fn set_surface(
+        &self,
+        surface: w::Surface<'static>,
+        adapter: &w::Adapter,
+        desc: ScreenDesc,
+    ) -> Result<(), CoreError> {
+        let capabilities = surface.get_capabilities(adapter);
+        let format = *capabilities.formats.first().ok_or_else(|| {
+            CoreError::ContextCreation("the wgpu adapter cannot draw to the window".to_string())
+        })?;
+        // The shaders of three-d encode the colors themselves, as for the default framebuffer of OpenGL,
+        // so the surface is written to through a view without sRGB encoding
+        let view_format = format.remove_srgb_suffix();
+        let configuration = w::SurfaceConfiguration {
+            usage: w::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: desc.width.max(1),
+            height: desc.height.max(1),
+            present_mode: present_mode(desc.vsync),
+            desired_maximum_frame_latency: 2,
+            alpha_mode: if capabilities
+                .alpha_modes
+                .contains(&w::CompositeAlphaMode::Opaque)
+            {
+                w::CompositeAlphaMode::Opaque
+            } else {
+                w::CompositeAlphaMode::Auto
+            },
+            view_formats: if view_format == format {
+                Vec::new()
+            } else {
+                vec![view_format]
+            },
+        };
+        surface.configure(&self.device, &configuration);
+        self.set_screen(desc);
+        self.lock().screen.as_mut().unwrap().surface = Some((surface, configuration));
+        Ok(())
+    }
+
+    ///
+    /// Creates the textures of the screen. Keeps the surface if there is one, but does not change its size, see [WgpuBackend::resize_screen].
+    ///
+    pub fn set_screen(&self, desc: ScreenDesc) {
+        let texture = |format, multisample: bool| {
+            self.device.create_texture(&w::TextureDescriptor {
+                label: Some("three-d screen"),
+                size: w::Extent3d {
+                    width: desc.width.max(1),
+                    height: desc.height.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: if multisample { 4 } else { 1 },
+                dimension: w::TextureDimension::D2,
+                format,
+                usage: w::TextureUsages::TEXTURE_BINDING
+                    | w::TextureUsages::COPY_SRC
+                    | w::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            })
+        };
+        let state = &mut *self.lock();
+        // Recorded commands may still render to the old textures
+        self.flush(state);
+        let surface = state.screen.take().and_then(|screen| screen.surface);
+        state.screen = Some(Screen {
+            desc,
+            color: texture(w::TextureFormat::Rgba8Unorm, false),
+            multisample_color: desc
+                .multisample
+                .then(|| texture(w::TextureFormat::Rgba8Unorm, true)),
+            depth: desc
+                .depth
+                .then(|| texture(w::TextureFormat::Depth32Float, desc.multisample)),
+            surface,
+        });
+    }
+
+    ///
+    /// Changes the size of the screen and its surface.
+    ///
+    pub fn resize_screen(&self, width: u32, height: u32) {
+        let desc = {
+            let state = &mut *self.lock();
+            let screen = state.screen.as_mut().expect(NO_SCREEN);
+            if (screen.desc.width, screen.desc.height) == (width, height) {
+                return;
+            }
+            if let Some((surface, configuration)) = &mut screen.surface {
+                configuration.width = width.max(1);
+                configuration.height = height.max(1);
+                surface.configure(&self.device, configuration);
+            }
+            ScreenDesc {
+                width,
+                height,
+                ..screen.desc
+            }
+        };
+        self.set_screen(desc);
+    }
+
+    ///
+    /// Changes whether presenting waits for the display.
+    ///
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub fn set_vsync(&self, vsync: bool) {
+        let state = &mut *self.lock();
+        let screen = state.screen.as_mut().expect(NO_SCREEN);
+        screen.desc.vsync = vsync;
+        if let Some((surface, configuration)) = &mut screen.surface {
+            configuration.present_mode = present_mode(vsync);
+            surface.configure(&self.device, configuration);
+        }
+    }
+
+    ///
+    /// Shows what was rendered to the screen on the surface. Without a surface, only submits what is recorded.
+    /// The frame is left out if the surface has to be set up again, for example after the window changed its size.
+    ///
+    pub fn present(&self) -> Result<(), CoreError> {
+        let state = &mut *self.lock();
+        let screen = state.screen.as_ref().expect(NO_SCREEN);
+        let Some((surface, configuration)) = &screen.surface else {
+            self.flush(state);
+            return Ok(());
+        };
+        let frame = match surface.get_current_texture() {
+            w::CurrentSurfaceTexture::Success(frame)
+            | w::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            w::CurrentSurfaceTexture::Outdated | w::CurrentSurfaceTexture::Lost => {
+                surface.configure(&self.device, configuration);
+                self.flush(state);
+                return Ok(());
+            }
+            w::CurrentSurfaceTexture::Timeout | w::CurrentSurfaceTexture::Occluded => {
+                self.flush(state);
+                return Ok(());
+            }
+            w::CurrentSurfaceTexture::Validation => {
+                return Err(CoreError::ContextError(
+                    "the surface of the window is invalid".to_string(),
+                ));
+            }
+        };
+        let format = configuration.format.remove_srgb_suffix();
+        let destination = frame.texture.create_view(&w::TextureViewDescriptor {
+            format: Some(format),
+            ..Default::default()
+        });
+        self.present_to(state, &destination, format);
+        self.flush(state);
+        frame.present();
+        Ok(())
+    }
+
+    ///
+    /// Records the pass that draws the color of the screen to the given view the way a surface expects it, with the top row first.
+    ///
+    pub(super) fn present_to(
+        &self,
+        state: &mut State,
+        destination: &w::TextureView,
+        format: w::TextureFormat,
+    ) {
+        let screen = state.screen.as_ref().expect(NO_SCREEN);
+        let color = Slice {
+            texture: screen.color.clone(),
+            mip_level: 0,
+            layer: 0,
+        };
+        if let Some(multisample_color) = &screen.multisample_color {
+            let multisample_color = Slice {
+                texture: multisample_color.clone(),
+                mip_level: 0,
+                layer: 0,
+            };
+            self.resolve_color(state, &multisample_color, &color);
+        }
+        self.builtin_pass(
+            state,
+            builtin::Kind::Present,
+            &color.view(),
+            destination,
+            format,
+            None,
+        );
+    }
+}
+
+fn present_mode(vsync: bool) -> w::PresentMode {
+    if vsync {
+        w::PresentMode::AutoVsync
+    } else {
+        w::PresentMode::AutoNoVsync
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::renderer::*;
+
+    const WIDTH: u32 = 40;
+    const HEIGHT: u32 = 24;
+
+    /// A context with a screen but without a surface.
+    fn context(multisample: bool) -> Option<Context> {
+        let context = match Context::new_headless_wgpu() {
+            Ok(context) => context,
+            Err(error) if std::env::var("THREE_D_REQUIRE_WGPU").is_ok() => {
+                panic!("no wgpu adapter: {error}")
+            }
+            Err(error) => {
+                eprintln!("skipped, no wgpu adapter: {error}");
+                return None;
+            }
+        };
+        context.wgpu_backend().set_screen(ScreenDesc {
+            width: WIDTH,
+            height: HEIGHT,
+            depth: true,
+            multisample,
+            vsync: true,
+        });
+        Some(context)
+    }
+
+    /// Two spheres, the one in front is not symmetric in the image, so a flipped image is noticed.
+    fn render(context: &Context, target: &RenderTarget, width: u32, height: u32) {
+        let camera = Camera::new_perspective(
+            Viewport::new_at_origo(width, height),
+            vec3(0.0, 0.0, 5.0),
+            vec3(0.0, 0.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+            degrees(45.0),
+            0.1,
+            10.0,
+        );
+        let sphere = |color, position| {
+            let mut sphere = Gm::new(
+                Mesh::new(context, &CpuMesh::sphere(16)),
+                ColorMaterial {
+                    color,
+                    ..Default::default()
+                },
+            );
+            sphere.set_transformation(Mat4::from_translation(position));
+            sphere
+        };
+        target
+            .clear(ClearState::color_and_depth(0.2, 0.4, 0.6, 1.0, 1.0))
+            .render(
+                &camera,
+                [
+                    &sphere(Srgba::RED, vec3(0.5, 0.8, 1.0)),
+                    &sphere(Srgba::GREEN, vec3(0.0, 0.0, 0.0)),
+                ],
+                &[],
+            );
+    }
+
+    fn render_to_texture(context: &Context) -> (Vec<[u8; 4]>, Vec<f32>) {
+        let color = Texture2D::new_empty::<[u8; 4]>(
+            context,
+            WIDTH,
+            HEIGHT,
+            Interpolation::Nearest,
+            Interpolation::Nearest,
+            None,
+            Wrapping::ClampToEdge,
+            Wrapping::ClampToEdge,
+        );
+        let depth = DepthTexture2D::new::<f32>(
+            context,
+            WIDTH,
+            HEIGHT,
+            Wrapping::ClampToEdge,
+            Wrapping::ClampToEdge,
+        );
+        let target = RenderTarget::new(color.as_color_target(None), depth.as_depth_target());
+        render(context, &target, WIDTH, HEIGHT);
+        (target.read_color(), target.read_depth())
+    }
+
+    #[test]
+    fn screen_is_a_render_target() {
+        let Some(context) = context(false) else {
+            return;
+        };
+        let screen = RenderTarget::screen(&context, WIDTH, HEIGHT);
+        render(&context, &screen, WIDTH, HEIGHT);
+        let (color, depth) = render_to_texture(&context);
+        assert_eq!(screen.read_color::<[u8; 4]>(), color);
+        assert_eq!(screen.read_depth(), depth);
+        assert!(color.contains(&[255, 0, 0, 255]) && color.contains(&[0, 255, 0, 255]));
+        context.error_check().unwrap();
+    }
+
+    #[test]
+    fn multisampled_screen() {
+        let Some(context) = context(true) else {
+            return;
+        };
+        let screen = RenderTarget::screen(&context, WIDTH, HEIGHT);
+        render(&context, &screen, WIDTH, HEIGHT);
+        let actual = screen.read_color::<[u8; 4]>();
+        let (expected, _) = render_to_texture(&context);
+        // The edges of the spheres are smooth, everything else is the same
+        let different = actual.iter().zip(&expected).filter(|(a, e)| a != e).count();
+        assert!(different > 0, "the screen is not multisampled");
+        assert!(different < actual.len() / 4, "{different} pixels differ");
+        assert!(actual.contains(&[255, 0, 0, 255]) && actual.contains(&[0, 255, 0, 255]));
+        // The depth of a pixel is the depth of one of its samples
+        let depth = screen.read_depth();
+        assert_eq!(depth[0], 1.0);
+        assert!(depth[(HEIGHT / 2 * WIDTH + WIDTH / 2) as usize] < 1.0);
+        context.error_check().unwrap();
+    }
+
+    #[test]
+    fn present_draws_the_top_row_first() {
+        for multisample in [false, true] {
+            let Some(context) = context(multisample) else {
+                return;
+            };
+            let screen = RenderTarget::screen(&context, WIDTH, HEIGHT);
+            render(&context, &screen, WIDTH, HEIGHT);
+            let expected = screen.read_color::<[u8; 4]>();
+            let backend = context.wgpu_backend();
+            let presented = {
+                let state = &mut *backend.lock();
+                // What a surface would get, in a format with another order of the channels
+                let format = w::TextureFormat::Bgra8Unorm;
+                let surface = backend.temporary_texture(format, WIDTH, HEIGHT);
+                backend.present_to(state, &surface.view(), format);
+                let rect = ScissorBox::new_at_origo(WIDTH, HEIGHT);
+                backend.read_texture(state, &surface, rect, 4)
+            };
+            // The first row of a surface is the top row, which is also the first row that is read from a render target
+            for y in 0..HEIGHT {
+                for x in 0..WIDTH {
+                    let [r, g, b, _] = expected[(y * WIDTH + x) as usize];
+                    let index = ((y * WIDTH + x) * 4) as usize;
+                    assert_eq!(presented[index..index + 4], [b, g, r, 255], "at {x}, {y}");
+                }
+            }
+            // Without a surface, presenting only submits
+            backend.present().unwrap();
+            context.error_check().unwrap();
+        }
+    }
+
+    #[test]
+    fn screen_changes_its_size() {
+        let Some(context) = context(true) else {
+            return;
+        };
+        let backend = context.wgpu_backend();
+        backend.resize_screen(WIDTH * 2, HEIGHT + 3);
+        let screen = RenderTarget::screen(&context, WIDTH * 2, HEIGHT + 3);
+        render(&context, &screen, WIDTH * 2, HEIGHT + 3);
+        let color = screen.read_color::<[u8; 4]>();
+        assert_eq!(color.len() as u32, WIDTH * 2 * (HEIGHT + 3));
+        assert!(color.contains(&[255, 0, 0, 255]));
+        // A window that is minimized has no size
+        backend.resize_screen(0, 0);
+        backend.present().unwrap();
+        context.error_check().unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "the context has no screen")]
+    fn context_without_window_has_no_screen() {
+        let Ok(context) = Context::new_headless_wgpu() else {
+            panic!("the context has no screen (skipped, no wgpu adapter)");
+        };
+        RenderTarget::screen(&context, WIDTH, HEIGHT).clear(ClearState::color(0.0, 0.0, 0.0, 1.0));
+    }
+}

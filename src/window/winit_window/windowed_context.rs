@@ -4,6 +4,86 @@ use crate::WindowError;
 use std::sync::Arc;
 use winit::window::Window;
 
+///
+/// Creates a context that uses the wgpu backend and has a screen which is presented on the given window or canvas.
+///
+#[cfg(feature = "wgpu")]
+mod wgpu_context {
+    use super::*;
+    use crate::core::backend::{
+        wgpu::{AdapterPreference, ScreenDesc, WgpuBackend},
+        Backend,
+    };
+    use crate::{BackendPreference, CoreError, HardwareAcceleration};
+
+    fn error(error: impl std::fmt::Display) -> WindowError {
+        WindowError::ThreeDError(CoreError::ContextCreation(error.to_string()))
+    }
+
+    ///
+    /// The surface is created by the given function, after it is known that there is an adapter and a device.
+    /// In a browser, a canvas that was once used for WebGPU cannot be used for WebGL anymore.
+    ///
+    pub(super) async fn new(
+        instance: ::wgpu::Instance,
+        create_surface: impl FnOnce(&::wgpu::Instance) -> Result<::wgpu::Surface<'static>, WindowError>,
+        (width, height): (u32, u32),
+        settings: SurfaceSettings,
+        preference: BackendPreference,
+    ) -> Result<Context, WindowError> {
+        let adapter_preference = match settings.hardware_acceleration {
+            HardwareAcceleration::Off => AdapterPreference::Software,
+            HardwareAcceleration::Required => AdapterPreference::Hardware,
+            // With the choice between the backends, OpenGL on hardware is better than wgpu in software
+            HardwareAcceleration::Preferred if preference == BackendPreference::Auto => {
+                AdapterPreference::Hardware
+            }
+            HardwareAcceleration::Preferred => AdapterPreference::Any,
+        };
+        // In a browser the adapter is asked for before the surface exists, see above
+        #[cfg(not(target_arch = "wasm32"))]
+        let (surface, (backend, adapter)) = {
+            let surface = create_surface(&instance)?;
+            let backend =
+                WgpuBackend::request(&instance, adapter_preference, Some(&surface)).await?;
+            (surface, backend)
+        };
+        #[cfg(target_arch = "wasm32")]
+        let (surface, (backend, adapter)) = {
+            let backend = WgpuBackend::request(&instance, adapter_preference, None).await?;
+            (create_surface(&instance)?, backend)
+        };
+        backend.set_surface(
+            surface,
+            &adapter,
+            ScreenDesc {
+                width,
+                height,
+                depth: settings.depth_buffer > 0,
+                multisample: settings.multisamples > 0,
+                vsync: settings.vsync,
+            },
+        )?;
+        Ok(Context::from_backend(Backend::Wgpu(Box::new(backend))))
+    }
+
+    pub(super) fn surface_error(e: ::wgpu::CreateSurfaceError) -> WindowError {
+        error(e)
+    }
+}
+
+#[cfg(not(feature = "wgpu"))]
+mod wgpu_context {
+    use super::*;
+
+    pub(super) fn not_compiled() -> WindowError {
+        WindowError::ThreeDError(crate::CoreError::ContextCreation(
+            "the wgpu backend is asked for, but the crate is not compiled with the `wgpu` feature"
+                .to_string(),
+        ))
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 mod inner {
     use crate::HardwareAcceleration;
@@ -83,10 +163,77 @@ mod inner {
             })
         }
 
+        ///
+        /// Creates a new context from a [winit] window which uses the preferred backend, see [BackendPreference](crate::BackendPreference).
+        /// Asynchronous, because a browser cannot wait for WebGPU in any other way.
+        ///
+        pub async fn from_winit_window_async(
+            window: &Window,
+            settings: SurfaceSettings,
+            preference: crate::BackendPreference,
+        ) -> Result<Self, WindowError> {
+            let canvas = window.canvas().ok_or(WindowError::CanvasMissing)?;
+            Self::from_canvas_async(canvas, settings, preference).await
+        }
+
+        ///
+        /// Creates a new context from a canvas which uses the preferred backend, see [BackendPreference](crate::BackendPreference).
+        /// With [BackendPreference::Auto](crate::BackendPreference::Auto), WebGPU is used if the browser supports it and WebGL2 otherwise.
+        ///
+        pub async fn from_canvas_async(
+            canvas: HtmlCanvasElement,
+            settings: SurfaceSettings,
+            preference: crate::BackendPreference,
+        ) -> Result<Self, WindowError> {
+            use crate::BackendPreference;
+            if preference == BackendPreference::Gl {
+                return Self::from_canvas(canvas, settings);
+            }
+            #[cfg(feature = "wgpu")]
+            {
+                let instance =
+                    ::wgpu::Instance::new(::wgpu::InstanceDescriptor::new_without_display_handle());
+                let target = canvas.clone();
+                let context = wgpu_context::new(
+                    instance,
+                    |instance| {
+                        instance
+                            .create_surface(::wgpu::SurfaceTarget::Canvas(target))
+                            .map_err(wgpu_context::surface_error)
+                    },
+                    (canvas.width(), canvas.height()),
+                    settings,
+                    preference,
+                )
+                .await;
+                match context {
+                    Ok(context) => Ok(Self { context, canvas }),
+                    Err(_) if preference == BackendPreference::Auto => {
+                        Self::from_canvas(canvas, settings)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            #[cfg(not(feature = "wgpu"))]
+            {
+                if preference == BackendPreference::Auto {
+                    Self::from_canvas(canvas, settings)
+                } else {
+                    Err(wgpu_context::not_compiled())
+                }
+            }
+        }
+
         /// Resizes the context
         pub fn resize(&self, physical_size: winit::dpi::PhysicalSize<u32>) {
             self.canvas.set_width(physical_size.width as u32);
             self.canvas.set_height(physical_size.height as u32);
+            #[cfg(feature = "wgpu")]
+            if self.context.as_wgpu().is_some() {
+                self.context
+                    .wgpu_backend()
+                    .resize_screen(physical_size.width, physical_size.height);
+            }
         }
 
         /// Make this context current. Needed when using multiple windows (contexts) on native.
@@ -96,6 +243,10 @@ mod inner {
 
         /// Swap buffers - should always be called after rendering.
         pub fn swap_buffers(&self) -> Result<(), WindowError> {
+            #[cfg(feature = "wgpu")]
+            if self.context.as_wgpu().is_some() {
+                self.context.wgpu_backend().present()?;
+            }
             Ok(())
         }
     }
@@ -111,8 +262,11 @@ mod inner {
     ///
     pub struct WindowedContext {
         pub(super) context: Context,
-        surface: Surface<WindowSurface>,
-        glutin_context: glutin::context::PossiblyCurrentContext,
+        /// The OpenGL surface and context, `None` with the wgpu backend, which keeps its surface itself.
+        gl: Option<(
+            Surface<WindowSurface>,
+            glutin::context::PossiblyCurrentContext,
+        )>,
     }
 
     impl WindowedContext {
@@ -213,38 +367,130 @@ mod inner {
                         gl_display.get_proc_address(&s)
                     })
                 }))?,
-                glutin_context: gl_context,
-                surface: gl_surface,
+                gl: Some((gl_surface, gl_context)),
             })
+        }
+
+        ///
+        /// Creates a new windowed context from a [winit](https://crates.io/crates/winit) window which uses the preferred backend,
+        /// see [BackendPreference](crate::BackendPreference). The window must not be dropped before the context.
+        ///
+        pub fn from_winit_window_with_backend(
+            window: &Window,
+            settings: SurfaceSettings,
+            preference: crate::BackendPreference,
+        ) -> Result<Self, WindowError> {
+            #[cfg(feature = "wgpu")]
+            {
+                pollster::block_on(Self::from_winit_window_async(window, settings, preference))
+            }
+            #[cfg(not(feature = "wgpu"))]
+            {
+                if preference == crate::BackendPreference::Wgpu {
+                    Err(wgpu_context::not_compiled())
+                } else {
+                    Self::from_winit_window(window, settings)
+                }
+            }
+        }
+
+        ///
+        /// The same as [WindowedContext::from_winit_window_with_backend], but asynchronous like the function with the same name for the web,
+        /// so the same code can be used on all platforms.
+        ///
+        #[allow(unsafe_code)]
+        pub async fn from_winit_window_async(
+            window: &Window,
+            settings: SurfaceSettings,
+            preference: crate::BackendPreference,
+        ) -> Result<Self, WindowError> {
+            use crate::BackendPreference;
+            if preference == BackendPreference::Gl {
+                return Self::from_winit_window(window, settings);
+            }
+            #[cfg(feature = "wgpu")]
+            {
+                let instance = ::wgpu::Instance::new(
+                    ::wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
+                );
+                // Safety: the window must outlive the context, which is documented for this function and the same as for OpenGL
+                let target = unsafe {
+                    ::wgpu::SurfaceTargetUnsafe::from_display_and_window(window, window)?
+                };
+                let context = wgpu_context::new(
+                    instance,
+                    |instance| {
+                        unsafe { instance.create_surface_unsafe(target) }
+                            .map_err(wgpu_context::surface_error)
+                    },
+                    window.inner_size().into(),
+                    settings,
+                    preference,
+                )
+                .await;
+                match context {
+                    Ok(context) => Ok(Self { context, gl: None }),
+                    Err(_) if preference == BackendPreference::Auto => {
+                        Self::from_winit_window(window, settings)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            #[cfg(not(feature = "wgpu"))]
+            {
+                if preference == BackendPreference::Auto {
+                    Self::from_winit_window(window, settings)
+                } else {
+                    Err(wgpu_context::not_compiled())
+                }
+            }
         }
 
         /// Resizes the context
         pub fn resize(&self, physical_size: winit::dpi::PhysicalSize<u32>) {
+            let Some((surface, glutin_context)) = &self.gl else {
+                #[cfg(feature = "wgpu")]
+                self.context
+                    .wgpu_backend()
+                    .resize_screen(physical_size.width, physical_size.height);
+                return;
+            };
             let width = std::num::NonZeroU32::new(physical_size.width.max(1)).unwrap();
             let height = std::num::NonZeroU32::new(physical_size.height.max(1)).unwrap();
-            self.surface.resize(&self.glutin_context, width, height);
+            surface.resize(glutin_context, width, height);
         }
 
         /// Make this context current. Needed when using multiple windows (contexts) on native.
         pub fn make_current(&self) -> Result<(), WindowError> {
-            Ok(self.glutin_context.make_current(&self.surface)?)
+            let Some((surface, glutin_context)) = &self.gl else {
+                return Ok(());
+            };
+            Ok(glutin_context.make_current(surface)?)
         }
 
         /// Swap buffers - should always be called after rendering.
         pub fn swap_buffers(&self) -> Result<(), WindowError> {
-            Ok(self.surface.swap_buffers(&self.glutin_context)?)
+            let Some((surface, glutin_context)) = &self.gl else {
+                #[cfg(feature = "wgpu")]
+                self.context.wgpu_backend().present()?;
+                return Ok(());
+            };
+            Ok(surface.swap_buffers(glutin_context)?)
         }
 
         /// Enables or disabled vsync.
         pub fn set_vsync(&self, enabled: bool) -> Result<(), WindowError> {
+            let Some((surface, glutin_context)) = &self.gl else {
+                #[cfg(feature = "wgpu")]
+                self.context.wgpu_backend().set_vsync(enabled);
+                return Ok(());
+            };
             let swap_interval = if enabled {
                 glutin::surface::SwapInterval::Wait(std::num::NonZeroU32::new(1).unwrap())
             } else {
                 glutin::surface::SwapInterval::DontWait
             };
-            Ok(self
-                .surface
-                .set_swap_interval(&self.glutin_context, swap_interval)?)
+            Ok(surface.set_swap_interval(glutin_context, swap_interval)?)
         }
     }
 }

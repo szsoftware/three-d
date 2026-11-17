@@ -73,9 +73,10 @@ pub enum WindowError {
 /// use [WindowedContext::from_winit_window] and [FrameInputGenerator].
 ///
 pub struct Window {
+    // Dropped first, the context must not outlive the window
+    gl: WindowedContext,
     window: winit::window::Window,
     event_loop: EventLoop<()>,
-    gl: WindowedContext,
 }
 
 impl Window {
@@ -90,11 +91,87 @@ impl Window {
 
     /// Exactly the same as [`Window::new()`] except with the ability to supply
     /// an existing [`EventLoop`].
-    #[allow(deprecated)] // Uses the closure-based winit event loop for now
     pub fn from_event_loop(
         window_settings: WindowSettings,
         event_loop: EventLoop<()>,
     ) -> Result<Self, WindowError> {
+        let surface_settings = window_settings.surface_settings;
+        let winit_window = Self::create_winit_window(window_settings, &event_loop)?;
+        Self::from_winit_window(winit_window, event_loop, surface_settings)
+    }
+
+    ///
+    /// Constructs a new Window with the given [settings] which uses the preferred backend for rendering, see [BackendPreference].
+    /// [Window::new] always uses OpenGL/WebGL.
+    ///
+    /// In a browser this function cannot wait for WebGPU, so [BackendPreference::Auto] means WebGL there
+    /// and [BackendPreference::Wgpu] is an error. Use [Window::new_async] to get WebGPU.
+    ///
+    /// [settings]: WindowSettings
+    pub fn new_with_backend(
+        window_settings: WindowSettings,
+        preference: BackendPreference,
+    ) -> Result<Self, WindowError> {
+        let event_loop = EventLoop::new()?;
+        let surface_settings = window_settings.surface_settings;
+        if preference == BackendPreference::Gl {
+            return Self::from_event_loop(window_settings, event_loop);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let window = Self::create_winit_window(window_settings, &event_loop)?;
+            let gl = WindowedContext::from_winit_window_with_backend(
+                &window,
+                surface_settings,
+                preference,
+            )?;
+            Ok(Self {
+                gl,
+                window,
+                event_loop,
+            })
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = surface_settings;
+            if preference == BackendPreference::Auto {
+                Self::from_event_loop(window_settings, event_loop)
+            } else {
+                Err(WindowError::ThreeDError(CoreError::ContextCreation(
+                    "a browser cannot wait for WebGPU, use Window::new_async instead".to_string(),
+                )))
+            }
+        }
+    }
+
+    ///
+    /// The same as [Window::new_with_backend], but asynchronous, which makes it possible to use WebGPU in a browser:
+    /// With [BackendPreference::Auto], the window uses WebGPU if the browser supports it and WebGL2 otherwise.
+    ///
+    pub async fn new_async(
+        window_settings: WindowSettings,
+        preference: BackendPreference,
+    ) -> Result<Self, WindowError> {
+        let event_loop = EventLoop::new()?;
+        let surface_settings = window_settings.surface_settings;
+        if preference == BackendPreference::Gl {
+            return Self::from_event_loop(window_settings, event_loop);
+        }
+        let window = Self::create_winit_window(window_settings, &event_loop)?;
+        let gl =
+            WindowedContext::from_winit_window_async(&window, surface_settings, preference).await?;
+        Ok(Self {
+            gl,
+            window,
+            event_loop,
+        })
+    }
+
+    #[allow(deprecated)] // Uses the closure-based winit event loop for now
+    fn create_winit_window(
+        window_settings: WindowSettings,
+        event_loop: &EventLoop<()>,
+    ) -> Result<window::Window, WindowError> {
         #[cfg(not(target_arch = "wasm32"))]
         let window_attributes = {
             let window_attributes = window::Window::default_attributes()
@@ -153,7 +230,7 @@ impl Window {
 
         let winit_window = event_loop.create_window(window_attributes)?;
         winit_window.focus_window();
-        Self::from_winit_window(winit_window, event_loop, window_settings.surface_settings)
+        Ok(winit_window)
     }
 
     ///
@@ -250,7 +327,8 @@ impl Window {
     }
 
     ///
-    /// Returns the graphics context for this window.
+    /// Returns the graphics context for this window. Despite the name of the function,
+    /// the context uses the wgpu backend if the window was created with it, see [Window::new_with_backend].
     ///
     pub fn gl(&self) -> Context {
         (*self.gl).clone()
