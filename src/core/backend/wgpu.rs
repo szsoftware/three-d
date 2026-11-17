@@ -220,6 +220,25 @@ struct PipelineKey {
     textures: Vec<SampleKind>,
 }
 
+///
+/// Makes the test that calls this the only one that uses a graphics driver until its thread ends.
+/// The tests run on the software drivers of Mesa for Vulkan and OpenGL. These share state inside the test process (one EGL display, one LLVM)
+/// and crashed now and then in CI when several tests used them at the same time.
+///
+#[cfg(test)]
+pub(crate) fn one_gpu_test_at_a_time() {
+    use std::cell::RefCell;
+    use std::sync::MutexGuard;
+    static LOCK: Mutex<()> = Mutex::new(());
+    thread_local!(static HELD: RefCell<Option<MutexGuard<'static, ()>>> = const { RefCell::new(None) });
+    HELD.with(|held| {
+        let mut held = held.borrow_mut();
+        if held.is_none() {
+            *held = Some(LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+        }
+    });
+}
+
 fn unsupported(what: &str) -> ! {
     panic!("{what} is not supported by the wgpu backend yet")
 }
@@ -261,6 +280,8 @@ impl WgpuBackend {
     ///
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new_headless() -> Result<Self, CoreError> {
+        #[cfg(test)]
+        one_gpu_test_at_a_time();
         let instance = w::Instance::new(w::InstanceDescriptor::new_without_display_handle());
         let (backend, _) =
             pollster::block_on(Self::request(&instance, AdapterPreference::Any, None))?;
