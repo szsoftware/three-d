@@ -426,6 +426,7 @@ pub(crate) trait BackendApi {
     fn set_render_states(&self, render_states: RenderStates);
     fn error_check(&self) -> Result<(), CoreError>;
     /// The maximum number of samples for multisample targets.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     fn max_samples(&self) -> u32;
 
     // BUFFERS
