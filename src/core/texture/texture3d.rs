@@ -4,7 +4,7 @@ use crate::core::texture::*;
 ///
 pub struct Texture3D {
     context: Context,
-    id: crate::context::Texture,
+    id: backend::TextureId,
     width: u32,
     height: u32,
     depth: u32,
@@ -73,30 +73,20 @@ impl Texture3D {
         wrap_t: Wrapping,
         wrap_r: Wrapping,
     ) -> Self {
-        unsafe {
-            Self::new_unchecked::<T>(
-                context,
-                width,
-                height,
-                depth,
-                min_filter,
-                mag_filter,
-                mipmap,
-                wrap_s,
-                wrap_t,
-                wrap_r,
-                |texture| {
-                    context.tex_storage_3d(
-                        crate::context::TEXTURE_3D,
-                        texture.number_of_mip_maps() as i32,
-                        T::internal_format(),
-                        width as i32,
-                        height as i32,
-                        depth as i32,
-                    )
-                },
-            )
-        }
+        Self::new_internal::<T>(
+            context,
+            width,
+            height,
+            depth,
+            min_filter,
+            mag_filter,
+            mipmap,
+            wrap_s,
+            wrap_t,
+            wrap_r,
+            true,
+            |_| {},
+        )
     }
 
     ///
@@ -114,22 +104,16 @@ impl Texture3D {
             self.data_byte_size,
             data.len(),
         );
-        self.bind();
-        unsafe {
-            self.context.tex_sub_image_3d(
-                crate::context::TEXTURE_3D,
-                0,
-                0,
-                0,
-                0,
-                self.width as i32,
-                self.height as i32,
-                self.depth as i32,
-                format_from_data_type::<T>(),
-                T::data_type(),
-                crate::context::PixelUnpackData::Slice(Some(to_byte_slice(data))),
-            );
-        }
+        self.context.backend().write_texture(
+            self.id,
+            backend::TextureKind::D3,
+            backend::TextureRegion::All,
+            self.width,
+            self.height,
+            self.depth,
+            backend::ColorFormat::of::<T>(),
+            to_byte_slice(data),
+        );
         self.generate_mip_maps();
     }
 
@@ -155,17 +139,14 @@ impl Texture3D {
 
     fn generate_mip_maps(&self) {
         if self.number_of_mip_maps > 1 {
-            self.bind();
-            unsafe {
-                self.context.generate_mipmap(crate::context::TEXTURE_3D);
-            }
+            self.context
+                .backend()
+                .generate_mipmaps(self.id, backend::TextureKind::D3);
         }
     }
-    pub(in crate::core) fn bind(&self) {
-        unsafe {
-            self.context
-                .bind_texture(crate::context::TEXTURE_3D, Some(self.id));
-        }
+
+    pub(in crate::core) fn id(&self) -> backend::TextureId {
+        self.id
     }
 
     ///
@@ -191,9 +172,44 @@ impl Texture3D {
         wrap_r: Wrapping,
         callback: impl FnOnce(&Self),
     ) -> Self {
-        let id = generate(context);
+        Self::new_internal::<T>(
+            context, width, height, depth, min_filter, mag_filter, mipmap, wrap_s, wrap_t, wrap_r,
+            false, callback,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_internal<T: TextureDataType>(
+        context: &Context,
+        width: u32,
+        height: u32,
+        depth: u32,
+        min_filter: Interpolation,
+        mag_filter: Interpolation,
+        mipmap: Option<Mipmap>,
+        wrap_s: Wrapping,
+        wrap_t: Wrapping,
+        wrap_r: Wrapping,
+        allocate: bool,
+        callback: impl FnOnce(&Self),
+    ) -> Self {
         let number_of_mip_maps =
             calculate_number_of_mip_maps::<T>(mipmap, width, height, Some(depth));
+        let id = create_texture::<T>(
+            context,
+            backend::TextureKind::D3,
+            width,
+            height,
+            depth,
+            number_of_mip_maps,
+            min_filter,
+            mag_filter,
+            mipmap,
+            wrap_s,
+            wrap_t,
+            Some(wrap_r),
+            allocate,
+        );
         let texture = Self {
             context: context.clone(),
             id,
@@ -203,21 +219,6 @@ impl Texture3D {
             number_of_mip_maps,
             data_byte_size: std::mem::size_of::<T>(),
         };
-        texture.bind();
-        set_parameters(
-            context,
-            crate::context::TEXTURE_3D,
-            min_filter,
-            mag_filter,
-            if number_of_mip_maps == 1 {
-                None
-            } else {
-                mipmap
-            },
-            wrap_s,
-            wrap_t,
-            Some(wrap_r),
-        );
         callback(&texture);
         texture.generate_mip_maps();
         texture
@@ -226,8 +227,6 @@ impl Texture3D {
 
 impl Drop for Texture3D {
     fn drop(&mut self) {
-        unsafe {
-            self.context.delete_texture(self.id);
-        }
+        self.context.backend().delete_texture(self.id);
     }
 }

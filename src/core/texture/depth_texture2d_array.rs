@@ -5,7 +5,7 @@ use crate::core::texture::*;
 ///
 pub struct DepthTexture2DArray {
     context: Context,
-    id: crate::context::Texture,
+    id: backend::TextureId,
     width: u32,
     height: u32,
     depth: u32,
@@ -23,36 +23,23 @@ impl DepthTexture2DArray {
         wrap_s: Wrapping,
         wrap_t: Wrapping,
     ) -> Self {
-        let id = generate(context);
-        let texture = Self {
+        let id = create_depth_texture::<T>(
+            context,
+            backend::TextureKind::D2Array,
+            width,
+            height,
+            depth,
+            wrap_s,
+            wrap_t,
+            None,
+        );
+        Self {
             context: context.clone(),
             id,
             width,
             height,
             depth,
-        };
-        texture.bind();
-        set_parameters(
-            context,
-            crate::context::TEXTURE_2D_ARRAY,
-            Interpolation::Nearest,
-            Interpolation::Nearest,
-            None,
-            wrap_s,
-            wrap_t,
-            None,
-        );
-        unsafe {
-            context.tex_storage_3d(
-                crate::context::TEXTURE_2D_ARRAY,
-                1,
-                T::internal_format(),
-                width as i32,
-                height as i32,
-                depth as i32,
-            );
         }
-        texture
     }
 
     ///
@@ -78,30 +65,13 @@ impl DepthTexture2DArray {
         self.depth
     }
 
-    pub(in crate::core) fn bind_as_depth_target(&self, layer: u32) {
-        unsafe {
-            self.context.framebuffer_texture_layer(
-                crate::context::DRAW_FRAMEBUFFER,
-                crate::context::DEPTH_ATTACHMENT,
-                Some(self.id),
-                0,
-                layer as i32,
-            );
-        }
-    }
-
-    pub(in crate::core) fn bind(&self) {
-        unsafe {
-            self.context
-                .bind_texture(crate::context::TEXTURE_2D_ARRAY, Some(self.id));
-        }
+    pub(in crate::core) fn id(&self) -> backend::TextureId {
+        self.id
     }
 }
 
 impl Drop for DepthTexture2DArray {
     fn drop(&mut self) {
-        unsafe {
-            self.context.delete_texture(self.id);
-        }
+        self.context.backend().delete_texture(self.id);
     }
 }

@@ -6,7 +6,7 @@ use crate::core::*;
 ///
 pub struct UniformBuffer {
     context: Context,
-    id: crate::context::Buffer,
+    id: backend::BufferId,
     offsets: Vec<usize>,
     data: Vec<f32>,
 }
@@ -19,7 +19,7 @@ impl UniformBuffer {
     /// The variables are initialized to 0.
     ///
     pub fn new(context: &Context, sizes: &[u32]) -> UniformBuffer {
-        let id = unsafe { context.create_buffer().expect("Failed creating buffer") };
+        let id = context.backend().create_buffer();
 
         let mut offsets = Vec::new();
         let mut length = 0;
@@ -37,11 +37,8 @@ impl UniformBuffer {
         buffer
     }
 
-    pub(crate) fn bind(&self, id: u32) {
-        unsafe {
-            self.context
-                .bind_buffer_base(crate::context::UNIFORM_BUFFER, id, Some(self.id))
-        };
+    pub(crate) fn id(&self) -> backend::BufferId {
+        self.id
     }
 
     ///
@@ -97,24 +94,17 @@ impl UniformBuffer {
     }
 
     fn send(&self) {
-        unsafe {
-            self.context
-                .bind_buffer(crate::context::UNIFORM_BUFFER, Some(self.id));
-            self.context.buffer_data_u8_slice(
-                crate::context::UNIFORM_BUFFER,
-                to_byte_slice(&self.data),
-                crate::context::STATIC_DRAW,
-            );
-            self.context
-                .bind_buffer(crate::context::UNIFORM_BUFFER, None);
-        }
+        self.context.backend().write_buffer(
+            self.id,
+            backend::BufferKind::Uniform,
+            to_byte_slice(&self.data),
+            backend::BufferUsage::Static,
+        );
     }
 }
 
 impl Drop for UniformBuffer {
     fn drop(&mut self) {
-        unsafe {
-            self.context.delete_buffer(self.id);
-        }
+        self.context.backend().delete_buffer(self.id);
     }
 }

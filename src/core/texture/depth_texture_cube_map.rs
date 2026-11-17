@@ -5,7 +5,7 @@ use crate::core::texture::*;
 ///
 pub struct DepthTextureCubeMap {
     context: Context,
-    id: crate::context::Texture,
+    id: backend::TextureId,
     width: u32,
     height: u32,
 }
@@ -22,34 +22,22 @@ impl DepthTextureCubeMap {
         wrap_t: Wrapping,
         wrap_r: Wrapping,
     ) -> Self {
-        let id = generate(context);
-        let texture = Self {
-            context: context.clone(),
-            id,
+        let id = create_depth_texture::<T>(
+            context,
+            backend::TextureKind::CubeMap,
             width,
             height,
-        };
-        texture.bind();
-        set_parameters(
-            context,
-            crate::context::TEXTURE_CUBE_MAP,
-            Interpolation::Nearest,
-            Interpolation::Nearest,
-            None,
+            1,
             wrap_s,
             wrap_t,
             Some(wrap_r),
         );
-        unsafe {
-            context.tex_storage_2d(
-                crate::context::TEXTURE_CUBE_MAP,
-                1,
-                T::internal_format(),
-                width as i32,
-                height as i32,
-            );
+        Self {
+            context: context.clone(),
+            id,
+            width,
+            height,
         }
-        texture
     }
 
     ///
@@ -70,30 +58,13 @@ impl DepthTextureCubeMap {
         self.height
     }
 
-    pub(in crate::core) fn bind_as_depth_target(&self, side: CubeMapSide) {
-        unsafe {
-            self.context.framebuffer_texture_2d(
-                crate::context::DRAW_FRAMEBUFFER,
-                crate::context::DEPTH_ATTACHMENT,
-                side.to_const(),
-                Some(self.id),
-                0,
-            );
-        }
-    }
-
-    pub(in crate::core) fn bind(&self) {
-        unsafe {
-            self.context
-                .bind_texture(crate::context::TEXTURE_CUBE_MAP, Some(self.id));
-        }
+    pub(in crate::core) fn id(&self) -> backend::TextureId {
+        self.id
     }
 }
 
 impl Drop for DepthTextureCubeMap {
     fn drop(&mut self) {
-        unsafe {
-            self.context.delete_texture(self.id);
-        }
+        self.context.backend().delete_texture(self.id);
     }
 }

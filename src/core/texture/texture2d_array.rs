@@ -8,7 +8,7 @@ use crate::core::texture::*;
 ///
 pub struct Texture2DArray {
     context: Context,
-    id: crate::context::Texture,
+    id: backend::TextureId,
     width: u32,
     height: u32,
     depth: u32,
@@ -160,29 +160,19 @@ impl Texture2DArray {
         wrap_s: Wrapping,
         wrap_t: Wrapping,
     ) -> Self {
-        unsafe {
-            Self::new_unchecked::<T>(
-                context,
-                width,
-                height,
-                depth,
-                min_filter,
-                mag_filter,
-                mipmap,
-                wrap_s,
-                wrap_t,
-                |texture| {
-                    context.tex_storage_3d(
-                        crate::context::TEXTURE_2D_ARRAY,
-                        texture.number_of_mip_maps() as i32,
-                        T::internal_format(),
-                        width as i32,
-                        height as i32,
-                        depth as i32,
-                    )
-                },
-            )
-        }
+        Self::new_internal::<T>(
+            context,
+            width,
+            height,
+            depth,
+            min_filter,
+            mag_filter,
+            mipmap,
+            wrap_s,
+            wrap_t,
+            true,
+            |_| {},
+        )
     }
 
     ///
@@ -213,24 +203,18 @@ impl Texture2DArray {
             )
         }
         check_data_length::<T>(self.width, self.height, 1, self.data_byte_size, data.len());
-        self.bind();
         let mut data = (*data).to_owned();
         flip_y(&mut data, self.width as usize, self.height as usize);
-        unsafe {
-            self.context.tex_sub_image_3d(
-                crate::context::TEXTURE_2D_ARRAY,
-                0,
-                0,
-                0,
-                layer as i32,
-                self.width as i32,
-                self.height as i32,
-                1,
-                format_from_data_type::<T>(),
-                T::data_type(),
-                crate::context::PixelUnpackData::Slice(Some(to_byte_slice(&data))),
-            );
-        }
+        self.context.backend().write_texture(
+            self.id,
+            backend::TextureKind::D2Array,
+            backend::TextureRegion::Layer(layer),
+            self.width,
+            self.height,
+            1,
+            backend::ColorFormat::of::<T>(),
+            to_byte_slice(&data),
+        );
         self.generate_mip_maps();
     }
 
@@ -272,31 +256,14 @@ impl Texture2DArray {
 
     pub(in crate::core) fn generate_mip_maps(&self) {
         if self.number_of_mip_maps > 1 {
-            self.bind();
-            unsafe {
-                self.context
-                    .generate_mipmap(crate::context::TEXTURE_2D_ARRAY);
-            }
-        }
-    }
-
-    pub(in crate::core) fn bind_as_color_target(&self, layer: u32, channel: u32, mip_level: u32) {
-        unsafe {
-            self.context.framebuffer_texture_layer(
-                crate::context::DRAW_FRAMEBUFFER,
-                crate::context::COLOR_ATTACHMENT0 + channel,
-                Some(self.id),
-                mip_level as i32,
-                layer as i32,
-            );
-        }
-    }
-
-    pub(in crate::core) fn bind(&self) {
-        unsafe {
             self.context
-                .bind_texture(crate::context::TEXTURE_2D_ARRAY, Some(self.id));
+                .backend()
+                .generate_mipmaps(self.id, backend::TextureKind::D2Array);
         }
+    }
+
+    pub(in crate::core) fn id(&self) -> backend::TextureId {
+        self.id
     }
 
     ///
@@ -321,8 +288,42 @@ impl Texture2DArray {
         wrap_t: Wrapping,
         callback: impl FnOnce(&Self),
     ) -> Self {
-        let id = generate(context);
+        Self::new_internal::<T>(
+            context, width, height, depth, min_filter, mag_filter, mipmap, wrap_s, wrap_t, false,
+            callback,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_internal<T: TextureDataType>(
+        context: &Context,
+        width: u32,
+        height: u32,
+        depth: u32,
+        min_filter: Interpolation,
+        mag_filter: Interpolation,
+        mipmap: Option<Mipmap>,
+        wrap_s: Wrapping,
+        wrap_t: Wrapping,
+        allocate: bool,
+        callback: impl FnOnce(&Self),
+    ) -> Self {
         let number_of_mip_maps = calculate_number_of_mip_maps::<T>(mipmap, width, height, None);
+        let id = create_texture::<T>(
+            context,
+            backend::TextureKind::D2Array,
+            width,
+            height,
+            depth,
+            number_of_mip_maps,
+            min_filter,
+            mag_filter,
+            mipmap,
+            wrap_s,
+            wrap_t,
+            None,
+            allocate,
+        );
         let texture = Self {
             context: context.clone(),
             id,
@@ -332,21 +333,6 @@ impl Texture2DArray {
             number_of_mip_maps,
             data_byte_size: std::mem::size_of::<T>(),
         };
-        texture.bind();
-        set_parameters(
-            context,
-            crate::context::TEXTURE_2D_ARRAY,
-            min_filter,
-            mag_filter,
-            if number_of_mip_maps == 1 {
-                None
-            } else {
-                mipmap
-            },
-            wrap_s,
-            wrap_t,
-            None,
-        );
         callback(&texture);
         texture.generate_mip_maps();
         texture
@@ -355,8 +341,6 @@ impl Texture2DArray {
 
 impl Drop for Texture2DArray {
     fn drop(&mut self) {
-        unsafe {
-            self.context.delete_texture(self.id);
-        }
+        self.context.backend().delete_texture(self.id);
     }
 }

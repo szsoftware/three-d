@@ -5,7 +5,7 @@ use crate::core::texture::*;
 ///
 pub struct DepthTexture2D {
     context: Context,
-    id: crate::context::Texture,
+    id: backend::TextureId,
     width: u32,
     height: u32,
 }
@@ -21,34 +21,22 @@ impl DepthTexture2D {
         wrap_s: Wrapping,
         wrap_t: Wrapping,
     ) -> Self {
-        let id = generate(context);
-        let texture = Self {
-            context: context.clone(),
-            id,
+        let id = create_depth_texture::<T>(
+            context,
+            backend::TextureKind::D2,
             width,
             height,
-        };
-        texture.bind();
-        set_parameters(
-            context,
-            crate::context::TEXTURE_2D,
-            Interpolation::Nearest,
-            Interpolation::Nearest,
-            None,
+            1,
             wrap_s,
             wrap_t,
             None,
         );
-        unsafe {
-            context.tex_storage_2d(
-                crate::context::TEXTURE_2D,
-                1,
-                T::internal_format(),
-                width as i32,
-                height as i32,
-            );
+        Self {
+            context: context.clone(),
+            id,
+            width,
+            height,
         }
-        texture
     }
 
     ///
@@ -69,30 +57,13 @@ impl DepthTexture2D {
         self.height
     }
 
-    pub(in crate::core) fn bind_as_depth_target(&self) {
-        unsafe {
-            self.context.framebuffer_texture_2d(
-                crate::context::FRAMEBUFFER,
-                crate::context::DEPTH_ATTACHMENT,
-                crate::context::TEXTURE_2D,
-                Some(self.id),
-                0,
-            );
-        }
-    }
-
-    pub(in crate::core) fn bind(&self) {
-        unsafe {
-            self.context
-                .bind_texture(crate::context::TEXTURE_2D, Some(self.id));
-        }
+    pub(in crate::core) fn id(&self) -> backend::TextureId {
+        self.id
     }
 }
 
 impl Drop for DepthTexture2D {
     fn drop(&mut self) {
-        unsafe {
-            self.context.delete_texture(self.id);
-        }
+        self.context.backend().delete_texture(self.id);
     }
 }

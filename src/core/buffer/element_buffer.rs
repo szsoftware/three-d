@@ -32,7 +32,7 @@ impl ElementBufferDataType for u32 {
 ///
 pub struct ElementBuffer<T: ElementBufferDataType> {
     context: Context,
-    id: crate::context::Buffer,
+    id: backend::BufferId,
     count: u32,
     _d: PhantomData<T>,
 }
@@ -42,7 +42,7 @@ impl<T: ElementBufferDataType> ElementBuffer<T> {
     /// Creates a new empty element buffer.
     ///
     pub fn new(context: &Context) -> Self {
-        let id = unsafe { context.create_buffer().expect("Failed creating buffer") };
+        let id = context.backend().create_buffer();
         Self {
             context: context.clone(),
             id,
@@ -67,16 +67,12 @@ impl<T: ElementBufferDataType> ElementBuffer<T> {
     /// This function will resize the buffer to have the same size as the indices array, if that is not desired, use [fill_subset](Self::fill_subset) instead.
     ///
     pub fn fill(&mut self, indices: &[T]) {
-        self.bind();
-        unsafe {
-            self.context.buffer_data_u8_slice(
-                crate::context::ELEMENT_ARRAY_BUFFER,
-                to_byte_slice(indices),
-                crate::context::STATIC_DRAW,
-            );
-            self.context
-                .bind_buffer(crate::context::ELEMENT_ARRAY_BUFFER, None);
-        }
+        self.context.backend().write_buffer(
+            self.id,
+            backend::BufferKind::Element,
+            to_byte_slice(indices),
+            backend::BufferUsage::Static,
+        );
         self.count = indices.len() as u32;
     }
 
@@ -85,16 +81,12 @@ impl<T: ElementBufferDataType> ElementBuffer<T> {
     /// This will increase the size of the buffer if there's not enough room. Otherwise, the size will remain unchanged.
     ///
     pub fn fill_subset(&mut self, offset: u32, indices: &[T]) {
-        self.bind();
-        unsafe {
-            self.context.buffer_sub_data_u8_slice(
-                crate::context::ELEMENT_ARRAY_BUFFER,
-                offset as i32,
-                to_byte_slice(indices),
-            );
-            self.context
-                .bind_buffer(crate::context::ELEMENT_ARRAY_BUFFER, None);
-        }
+        self.context.backend().write_buffer_subset(
+            self.id,
+            backend::BufferKind::Element,
+            offset,
+            to_byte_slice(indices),
+        );
         self.count = (offset + indices.len() as u32).max(self.count);
     }
 
@@ -112,18 +104,13 @@ impl<T: ElementBufferDataType> ElementBuffer<T> {
         self.count / 3
     }
 
-    pub(crate) fn bind(&self) {
-        unsafe {
-            self.context
-                .bind_buffer(crate::context::ELEMENT_ARRAY_BUFFER, Some(self.id));
-        }
+    pub(crate) fn id(&self) -> backend::BufferId {
+        self.id
     }
 }
 
 impl<T: ElementBufferDataType> Drop for ElementBuffer<T> {
     fn drop(&mut self) {
-        unsafe {
-            self.context.delete_buffer(self.id);
-        }
+        self.context.backend().delete_buffer(self.id);
     }
 }

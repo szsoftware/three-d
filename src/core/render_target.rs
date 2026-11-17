@@ -36,7 +36,7 @@ use crate::context::Framebuffer;
 /// A render target purely adds functionality, so it can be created each time it is needed, the actual data is saved in the textures.
 ///
 pub struct RenderTarget<'a> {
-    id: Option<Framebuffer>,
+    id: Option<backend::FramebufferId>,
     color: Option<ColorTarget<'a>>,
     depth: Option<DepthTarget<'a>>,
     pub(crate) context: Context,
@@ -97,9 +97,9 @@ impl<'a> RenderTarget<'a> {
     /// Clears the color and depth of the part of this render target that is inside the given scissor box.
     ///
     pub fn clear_partially(&self, scissor_box: ScissorBox, clear_state: ClearState) -> &Self {
-        self.context.set_scissor(scissor_box);
-        self.bind(crate::context::DRAW_FRAMEBUFFER);
-        clear_state.apply(&self.context);
+        self.context
+            .backend()
+            .clear(&self.pass_target(), scissor_box, clear_state);
         self
     }
 
@@ -121,9 +121,12 @@ impl<'a> RenderTarget<'a> {
         scissor_box: ScissorBox,
         render: impl FnOnce() -> Result<(), E>,
     ) -> Result<&Self, E> {
-        self.context.set_scissor(scissor_box);
-        self.bind(crate::context::DRAW_FRAMEBUFFER);
-        render()?;
+        self.context
+            .backend()
+            .begin_pass(&self.pass_target(), scissor_box, backend::LoadOp::Load);
+        let result = render();
+        self.context.backend().end_pass();
+        result?;
         if let Some(ref color) = self.color {
             color.generate_mip_maps();
         }
@@ -162,33 +165,20 @@ impl<'a> RenderTarget<'a> {
         if self.id.is_some() && self.color.is_none() {
             panic!("Cannot read color from a render target without a color target");
         }
-        let format = format_from_data_type::<T>();
-        let data_type = T::data_type();
-
         // On web, the read format needs to be RGBA and f16 is not supported (see https://webglfundamentals.org/webgl/lessons/webgl-readpixels.html).
         #[cfg(target_arch = "wasm32")]
-        if format != crate::context::RGBA
-            || !(data_type == crate::context::UNSIGNED_BYTE || data_type == crate::context::FLOAT)
+        if T::size() != 4
+            || !(T::primitive_type() == backend::PrimitiveType::U8
+                || T::primitive_type() == backend::PrimitiveType::F32)
         {
             panic!("Only the texture data types `Vec4<T>` and `[T; 4]` where `T` is either `u8` or `f32` are supported when reading color from a render target on web.");
         }
 
-        self.bind(crate::context::DRAW_FRAMEBUFFER);
-        self.bind(crate::context::READ_FRAMEBUFFER);
-        let data_size = std::mem::size_of::<T>();
-        let mut bytes =
-            vec![0u8; scissor_box.width as usize * scissor_box.height as usize * data_size];
-        unsafe {
-            self.context.read_pixels(
-                scissor_box.x,
-                scissor_box.y,
-                scissor_box.width as i32,
-                scissor_box.height as i32,
-                format,
-                data_type,
-                crate::context::PixelPackData::Slice(Some(&mut bytes)),
-            );
-        }
+        let bytes = self.context.backend().read_pixels(
+            &self.pass_target(),
+            scissor_box,
+            backend::ReadFormat::Color(backend::ColorFormat::of::<T>()),
+        );
         let mut pixels = from_byte_slice(&bytes).to_vec();
         flip_y(
             &mut pixels,
@@ -214,20 +204,11 @@ impl<'a> RenderTarget<'a> {
         if self.id.is_some() && self.depth.is_none() {
             panic!("cannot read depth from a render target without a depth target");
         }
-        self.bind(crate::context::DRAW_FRAMEBUFFER);
-        self.bind(crate::context::READ_FRAMEBUFFER);
-        let mut pixels = vec![0u8; scissor_box.width as usize * scissor_box.height as usize * 4];
-        unsafe {
-            self.context.read_pixels(
-                scissor_box.x,
-                scissor_box.y,
-                scissor_box.width as i32,
-                scissor_box.height as i32,
-                crate::context::DEPTH_COMPONENT,
-                crate::context::FLOAT,
-                crate::context::PixelPackData::Slice(Some(&mut pixels)),
-            );
-        }
+        let pixels = self.context.backend().read_pixels(
+            &self.pass_target(),
+            scissor_box,
+            backend::ReadFormat::Depth,
+        );
         from_byte_slice(&pixels).to_vec()
     }
 
@@ -242,7 +223,7 @@ impl<'a> RenderTarget<'a> {
         framebuffer: Framebuffer,
     ) -> Self {
         Self {
-            id: Some(framebuffer),
+            id: Some(backend::FramebufferId::Gl(framebuffer)),
             color: None,
             depth: None,
             context: context.clone(),
@@ -256,43 +237,27 @@ impl<'a> RenderTarget<'a> {
     /// to combine this crate with functionality of another crate. Also see [Self::from_framebuffer].
     ///
     pub fn into_framebuffer(mut self) -> Option<Framebuffer> {
-        self.id.take()
+        self.id.take().map(|id| id.gl())
     }
 
     pub(in crate::core) fn blit_to(&self, target: &RenderTarget) {
-        self.bind(crate::context::DRAW_FRAMEBUFFER);
-        target.bind(crate::context::DRAW_FRAMEBUFFER);
         let target_is_screen = target.color.is_none() && target.depth.is_none();
         let mask = if self.color.is_some() && (target.color.is_some() || target_is_screen) {
-            let mut mask = crate::context::COLOR_BUFFER_BIT;
-            if self.depth.is_some() && (target.depth.is_some() || target_is_screen) {
-                mask |= crate::context::DEPTH_BUFFER_BIT;
+            backend::CopyMask {
+                color: true,
+                depth: self.depth.is_some() && (target.depth.is_some() || target_is_screen),
             }
-            mask
         } else if self.depth.is_some() && (target.depth.is_some() || target_is_screen) {
-            crate::context::DEPTH_BUFFER_BIT
+            backend::CopyMask {
+                color: false,
+                depth: true,
+            }
         } else {
             unreachable!()
         };
         self.context
-            .set_scissor(ScissorBox::new_at_origo(target.width, target.height));
-        unsafe {
-            self.context
-                .bind_framebuffer(crate::context::READ_FRAMEBUFFER, self.id);
-
-            self.context.blit_framebuffer(
-                0,
-                0,
-                self.width as i32,
-                self.height as i32,
-                0,
-                0,
-                target.width as i32,
-                target.height as i32,
-                mask,
-                crate::context::NEAREST,
-            );
-        }
+            .backend()
+            .copy_target(&self.pass_target(), &target.pass_target(), mask);
     }
 
     fn new_color(color: ColorTarget<'a>) -> Self {
@@ -321,25 +286,21 @@ impl<'a> RenderTarget<'a> {
         }
     }
 
-    fn bind(&self, target: u32) {
-        unsafe {
-            self.context.bind_framebuffer(target, self.id);
-        }
-        if let Some(ref color) = self.color {
-            color.bind(&self.context);
-        }
-        if let Some(ref depth) = self.depth {
-            depth.bind();
+    fn pass_target(&self) -> backend::PassTarget {
+        backend::PassTarget {
+            framebuffer: self.id,
+            color: self.color.as_ref().map(|color| color.attachment()),
+            depth: self.depth.as_ref().map(|depth| depth.attachment()),
+            width: self.width,
+            height: self.height,
         }
     }
 }
 
 impl Drop for RenderTarget<'_> {
     fn drop(&mut self) {
-        unsafe {
-            if let Some(id) = self.id {
-                self.context.delete_framebuffer(id);
-            }
+        if let Some(id) = self.id {
+            self.context.backend().delete_framebuffer(id);
         }
     }
 }
@@ -352,22 +313,13 @@ fn size_with_mip(size: u32, mip: Option<u32>) -> u32 {
     }
 }
 
-fn new_framebuffer(context: &Context) -> crate::context::Framebuffer {
-    unsafe {
-        context
-            .create_framebuffer()
-            .expect("Failed creating frame buffer")
-    }
+fn new_framebuffer(context: &Context) -> backend::FramebufferId {
+    context.backend().create_framebuffer()
 }
 
 #[cfg(debug_assertions)]
 fn multisample_sanity_check(context: &Context, number_of_samples: u32) {
-    let max_samples: u32 = unsafe {
-        context
-            .get_parameter_i32(crate::context::MAX_SAMPLES)
-            .try_into()
-            .unwrap()
-    };
+    let max_samples: u32 = context.backend().max_samples();
     if number_of_samples > max_samples {
         panic!("number_of_samples ({}) for multisample target is larger than supported number of samples: {}", number_of_samples, max_samples);
     }

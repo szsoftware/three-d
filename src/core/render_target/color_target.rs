@@ -212,50 +212,29 @@ impl<'a> ColorTarget<'a> {
         }
     }
 
-    pub(super) fn bind(&self, context: &Context) {
+    pub(super) fn attachment(&self) -> backend::ColorAttachment {
+        let mip_level = self.mip_level.unwrap_or(0);
         if let Some(target) = self.target {
             match target {
-                ColorTexture::Single(texture) => unsafe {
-                    context.draw_buffers(&[crate::context::COLOR_ATTACHMENT0]);
-                    texture.bind_as_color_target(0, self.mip_level.unwrap_or(0));
+                ColorTexture::Single(texture) => backend::ColorAttachment::Texture2D {
+                    texture: texture.id(),
+                    mip_level,
                 },
-                ColorTexture::Array { texture, layers } => unsafe {
-                    context.draw_buffers(
-                        &(0..layers.len())
-                            .map(|i| crate::context::COLOR_ATTACHMENT0 + i as u32)
-                            .collect::<Vec<u32>>(),
-                    );
-                    (0..layers.len()).for_each(|channel| {
-                        texture.bind_as_color_target(
-                            layers[channel],
-                            channel as u32,
-                            self.mip_level.unwrap_or(0),
-                        );
-                    });
-                },
-                ColorTexture::CubeMap { texture, sides } => unsafe {
-                    context.draw_buffers(
-                        &(0..sides.len())
-                            .map(|i| crate::context::COLOR_ATTACHMENT0 + i as u32)
-                            .collect::<Vec<u32>>(),
-                    );
-                    (0..sides.len()).for_each(|channel| {
-                        texture.bind_as_color_target(
-                            sides[channel],
-                            channel as u32,
-                            self.mip_level.unwrap_or(0),
-                        );
-                    });
+                ColorTexture::Array { texture, layers } => {
+                    backend::ColorAttachment::Texture2DArray {
+                        texture: texture.id(),
+                        layers: layers.to_vec(),
+                        mip_level,
+                    }
+                }
+                ColorTexture::CubeMap { texture, sides } => backend::ColorAttachment::CubeMap {
+                    texture: texture.id(),
+                    sides: sides.to_vec(),
+                    mip_level,
                 },
             }
         } else {
-            unsafe {
-                context.draw_buffers(&[crate::context::COLOR_ATTACHMENT0]);
-                self.multisample_target
-                    .as_ref()
-                    .unwrap()
-                    .bind_as_color_target(0);
-            }
+            backend::ColorAttachment::Multisample(self.multisample_target.as_ref().unwrap().id())
         }
     }
 }
