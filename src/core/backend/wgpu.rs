@@ -25,6 +25,8 @@ mod builtin;
 #[cfg(all(test, target_os = "linux"))]
 mod compare_tests;
 pub(crate) mod glsl;
+#[cfg(all(test, target_os = "linux"))]
+mod renderer_compare_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod shader_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -45,6 +47,7 @@ pub(crate) struct WgpuBackend {
     /// Offsets into the ring buffer must be a multiple of this.
     uniform_alignment: usize,
     float32_filterable: bool,
+    max_vertex_buffers: usize,
 }
 
 // The backend only holds handles and plain data behind a mutex, a panic cannot leave it in a state that is unsafe to observe.
@@ -66,6 +69,8 @@ struct State {
     pipelines: HashMap<PipelineKey, w::RenderPipeline>,
     /// The bind groups with the textures of a program, by program and textures.
     texture_groups: HashMap<(u32, Vec<u32>), w::BindGroup>,
+    /// Instance buffers that are combined into one buffer, by the buffers they are made of. See [WgpuBackend::draw].
+    merged_buffers: HashMap<Vec<u32>, w::Buffer>,
     builtin: builtin::Builtin,
     ring: Ring,
     /// Increased with every submit, the uniforms uploaded before are gone after it.
@@ -188,6 +193,9 @@ enum SampleKind {
     Unfilterable,
 }
 
+/// The layout of a vertex buffer: whether it is per instance, the size of a vertex and the location, format and offset of the attributes in it.
+type VertexLayout = (bool, u64, Vec<(u32, w::VertexFormat, u64)>);
+
 /// Everything a render pipeline depends on.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct PipelineKey {
@@ -197,8 +205,7 @@ struct PipelineKey {
     write_mask: u8,
     blend: Option<[u8; 6]>,
     formats: TargetFormats,
-    /// Location, format and whether the attribute is per instance.
-    attributes: Vec<(u32, w::VertexFormat, bool)>,
+    vertex_buffers: Vec<VertexLayout>,
     textures: Vec<SampleKind>,
 }
 
@@ -212,6 +219,7 @@ impl WgpuBackend {
         Self {
             uniform_alignment: device.limits().min_uniform_buffer_offset_alignment as usize,
             float32_filterable: device.features().contains(w::Features::FLOAT32_FILTERABLE),
+            max_vertex_buffers: device.limits().max_vertex_buffers as usize,
             state: Mutex::new(State {
                 next_id: 0,
                 buffers: HashMap::new(),
@@ -222,6 +230,7 @@ impl WgpuBackend {
                 passes: Vec::new(),
                 pipelines: HashMap::new(),
                 texture_groups: HashMap::new(),
+                merged_buffers: HashMap::new(),
                 builtin: Default::default(),
                 ring,
                 epoch: 0,
@@ -1172,7 +1181,10 @@ impl BackendApi for WgpuBackend {
     }
 
     fn delete_buffer(&self, buffer: BufferId) {
-        self.lock().buffers.remove(&buffer.wgpu());
+        let state = &mut *self.lock();
+        let id = buffer.wgpu();
+        state.buffers.remove(&id);
+        state.merged_buffers.retain(|ids, _| !ids.contains(&id));
     }
 
     fn write_buffer(&self, buffer: BufferId, kind: BufferKind, bytes: &[u8], _usage: BufferUsage) {
@@ -1192,6 +1204,14 @@ impl BackendApi for WgpuBackend {
                     entry.bytes = Some(bytes.to_vec());
                 }
             }
+            BufferKind::Instance(format) => {
+                entry.usage = w::BufferUsages::VERTEX;
+                if stored_components(format) != format.components {
+                    entry.widened = Some(format);
+                }
+                // Kept because instance buffers are combined when a draw call has more attributes than vertex buffers are allowed
+                entry.bytes = Some(bytes.to_vec());
+            }
             BufferKind::Element => {
                 entry.usage = w::BufferUsages::INDEX;
                 entry.bytes = Some(bytes.to_vec());
@@ -1202,12 +1222,17 @@ impl BackendApi for WgpuBackend {
             Some(format) => self.new_buffer(&widen_vertices(bytes, format), entry.usage),
             None => self.new_buffer(bytes, entry.usage),
         });
-        self.lock().buffers.insert(buffer.wgpu(), entry);
+        let state = &mut *self.lock();
+        let id = buffer.wgpu();
+        state.buffers.insert(id, entry);
+        state.merged_buffers.retain(|ids, _| !ids.contains(&id));
     }
 
     fn write_buffer_subset(&self, buffer: BufferId, _kind: BufferKind, offset: u32, bytes: &[u8]) {
         let state = &mut *self.lock();
-        let entry = state.buffers.get_mut(&buffer.wgpu()).unwrap();
+        let id = buffer.wgpu();
+        state.merged_buffers.retain(|ids, _| !ids.contains(&id));
+        let entry = state.buffers.get_mut(&id).unwrap();
         if let Some(content) = &mut entry.bytes {
             // The buffer is not stored as it was written or the write may not be aligned to 4 bytes, so the buffer is replaced
             let end = offset as usize + bytes.len();
@@ -1820,20 +1845,87 @@ impl BackendApi for WgpuBackend {
 
         // Vertex buffers, one per attribute
         let program = &state.programs[&program_id];
+        let bound: Vec<(u32, u32, VertexFormat, bool)> = program
+            .attribute_locations
+            .iter()
+            .map(|location| {
+                let (buffer, format, divisor) =
+                    program.attributes.get(location).unwrap_or_else(|| {
+                        panic!("no buffer is bound to the vertex attribute at location {location}")
+                    });
+                (*location, *buffer, *format, *divisor != 0)
+            })
+            .collect();
+        // If there are more attributes than vertex buffers are allowed, the attributes per instance share one buffer
+        let merge = bound.len() > self.max_vertex_buffers;
         let mut vertex_buffers = Vec::new();
-        let mut attributes = Vec::new();
-        for location in &program.attribute_locations {
-            let (buffer, format, divisor) = program.attributes.get(location).unwrap_or_else(|| {
-                panic!("no buffer is bound to the vertex attribute at location {location}")
-            });
+        let mut vertex_layouts = Vec::new();
+        for (location, buffer, format, instanced) in &bound {
+            if merge && *instanced {
+                continue;
+            }
             vertex_buffers.push(
                 state.buffers[buffer]
                     .buffer
                     .clone()
                     .expect("a vertex buffer is used before it is filled"),
             );
-            attributes.push((*location, vertex_format(*format), *divisor != 0));
+            let format = vertex_format(*format);
+            vertex_layouts.push((*instanced, format.size(), vec![(*location, format, 0)]));
         }
+        if merge {
+            let instanced: Vec<_> = bound.iter().filter(|a| a.3).collect();
+            if vertex_buffers.len() + 1 > self.max_vertex_buffers || instanced.is_empty() {
+                unsupported(&format!(
+                    "a draw call with more than {} vertex attributes that are not per instance",
+                    self.max_vertex_buffers - 1
+                ));
+            }
+            let mut offset = 0;
+            let mut layout = Vec::new();
+            let mut parts = Vec::new();
+            for (location, buffer, format, _) in &instanced {
+                let wgpu_format = vertex_format(*format);
+                layout.push((*location, wgpu_format, offset));
+                offset += wgpu_format.size();
+                parts.push((*buffer, *format, wgpu_format.size() as usize));
+            }
+            let key: Vec<u32> = parts.iter().map(|(buffer, _, _)| *buffer).collect();
+            if !state.merged_buffers.contains_key(&key) {
+                let contents: Vec<(Vec<u8>, usize)> = parts
+                    .iter()
+                    .map(|(buffer, format, size)| {
+                        let bytes = state.buffers[buffer]
+                            .bytes
+                            .as_ref()
+                            .expect("an instance buffer is used before it is filled");
+                        let stored = if stored_components(*format) != format.components {
+                            widen_vertices(bytes, *format)
+                        } else {
+                            bytes.clone()
+                        };
+                        (stored, *size)
+                    })
+                    .collect();
+                let count = contents
+                    .iter()
+                    .map(|(bytes, size)| bytes.len() / size)
+                    .min()
+                    .unwrap_or(0);
+                let mut interleaved = Vec::with_capacity(count * offset as usize);
+                for instance in 0..count {
+                    for (bytes, size) in &contents {
+                        interleaved
+                            .extend_from_slice(&bytes[instance * size..(instance + 1) * size]);
+                    }
+                }
+                let buffer = self.new_buffer(&interleaved, w::BufferUsages::VERTEX);
+                state.merged_buffers.insert(key.clone(), buffer);
+            }
+            vertex_buffers.push(state.merged_buffers[&key].clone());
+            vertex_layouts.push((true, offset, layout));
+        }
+        let program = &state.programs[&program_id];
 
         // Textures and samplers
         let mut sample_kinds = Vec::new();
@@ -2077,7 +2169,7 @@ impl BackendApi for WgpuBackend {
             write_mask: color_writes(write_mask).bits() as u8 | (u8::from(write_mask.depth) << 4),
             blend: blend_key(call.render_states.blend),
             formats,
-            attributes,
+            vertex_buffers: vertex_layouts,
             textures: sample_kinds,
         };
         if !state.pipelines.contains_key(&key) {
@@ -2096,24 +2188,27 @@ impl BackendApi for WgpuBackend {
                     bind_group_layouts: &bind_group_layouts,
                     immediate_size: 0,
                 });
-            let vertex_attributes: Vec<_> = key
-                .attributes
+            let vertex_attributes: Vec<Vec<w::VertexAttribute>> = key
+                .vertex_buffers
                 .iter()
-                .map(|(location, format, _)| {
-                    [w::VertexAttribute {
-                        format: *format,
-                        offset: 0,
-                        shader_location: *location,
-                    }]
+                .map(|(_, _, attributes)| {
+                    attributes
+                        .iter()
+                        .map(|(location, format, offset)| w::VertexAttribute {
+                            format: *format,
+                            offset: *offset,
+                            shader_location: *location,
+                        })
+                        .collect()
                 })
                 .collect();
             let vertex_layouts: Vec<_> = key
-                .attributes
+                .vertex_buffers
                 .iter()
                 .zip(&vertex_attributes)
                 .map(
-                    |((_, format, instanced), attributes)| w::VertexBufferLayout {
-                        array_stride: format.size(),
+                    |((instanced, stride, _), attributes)| w::VertexBufferLayout {
+                        array_stride: *stride,
                         step_mode: if *instanced {
                             w::VertexStepMode::Instance
                         } else {

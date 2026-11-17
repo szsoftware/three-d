@@ -15,7 +15,7 @@ impl<T: BufferDataType> InstanceBuffer<T> {
     ///
     pub fn new(context: &Context) -> Self {
         Self {
-            buffer: Buffer::new(context),
+            buffer: Buffer::new(context, true),
         }
     }
 
@@ -25,7 +25,7 @@ impl<T: BufferDataType> InstanceBuffer<T> {
     ///
     pub fn new_with_data(context: &Context, data: &[T]) -> Self {
         Self {
-            buffer: Buffer::new_with_data(context, data),
+            buffer: Buffer::new_with_data(context, true, data),
         }
     }
 

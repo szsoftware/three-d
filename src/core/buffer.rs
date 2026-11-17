@@ -46,21 +46,23 @@ struct Buffer<T: BufferDataType> {
     context: Context,
     id: backend::BufferId,
     attribute_count: u32,
+    per_instance: bool,
     _d: PhantomData<T>,
 }
 
 impl<T: BufferDataType> Buffer<T> {
-    pub fn new(context: &Context) -> Self {
+    pub fn new(context: &Context, per_instance: bool) -> Self {
         Self {
             context: context.clone(),
             id: context.backend().create_buffer(),
             attribute_count: 0,
+            per_instance,
             _d: PhantomData,
         }
     }
 
-    pub fn new_with_data(context: &Context, data: &[T]) -> Self {
-        let mut buffer = Self::new(context);
+    pub fn new_with_data(context: &Context, per_instance: bool, data: &[T]) -> Self {
+        let mut buffer = Self::new(context, per_instance);
         if !data.is_empty() {
             buffer.fill(data);
         }
@@ -70,7 +72,7 @@ impl<T: BufferDataType> Buffer<T> {
     pub fn fill(&mut self, data: &[T]) {
         self.context.backend().write_buffer(
             self.id,
-            backend::BufferKind::Vertex(backend::VertexFormat::of::<T>()),
+            self.kind(),
             to_byte_slice(data),
             if self.attribute_count > 0 {
                 backend::BufferUsage::Dynamic
@@ -84,11 +86,20 @@ impl<T: BufferDataType> Buffer<T> {
     pub fn fill_subset(&mut self, offset: u32, data: &[T]) {
         self.context.backend().write_buffer_subset(
             self.id,
-            backend::BufferKind::Vertex(backend::VertexFormat::of::<T>()),
+            self.kind(),
             offset,
             to_byte_slice(data),
         );
         self.attribute_count = (offset + data.len() as u32).max(self.attribute_count);
+    }
+
+    fn kind(&self) -> backend::BufferKind {
+        let format = backend::VertexFormat::of::<T>();
+        if self.per_instance {
+            backend::BufferKind::Instance(format)
+        } else {
+            backend::BufferKind::Vertex(format)
+        }
     }
 
     pub fn attribute_count(&self) -> u32 {

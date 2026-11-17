@@ -44,7 +44,19 @@ fn gl_context() -> Result<(Context, impl Sized), String> {
 ///
 /// Runs the scenario on both backends and checks that the values it returns differ by at most the tolerance.
 ///
-fn compare(tolerance: f32, scenario: impl Fn(&Context) -> Vec<f32>) {
+pub(super) fn compare(tolerance: f32, scenario: impl Fn(&Context) -> Vec<f32>) {
+    compare_with_outliers(tolerance, 0.0, scenario)
+}
+
+///
+/// Like [compare], but the given part of the values may differ by more than the tolerance.
+/// For images where a small numerical difference decides between two colors, like the edges an effect looks for.
+///
+pub(super) fn compare_with_outliers(
+    tolerance: f32,
+    outliers: f32,
+    scenario: impl Fn(&Context) -> Vec<f32>,
+) {
     let required = std::env::var("THREE_D_REQUIRE_WGPU").is_ok();
     let skip = |what: &str, error: String| {
         if required {
@@ -86,9 +98,15 @@ fn compare(tolerance: f32, scenario: impl Fn(&Context) -> Vec<f32>) {
                 worst
             }
         });
+    let beyond = expected
+        .iter()
+        .zip(&actual)
+        .filter(|(e, a)| (*e - *a).abs() > tolerance)
+        .count();
     assert!(
-        worst.1 <= tolerance,
-        "value {} is {} on OpenGL and {} on wgpu, the tolerance is {tolerance}",
+        beyond as f32 <= outliers * expected.len() as f32,
+        "{beyond} of {} values differ by more than {tolerance}, the worst is value {}: {} on OpenGL and {} on wgpu",
+        expected.len(),
         worst.0,
         worst.2,
         worst.3
@@ -96,9 +114,9 @@ fn compare(tolerance: f32, scenario: impl Fn(&Context) -> Vec<f32>) {
 }
 
 /// One step of a `u8` color channel, plus rounding.
-const STEP: f32 = 1.01 / 255.0;
+pub(super) const STEP: f32 = 1.01 / 255.0;
 
-fn floats(pixels: Vec<[u8; 4]>) -> Vec<f32> {
+pub(super) fn floats(pixels: Vec<[u8; 4]>) -> Vec<f32> {
     pixels
         .iter()
         .flatten()
@@ -106,7 +124,7 @@ fn floats(pixels: Vec<[u8; 4]>) -> Vec<f32> {
         .collect()
 }
 
-fn color_texture(context: &Context, width: u32, height: u32) -> Texture2D {
+pub(super) fn color_texture(context: &Context, width: u32, height: u32) -> Texture2D {
     Texture2D::new_empty::<[u8; 4]>(
         context,
         width,
@@ -119,7 +137,7 @@ fn color_texture(context: &Context, width: u32, height: u32) -> Texture2D {
     )
 }
 
-fn depth_texture<T: DepthTextureDataType>(
+pub(super) fn depth_texture<T: DepthTextureDataType>(
     context: &Context,
     width: u32,
     height: u32,
@@ -161,7 +179,7 @@ fn draw_screen(context: &Context, size: u32, program: &Program, bind: impl FnOnc
 }
 
 /// Colors that are different in every texel and far apart for neighbours.
-fn pattern(width: u32, height: u32, seed: u32) -> Vec<[u8; 4]> {
+pub(super) fn pattern(width: u32, height: u32, seed: u32) -> Vec<[u8; 4]> {
     (0..width * height)
         .map(|i| {
             let (x, y) = (i % width, i / width);
