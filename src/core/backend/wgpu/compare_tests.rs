@@ -543,7 +543,8 @@ fn texture_array_and_several_color_targets() {
 
 #[test]
 fn texture_3d() {
-    compare(2.0 * STEP, |context| {
+    // Three steps, because the software adapter of Windows interpolates between the layers a bit less exactly
+    compare(3.0 * STEP, |context| {
         let data: Vec<[u8; 4]> = (0..4).flat_map(|z| pattern(4, 4, 30 + z)).collect();
         let texture = Texture3D::new_empty::<[u8; 4]>(
             context,
