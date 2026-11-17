@@ -525,6 +525,18 @@ pub(crate) trait BackendApi {
         vertex_shader_source: &str,
         fragment_shader_source: &str,
     ) -> Result<(ProgramId, ProgramReflection), CoreError>;
+    /// Creates a program from WGSL, which only a backend that takes WGSL can do.
+    #[cfg(feature = "wgsl")]
+    fn create_program_wgsl(
+        &self,
+        source: &str,
+    ) -> Result<(ProgramId, ProgramReflection), CoreError> {
+        Err(CoreError::ShaderCompilation(
+            "WGSL".to_string(),
+            source.to_string(),
+            "shader programs written in WGSL need a context with the wgpu backend, this context uses another backend".to_string(),
+        ))
+    }
     fn delete_program(&self, program: ProgramId);
     fn set_uniform(&self, program: ProgramId, location: &UniformLocation, value: &UniformValue);
     fn bind_texture(&self, unit: u32, texture: TextureId, kind: TextureKind);

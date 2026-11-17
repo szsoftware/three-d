@@ -22,6 +22,7 @@ window = ["glutin", "winit", "raw-window-handle", "wasm-bindgen", "serde", "serd
 egui-gui = ["egui_glow", "egui"] # Additional GUI features 
 text = ["swash", "lyon"] # Text mesh generation features
 wgpu = ["dep:wgpu", "dep:naga", "dep:pollster"] # Additional wgpu backend (see docs/wgpu-backend.md), OpenGL/WebGL stays the default
+wgsl = ["wgpu", "naga?/wgsl-in"] # Shader programs written in WGSL for the wgpu backend, see Program::from_wgsl_source
 
 [dependencies]
 glow = "0.17"

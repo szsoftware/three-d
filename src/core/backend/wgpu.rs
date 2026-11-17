@@ -35,6 +35,10 @@ mod renderer_compare_tests;
 mod shader_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests;
+#[cfg(feature = "wgsl")]
+mod wgsl;
+#[cfg(all(test, feature = "wgsl", target_os = "linux"))]
+mod wgsl_tests;
 
 /// The size of the ring buffer for uniforms, it grows if a single program needs more.
 const RING_CAPACITY: usize = 1 << 20;
@@ -247,6 +251,8 @@ struct ProgramEntry {
     /// Where the blocks were uploaded to the ring buffer and in which epoch, `None` if they changed since.
     uploaded: Option<(u64, [u32; 2])>,
     uniforms: Vec<UniformSlot>,
+    /// The names of the entry points of the vertex and fragment shader.
+    entry_points: [String; 2],
     samplers: Vec<(glsl::SamplerDecl, u32)>,
     /// The buffer bound to each vertex attribute location.
     attributes: HashMap<u32, (u32, VertexFormat, u32)>,
@@ -1704,125 +1710,54 @@ impl BackendApi for WgpuBackend {
 
         let (vertex_members, vertex_size) = block_members(&vertex_module, 0);
         let (fragment_members, fragment_size) = block_members(&fragment_module, 1);
-        let number_of_outputs = fragment_module
-            .entry_points
-            .first()
-            .and_then(|entry| entry.function.result.as_ref())
-            .map(|result| match &fragment_module.types[result.ty].inner {
-                naga::TypeInner::Struct { members, .. } => members
-                    .iter()
-                    .filter(|m| matches!(m.binding, Some(naga::Binding::Location { .. })))
-                    .count(),
-                _ => 1,
-            })
-            .unwrap_or(0);
+        let mut uniform_names = translation.vertex_uniforms;
+        uniform_names.extend(translation.fragment_uniforms);
+        Ok(self.insert_program(ProgramParts {
+            number_of_outputs: number_of_outputs(&fragment_module),
+            vertex: vertex_module,
+            fragment: Some(fragment_module),
+            entry_points: ["main".to_string(), "main".to_string()],
+            members: [vertex_members, fragment_members],
+            sizes: [vertex_size, fragment_size],
+            block_visibility: [w::ShaderStages::VERTEX, w::ShaderStages::FRAGMENT],
+            uniform_names,
+            samplers: translation.samplers,
+            attributes: translation.attributes,
+            uniform_blocks: translation.uniform_blocks,
+        }))
+    }
 
-        let mut reflection = ProgramReflection::default();
-        let mut uniforms = Vec::new();
-        let mut names: Vec<&String> = translation
-            .vertex_uniforms
-            .iter()
-            .chain(&translation.fragment_uniforms)
-            .collect();
-        names.dedup();
-        for name in names {
-            if reflection.uniforms.contains_key(name) {
-                continue;
-            }
-            let members = [vertex_members.get(name), fragment_members.get(name)]
-                .into_iter()
-                .flatten()
-                .copied()
-                .collect();
-            reflection
-                .uniforms
-                .insert(name.clone(), UniformLocation::Wgpu(uniforms.len() as u32));
-            uniforms.push(UniformSlot::Value(members));
+    #[cfg(feature = "wgsl")]
+    fn create_program_wgsl(
+        &self,
+        source: &str,
+    ) -> Result<(ProgramId, ProgramReflection), CoreError> {
+        let shader = wgsl::parse(source).map_err(|e| shader_error("WGSL", source, e))?;
+        let (members, size) = block_members(&shader.module, 0);
+        let (more_members, more_size) = block_members(&shader.module, 1);
+        let mut uniform_names: Vec<String> =
+            members.keys().chain(more_members.keys()).cloned().collect();
+        uniform_names.sort();
+        if let Some(name) = uniform_names.windows(2).find(|n| n[0] == n[1]) {
+            return Err(shader_error(
+                "WGSL",
+                source,
+                format!("the uniform {} is in both uniform structs", name[0]),
+            ));
         }
-        for (index, sampler) in translation.samplers.iter().enumerate() {
-            reflection.uniforms.insert(
-                sampler.name.clone(),
-                UniformLocation::Wgpu(uniforms.len() as u32),
-            );
-            uniforms.push(UniformSlot::Sampler(index));
-        }
-        reflection.attributes = translation.attributes.iter().cloned().collect();
-
-        // The blocks with the loose uniforms live in the ring buffer, at an offset that changes with every draw call
-        let block_entry =
-            |binding: u32, visibility: w::ShaderStages, size: usize| w::BindGroupLayoutEntry {
-                binding,
-                visibility,
-                ty: w::BindingType::Buffer {
-                    ty: w::BufferBindingType::Uniform,
-                    has_dynamic_offset: true,
-                    min_binding_size: NonZeroU64::new(size as u64),
-                },
-                count: None,
-            };
-        let mut entries = Vec::new();
-        if vertex_size > 0 {
-            entries.push(block_entry(0, w::ShaderStages::VERTEX, vertex_size));
-        }
-        if fragment_size > 0 {
-            entries.push(block_entry(1, w::ShaderStages::FRAGMENT, fragment_size));
-        }
-        let uniform_layout = self
-            .device
-            .create_bind_group_layout(&w::BindGroupLayoutDescriptor {
-                label: None,
-                entries: &entries,
-            });
-        // The uniform blocks declared in the shaders are whole buffers
-        let user_block_entries: Vec<_> = (0..translation.uniform_blocks.len())
-            .map(|binding| w::BindGroupLayoutEntry {
-                binding: binding as u32,
-                visibility: w::ShaderStages::VERTEX_FRAGMENT,
-                ty: w::BindingType::Buffer {
-                    ty: w::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            })
-            .collect();
-        let user_block_layout =
-            self.device
-                .create_bind_group_layout(&w::BindGroupLayoutDescriptor {
-                    label: None,
-                    entries: &user_block_entries,
-                });
-
-        let module = |module: naga::Module| self.shader_module(module);
-        let entry = ProgramEntry {
-            vertex: module(vertex_module),
-            fragment: module(fragment_module),
-            blocks: [vec![0; vertex_size], vec![0; fragment_size]],
-            uploaded: None,
-            uniforms,
-            samplers: translation.samplers.into_iter().map(|s| (s, 0)).collect(),
-            attributes: HashMap::new(),
-            attribute_locations: {
-                let mut locations: Vec<u32> =
-                    translation.attributes.iter().map(|(_, l)| *l).collect();
-                locations.sort();
-                locations
-            },
-            uniform_layout,
-            uniform_group: None,
-            texture_layouts: HashMap::new(),
-            user_blocks: translation
-                .uniform_blocks
-                .into_iter()
-                .map(|name| (name, None))
-                .collect(),
-            user_block_layout,
-            number_of_outputs,
-        };
-        let mut state = self.lock();
-        let id = Self::id(&mut state);
-        state.programs.insert(id, entry);
-        Ok((ProgramId::Wgpu(id), reflection))
+        Ok(self.insert_program(ProgramParts {
+            number_of_outputs: number_of_outputs(&shader.module),
+            vertex: shader.module,
+            fragment: None,
+            entry_points: shader.entry_points,
+            members: [members, more_members],
+            sizes: [size, more_size],
+            block_visibility: [w::ShaderStages::VERTEX_FRAGMENT; 2],
+            uniform_names,
+            samplers: shader.samplers,
+            attributes: shader.attributes,
+            uniform_blocks: shader.uniform_blocks,
+        }))
     }
 
     fn delete_program(&self, program: ProgramId) {
@@ -2343,7 +2278,7 @@ impl BackendApi for WgpuBackend {
                     layout: Some(&layout),
                     vertex: w::VertexState {
                         module: &program.vertex,
-                        entry_point: Some("main"),
+                        entry_point: Some(&program.entry_points[0]),
                         compilation_options: Default::default(),
                         buffers: &vertex_layouts,
                     },
@@ -2370,7 +2305,7 @@ impl BackendApi for WgpuBackend {
                     },
                     fragment: Some(w::FragmentState {
                         module: &program.fragment,
-                        entry_point: Some("main"),
+                        entry_point: Some(&program.entry_points[1]),
                         compilation_options: Default::default(),
                         targets: &targets,
                     }),
@@ -2462,5 +2397,162 @@ impl WgpuBackend {
                 self.start_read(state, &color, rect, 4)
             }
         }
+    }
+}
+
+/// What is needed to create a program, from translated GLSL or from WGSL.
+struct ProgramParts {
+    vertex: naga::Module,
+    /// `None` if the fragment shader is in the same module as the vertex shader.
+    fragment: Option<naga::Module>,
+    /// The names of the entry points of the vertex and fragment shader.
+    entry_points: [String; 2],
+    /// The members and the sizes of the two uniform blocks with the values set by name, and the stages which see them.
+    members: [HashMap<String, Member>; 2],
+    sizes: [usize; 2],
+    block_visibility: [w::ShaderStages; 2],
+    uniform_names: Vec<String>,
+    samplers: Vec<glsl::SamplerDecl>,
+    attributes: Vec<(String, u32)>,
+    uniform_blocks: Vec<String>,
+    number_of_outputs: usize,
+}
+
+/// The number of color outputs of the fragment shader.
+fn number_of_outputs(module: &naga::Module) -> usize {
+    module
+        .entry_points
+        .iter()
+        .find(|entry| entry.stage == naga::ShaderStage::Fragment)
+        .and_then(|entry| entry.function.result.as_ref())
+        .map(|result| match &module.types[result.ty].inner {
+            naga::TypeInner::Struct { members, .. } => members
+                .iter()
+                .filter(|m| matches!(m.binding, Some(naga::Binding::Location { .. })))
+                .count(),
+            _ => 1,
+        })
+        .unwrap_or(0)
+}
+
+impl WgpuBackend {
+    fn insert_program(&self, parts: ProgramParts) -> (ProgramId, ProgramReflection) {
+        let ProgramParts {
+            vertex,
+            fragment,
+            entry_points,
+            members: [vertex_members, fragment_members],
+            sizes: [vertex_size, fragment_size],
+            block_visibility,
+            uniform_names,
+            samplers,
+            attributes,
+            uniform_blocks,
+            number_of_outputs,
+        } = parts;
+        let mut reflection = ProgramReflection::default();
+        let mut uniforms = Vec::new();
+        for name in &uniform_names {
+            if reflection.uniforms.contains_key(name) {
+                continue;
+            }
+            let members = [vertex_members.get(name), fragment_members.get(name)]
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect();
+            reflection
+                .uniforms
+                .insert(name.clone(), UniformLocation::Wgpu(uniforms.len() as u32));
+            uniforms.push(UniformSlot::Value(members));
+        }
+        for (index, sampler) in samplers.iter().enumerate() {
+            reflection.uniforms.insert(
+                sampler.name.clone(),
+                UniformLocation::Wgpu(uniforms.len() as u32),
+            );
+            uniforms.push(UniformSlot::Sampler(index));
+        }
+        reflection.attributes = attributes.iter().cloned().collect();
+
+        // The blocks with the loose uniforms live in the ring buffer, at an offset that changes with every draw call
+        let block_entry =
+            |binding: u32, visibility: w::ShaderStages, size: usize| w::BindGroupLayoutEntry {
+                binding,
+                visibility,
+                ty: w::BindingType::Buffer {
+                    ty: w::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: NonZeroU64::new(size as u64),
+                },
+                count: None,
+            };
+        let mut entries = Vec::new();
+        if vertex_size > 0 {
+            entries.push(block_entry(0, block_visibility[0], vertex_size));
+        }
+        if fragment_size > 0 {
+            entries.push(block_entry(1, block_visibility[1], fragment_size));
+        }
+        let uniform_layout = self
+            .device
+            .create_bind_group_layout(&w::BindGroupLayoutDescriptor {
+                label: None,
+                entries: &entries,
+            });
+        // The uniform blocks declared in the shaders are whole buffers
+        let user_block_entries: Vec<_> = (0..uniform_blocks.len())
+            .map(|binding| w::BindGroupLayoutEntry {
+                binding: binding as u32,
+                visibility: w::ShaderStages::VERTEX_FRAGMENT,
+                ty: w::BindingType::Buffer {
+                    ty: w::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            })
+            .collect();
+        let user_block_layout =
+            self.device
+                .create_bind_group_layout(&w::BindGroupLayoutDescriptor {
+                    label: None,
+                    entries: &user_block_entries,
+                });
+
+        let vertex = self.shader_module(vertex);
+        let fragment = match fragment {
+            Some(fragment) => self.shader_module(fragment),
+            // Both stages are in the same module
+            None => vertex.clone(),
+        };
+        let entry = ProgramEntry {
+            vertex,
+            fragment,
+            entry_points,
+            blocks: [vec![0; vertex_size], vec![0; fragment_size]],
+            uploaded: None,
+            uniforms,
+            samplers: samplers.into_iter().map(|s| (s, 0)).collect(),
+            attributes: HashMap::new(),
+            attribute_locations: {
+                let mut locations: Vec<u32> = attributes.iter().map(|(_, l)| *l).collect();
+                locations.sort();
+                locations
+            },
+            uniform_layout,
+            uniform_group: None,
+            texture_layouts: HashMap::new(),
+            user_blocks: uniform_blocks
+                .into_iter()
+                .map(|name| (name, None))
+                .collect(),
+            user_block_layout,
+            number_of_outputs,
+        };
+        let mut state = self.lock();
+        let id = Self::id(&mut state);
+        state.programs.insert(id, entry);
+        (ProgramId::Wgpu(id), reflection)
     }
 }

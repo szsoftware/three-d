@@ -30,8 +30,37 @@ impl Program {
         let (id, reflection) = context
             .backend()
             .create_program(vertex_shader_source, fragment_shader_source)?;
+        Ok(Self::new(context, id, reflection))
+    }
+
+    ///
+    /// Creates a new shader program from the given WGSL source, which contains both a vertex and a fragment entry point.
+    /// This needs a context with the wgpu backend (see [Context::as_wgpu]), with another backend it returns an error.
+    ///
+    /// The program is used like one created from GLSL. What is addressed by name is found by these conventions:
+    /// - `use_uniform`: the members of the struct of `@group(0) @binding(0) var<uniform>` (and of a second one at `@binding(1)`).
+    /// - `use_texture` and its variants: the name of a texture variable. The texture number `i` is at `@group(1) @binding(2 * i)`
+    ///   and its sampler at `@group(1) @binding(2 * i + 1)`. Textures have `f32` values (`texture_2d<f32>`, `texture_2d_array<f32>`, `texture_cube<f32>` or `texture_3d<f32>`),
+    ///   also depth textures, which give the depth in the first channel.
+    /// - `use_uniform_block`: the name of a variable `@group(2) @binding(i) var<uniform>`, with `i` counting from 0.
+    /// - `use_vertex_attribute` and `use_instance_attribute`: the name of an argument of the vertex entry point with a `@location`, or of a member of an argument that is a struct.
+    ///
+    /// The shader uses the conventions of OpenGL like a GLSL shader of this crate, so the matrices of a [Camera](crate::renderer::Camera) work as they are:
+    /// the position returned by the vertex entry point is in the clip space of OpenGL (y up, z from `-w` to `w`), and the first row of a texture is the bottom one.
+    ///
+    #[cfg(feature = "wgsl")]
+    pub fn from_wgsl_source(context: &Context, source: &str) -> Result<Self, CoreError> {
+        let (id, reflection) = context.backend().create_program_wgsl(source)?;
+        Ok(Self::new(context, id, reflection))
+    }
+
+    fn new(
+        context: &Context,
+        id: backend::ProgramId,
+        reflection: backend::ProgramReflection,
+    ) -> Self {
         let attribute_locations = reflection.attributes.values().copied().collect();
-        Ok(Program {
+        Program {
             context: context.clone(),
             id,
             attributes: reflection.attributes,
@@ -39,7 +68,7 @@ impl Program {
             uniforms: reflection.uniforms,
             uniform_blocks: RwLock::new(HashMap::new()),
             textures: RwLock::new(HashMap::new()),
-        })
+        }
     }
 
     ///
