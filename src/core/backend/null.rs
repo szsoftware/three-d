@@ -369,13 +369,13 @@ mod tests {
                 Call::CreateBuffer(id),
                 Call::WriteBuffer {
                     buffer: id,
-                    kind: BufferKind::Vertex,
+                    kind: BufferKind::Vertex(VertexFormat::of::<Vec2>()),
                     bytes: bytes(&[1.0, 2.0]),
                     usage: BufferUsage::Static,
                 },
                 Call::WriteBuffer {
                     buffer: id,
-                    kind: BufferKind::Vertex,
+                    kind: BufferKind::Vertex(VertexFormat::of::<Vec2>()),
                     bytes: bytes(&[3.0, 4.0, 5.0, 6.0]),
                     usage: BufferUsage::Dynamic,
                 },

@@ -241,7 +241,8 @@ pub enum UniformValue {
 ///
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BufferKind {
-    Vertex,
+    /// Vertex attributes in the given format, tightly packed.
+    Vertex(VertexFormat),
     Element,
     Uniform,
 }
@@ -463,7 +464,7 @@ pub(crate) trait BackendApi {
     fn delete_buffer(&self, buffer: BufferId);
     /// Replaces the whole content and size of the buffer.
     fn write_buffer(&self, buffer: BufferId, kind: BufferKind, bytes: &[u8], usage: BufferUsage);
-    /// Writes into the existing buffer at the given offset.
+    /// Writes into the existing buffer at the given offset in bytes.
     fn write_buffer_subset(&self, buffer: BufferId, kind: BufferKind, offset: u32, bytes: &[u8]);
 
     // TEXTURES

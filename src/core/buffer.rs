@@ -70,7 +70,7 @@ impl<T: BufferDataType> Buffer<T> {
     pub fn fill(&mut self, data: &[T]) {
         self.context.backend().write_buffer(
             self.id,
-            backend::BufferKind::Vertex,
+            backend::BufferKind::Vertex(backend::VertexFormat::of::<T>()),
             to_byte_slice(data),
             if self.attribute_count > 0 {
                 backend::BufferUsage::Dynamic
@@ -84,7 +84,7 @@ impl<T: BufferDataType> Buffer<T> {
     pub fn fill_subset(&mut self, offset: u32, data: &[T]) {
         self.context.backend().write_buffer_subset(
             self.id,
-            backend::BufferKind::Vertex,
+            backend::BufferKind::Vertex(backend::VertexFormat::of::<T>()),
             offset,
             to_byte_slice(data),
         );

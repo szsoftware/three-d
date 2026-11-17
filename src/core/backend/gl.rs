@@ -1055,7 +1055,7 @@ impl BackendApi for GlBackend {
         format: VertexFormat,
         divisor: u32,
     ) {
-        self.bind_buffer(BufferKind::Vertex, buffer);
+        self.bind_buffer(BufferKind::Vertex(format), buffer);
         self.use_program(program);
         unsafe {
             self.context.bind_vertex_array(Some(self.vao));
@@ -1152,7 +1152,7 @@ fn shader_compilation_error(typ: &str, log: String, source: String) -> CoreError
 
 fn buffer_target(kind: BufferKind) -> u32 {
     match kind {
-        BufferKind::Vertex => crate::context::ARRAY_BUFFER,
+        BufferKind::Vertex(_) => crate::context::ARRAY_BUFFER,
         BufferKind::Element => crate::context::ELEMENT_ARRAY_BUFFER,
         BufferKind::Uniform => crate::context::UNIFORM_BUFFER,
     }

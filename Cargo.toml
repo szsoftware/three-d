@@ -61,6 +61,10 @@ winit = "0.30"
 naga = { version = "29", features = ["glsl-in", "wgsl-out", "spv-out", "msl-out", "hlsl-out"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# OpenGL without a window, used to compare the wgpu backend with the OpenGL backend (only with the wgpu feature)
+glutin = { version = "0.32", default-features = false, features = ["egl"] }
+
 [[example]]
 name = "triangle"
 path = "examples/triangle/src/main.rs"
