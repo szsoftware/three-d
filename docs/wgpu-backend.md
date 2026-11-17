@@ -57,7 +57,64 @@ The images are the same as with OpenGL within a few steps of 255 per channel. Th
 - **Float textures** with 32 bits are filtered linearly only if the adapter supports it (`FLOAT32_FILTERABLE`), otherwise with the nearest texel.
 - **Errors.** For a context created by `three-d`, validation errors are collected and returned by `Context::error_check` (at most 64 between two checks). For `Context::from_wgpu` they go to the error handler of your device.
 - **Custom GLSL.** The translation handles what the shaders of `three-d` and its examples use. A construct it does not know gives a `CoreError::ShaderCompilation` that names it, when the program is created. Known limits: no arrays of samplers, no arrays as inputs or outputs of a shader stage, and a function with a sampler parameter can only be called with the name of a sampler. Shaders are written without a version line, as for OpenGL.
-- **Not there yet:** rendering into a texture view of another wgpu application, shaders written in WGSL, compute shaders.
+- **Not there yet:** rendering into a texture view of another wgpu application, compute shaders.
+
+## Shaders in WGSL
+
+GLSL shaders work with both backends, so they are the first choice. If you only target wgpu, a program can also be written in WGSL.
+This needs the feature `wgsl` (which includes `wgpu`), since it adds the WGSL parser to your binary:
+
+```toml
+three-d = { git = "https://github.com/szsoftware/three-d", features = ["wgsl"] }
+```
+
+```rust
+let program = Program::from_wgsl_source(&context, include_str!("shader.wgsl"))?;
+program.use_uniform("viewProjection", camera.projection() * camera.view());
+program.use_texture("image", &texture);
+program.use_vertex_attribute("position", &positions);
+program.draw_arrays(RenderStates::default(), viewport, positions.vertex_count());
+```
+
+The source has one vertex and one fragment entry point. `Program` finds everything by name, as with GLSL, through these conventions:
+
+| What | Where in the WGSL source | Name |
+| :-- | :-- | :-- |
+| Uniforms (`use_uniform`) | `@group(0) @binding(0) var<uniform>` with a struct type, optionally a second one at `@binding(1)` | the members of the struct |
+| Textures (`use_texture` and its variants) | texture number `i` at `@group(1) @binding(2 * i)`, its sampler at `@group(1) @binding(2 * i + 1)` | the texture variable |
+| Uniform buffers (`use_uniform_block`) | `@group(2) @binding(i) var<uniform>`, counting from 0 | the variable |
+| Attributes (`use_vertex_attribute`, `use_instance_attribute`) | arguments of the vertex entry point with `@location`, or members of an argument that is a struct | the argument or member |
+
+```wgsl
+struct Uniforms {
+    viewProjection: mat4x4<f32>,
+}
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+@group(1) @binding(0) var image: texture_2d<f32>;
+@group(1) @binding(1) var image_sampler: sampler;
+
+struct Varyings {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+
+@vertex
+fn vertex(@location(0) position: vec3<f32>, @location(1) uv: vec2<f32>) -> Varyings {
+    return Varyings(uniforms.viewProjection * vec4(position, 1.0), uv);
+}
+
+@fragment
+fn fragment(in: Varyings) -> @location(0) vec4<f32> {
+    return textureSample(image, image_sampler, in.uv);
+}
+```
+
+Good to know:
+
+- The shader uses the conventions of OpenGL, like a GLSL shader of `three-d`. The matrices of a `Camera` work as they are: return the position in the clip space of OpenGL (y up, z from `-w` to `w`), `three-d` converts it. The first row of a texture is the bottom one.
+- Textures have `f32` values: `texture_2d<f32>`, `texture_2d_array<f32>`, `texture_cube<f32>` or `texture_3d<f32>`. A depth texture is bound the same way and gives the depth in the first channel. Depth texture types, multisampled textures, integer textures and comparison samplers are not supported.
+- A mistake in the source or against the conventions gives a `CoreError::ShaderCompilation` that says what is wrong.
+- With an OpenGL/WebGL context, `Program::from_wgsl_source` returns an error. The materials and effects of `three-d` itself stay in GLSL.
 
 ## How it works
 
