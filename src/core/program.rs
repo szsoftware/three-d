@@ -46,7 +46,7 @@ impl Program {
     /// - `use_vertex_attribute` and `use_instance_attribute`: the name of an argument of the vertex entry point with a `@location`, or of a member of an argument that is a struct.
     ///
     /// The shader uses the conventions of OpenGL like a GLSL shader of this crate, so the matrices of a [Camera](crate::renderer::Camera) work as they are:
-    /// the position returned by the vertex entry point is in the clip space of OpenGL (y up, z from `-w` to `w`), and the first row of a texture is the bottom one.
+    /// the position returned by the vertex entry point is in the clip space of OpenGL (y up, z from `-w` to `w`), and the texel (0, 0) of a texture is at the bottom left of the image.
     ///
     #[cfg(feature = "wgsl")]
     pub fn from_wgsl_source(context: &Context, source: &str) -> Result<Self, CoreError> {
@@ -536,5 +536,161 @@ impl Program {
 impl Drop for Program {
     fn drop(&mut self) {
         self.context.backend().delete_program(self.id);
+    }
+}
+
+///
+/// A compute shader program written in WGSL, which runs on the GPU without drawing anything and writes its results into textures.
+/// Only available with the `wgsl` feature and with a context that uses the wgpu backend (see [Context::as_wgpu]).
+///
+/// The source has one compute entry point. Uniforms, textures and uniform blocks are found by name with the same conventions
+/// as in [Program::from_wgsl_source] (groups 0, 1 and 2). In a compute shader a texture is read with `textureLoad` or `textureSampleLevel`.
+/// The textures the program writes to are in group 3: `@group(3) @binding(i) var name: texture_storage_2d<F, write>`, with `i` counting from 0
+/// and the format `F` one of `rgba8unorm`, `rgba16float`, `rgba32float` or `r32float`.
+///
+/// The results are used like any other texture: read them with [ColorTarget::read] or [ColorTarget::read_async], use them in a material
+/// or as the input of the next run. As in OpenGL, the texel (0, 0) of a texture is at the bottom left of the image.
+///
+#[cfg(feature = "wgsl")]
+pub struct ComputeProgram {
+    // A compute program has uniforms, textures and uniform blocks like every program
+    program: Program,
+}
+
+#[cfg(feature = "wgsl")]
+impl ComputeProgram {
+    ///
+    /// Creates a new compute program from the given WGSL source.
+    /// Returns an error if the source is not valid, does not follow the conventions or if the context does not use the wgpu backend.
+    ///
+    pub fn from_wgsl_source(context: &Context, source: &str) -> Result<Self, CoreError> {
+        let (id, reflection) = context.backend().create_compute_program(source)?;
+        Ok(Self {
+            program: Program::new(context, id, reflection),
+        })
+    }
+
+    ///
+    /// Send the given uniform data to this program and associate it with the given named variable, see [Program::use_uniform].
+    ///
+    /// # Panic
+    /// Will panic if the uniform is not defined in the shader code.
+    ///
+    pub fn use_uniform<T: UniformDataType>(&self, name: &str, data: T) {
+        self.program.use_uniform(name, data);
+    }
+
+    ///
+    /// Send the given array of uniform data to this program and associate it with the given named variable, see [Program::use_uniform_array].
+    ///
+    /// # Panic
+    /// Will panic if the uniform is not defined in the shader code.
+    ///
+    pub fn use_uniform_array<T: UniformDataType>(&self, name: &str, data: &[T]) {
+        self.program.use_uniform_array(name, data);
+    }
+
+    ///
+    /// Returns true if this program has a uniform with the given name.
+    ///
+    pub fn requires_uniform(&self, name: &str) -> bool {
+        self.program.requires_uniform(name)
+    }
+
+    ///
+    /// Use the given [Texture2D] as input of this program and associate it with the given named variable.
+    ///
+    /// # Panic
+    /// Will panic if the texture is not defined in the shader code.
+    ///
+    pub fn use_texture(&self, name: &str, texture: &Texture2D) {
+        self.program.use_texture(name, texture);
+    }
+
+    ///
+    /// Use the given [DepthTexture2D] as input of this program and associate it with the given named variable.
+    /// The depth is in the first channel.
+    ///
+    /// # Panic
+    /// Will panic if the texture is not defined in the shader code.
+    ///
+    pub fn use_depth_texture(&self, name: &str, texture: &DepthTexture2D) {
+        self.program.use_depth_texture(name, texture);
+    }
+
+    ///
+    /// Use the given [Texture2DArray] as input of this program and associate it with the given named variable.
+    ///
+    /// # Panic
+    /// Will panic if the texture is not defined in the shader code.
+    ///
+    pub fn use_texture_array(&self, name: &str, texture: &Texture2DArray) {
+        self.program.use_texture_array(name, texture);
+    }
+
+    ///
+    /// Use the given [TextureCubeMap] as input of this program and associate it with the given named variable.
+    ///
+    /// # Panic
+    /// Will panic if the texture is not defined in the shader code.
+    ///
+    pub fn use_texture_cube(&self, name: &str, texture: &TextureCubeMap) {
+        self.program.use_texture_cube(name, texture);
+    }
+
+    ///
+    /// Use the given [Texture3D] as input of this program and associate it with the given named variable.
+    ///
+    /// # Panic
+    /// Will panic if the texture is not defined in the shader code.
+    ///
+    pub fn use_texture_3d(&self, name: &str, texture: &Texture3D) {
+        self.program.use_texture_3d(name, texture);
+    }
+
+    ///
+    /// Use the given [UniformBuffer] in this program and associate it with the given named variable.
+    ///
+    pub fn use_uniform_block(&self, name: &str, buffer: &UniformBuffer) {
+        self.program.use_uniform_block(name, buffer);
+    }
+
+    ///
+    /// Lets this program write to the given [Texture2D] and associate it with the given named variable of type `texture_storage_2d`.
+    /// The program writes to the largest mip level, the other mip levels are not updated.
+    ///
+    /// The format of the texture must be the one in the shader code: `rgba8unorm` for a texture of `[u8; 4]` or `[u8; 3]`,
+    /// `rgba16float` and `rgba32float` for three or four channels of `f16` and `f32` and `r32float` for one channel of `f32`.
+    /// The texture must not be an input of the same run.
+    ///
+    /// # Panic
+    /// Will panic if the storage texture is not defined in the shader code. [ComputeProgram::dispatch] panics if the format does not fit.
+    ///
+    pub fn use_storage_texture(&self, name: &str, texture: &Texture2D) {
+        if !self
+            .program
+            .context
+            .backend()
+            .bind_storage_texture(self.program.id, name, texture.id())
+        {
+            panic!("the storage texture {name} is sent to the shader but not defined");
+        }
+    }
+
+    ///
+    /// Runs this program with the given number of workgroups in each of the three dimensions.
+    /// The size of a workgroup is defined in the shader code with `@workgroup_size`, so to cover a texture of 100 x 60 texels
+    /// with `@workgroup_size(8, 8)`, dispatch 13 x 8 x 1 workgroups and ignore the texels outside the texture in the shader.
+    ///
+    /// Everything drawn before is finished before the program runs, and its results are there for everything that comes after.
+    ///
+    /// # Panic
+    /// Will panic if a texture, storage texture or uniform block of the shader code has not been set.
+    ///
+    pub fn dispatch(&self, x: u32, y: u32, z: u32) {
+        self.program
+            .context
+            .backend()
+            .dispatch(self.program.id, [x, y, z]);
     }
 }

@@ -3,15 +3,20 @@
 //! Both need no window: OpenGL through EGL, wgpu on whatever adapter it finds (software renderers are enough).
 //! Without EGL or a wgpu adapter the tests are skipped, unless the environment variable `THREE_D_REQUIRE_WGPU` is set (as in CI).
 //!
+//! OpenGL without a window is only set up for Linux. On the other platforms (Metal on macOS, DirectX 12 on Windows) the wgpu backend
+//! is compared with what OpenGL returned on Linux, which is stored in the directory `reference` next to this file.
+//! After a scenario changed, run the tests on Linux with the environment variable `THREE_D_WRITE_REFERENCE` set to update these files.
+//!
 
 use crate::core::*;
-use glutin::api::egl::{device::Device, display::Display};
-use glutin::config::{ConfigSurfaceTypes, ConfigTemplateBuilder};
-use glutin::context::{ContextApi, ContextAttributesBuilder, Version};
-use glutin::prelude::*;
 
 /// An OpenGL context without a window and what keeps it alive.
+#[cfg(target_os = "linux")]
 pub(super) fn gl_context() -> Result<(Context, impl Sized), String> {
+    use glutin::api::egl::{device::Device, display::Display};
+    use glutin::config::{ConfigSurfaceTypes, ConfigTemplateBuilder};
+    use glutin::context::{ContextApi, ContextAttributesBuilder, Version};
+    use glutin::prelude::*;
     let error = |e: glutin::error::Error| e.to_string();
     let devices: Vec<Device> = Device::query_devices()
         .map_err(|e| e.to_string())?
@@ -66,12 +71,32 @@ pub(super) fn compare_with_outliers(
     };
     // All tests share one EGL display, which is initialized and terminated with the contexts
     super::one_gpu_test_at_a_time();
+    let reference = reference_file();
+    #[cfg(target_os = "linux")]
     let expected = {
-        match gl_context() {
+        let expected = match gl_context() {
             Ok((context, _keep_alive)) => scenario(&context),
             Err(error) => return skip("OpenGL context", error),
+        };
+        if std::env::var("THREE_D_WRITE_REFERENCE").is_ok() {
+            std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
+            std::fs::write(&reference, encode(&expected)).unwrap();
         }
+        // The other platforms rely on the file
+        let stored = std::fs::read(&reference).map(|bytes| decode(&bytes).len());
+        assert_eq!(
+            stored.ok(),
+            Some(expected.len()),
+            "{} is missing or outdated, run the tests with THREE_D_WRITE_REFERENCE=1",
+            reference.display()
+        );
+        expected
     };
+    #[cfg(not(target_os = "linux"))]
+    let expected = decode(
+        &std::fs::read(&reference)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", reference.display())),
+    );
     let actual = match Context::new_headless_wgpu() {
         Ok(context) => {
             let actual = scenario(&context);
@@ -104,12 +129,60 @@ pub(super) fn compare_with_outliers(
         .count();
     assert!(
         beyond as f32 <= outliers * expected.len() as f32,
-        "{beyond} of {} values differ by more than {tolerance}, the worst is value {}: {} on OpenGL and {} on wgpu",
+        "{beyond} of {} values differ by more than {tolerance}, the worst is value {}: {} on OpenGL (on Linux) and {} on wgpu",
         expected.len(),
         worst.0,
         worst.2,
         worst.3
     );
+}
+
+///
+/// The file with what OpenGL returns for the scenario of the current call of [compare] in the current test.
+///
+fn reference_file() -> std::path::PathBuf {
+    thread_local!(static CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) });
+    let call = CALLS.with(|calls| calls.replace(calls.get() + 1));
+    let thread = std::thread::current();
+    let test = thread
+        .name()
+        .expect("a test runs in a thread with its name")
+        .rsplit("::")
+        .next()
+        .unwrap()
+        .to_string();
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/core/backend/wgpu/reference")
+        .join(format!("{test}_{call}.bin"))
+}
+
+/// Values that are a multiple of 1/255 are stored as one byte each (after a 0), everything else as `f32` (after a 1).
+fn encode(values: &[f32]) -> Vec<u8> {
+    let bytes: Vec<u8> = values.iter().map(|v| (v * 255.0).round() as u8).collect();
+    if bytes
+        .iter()
+        .zip(values)
+        .all(|(byte, value)| *byte as f32 / 255.0 == *value)
+    {
+        [vec![0], bytes].concat()
+    } else {
+        std::iter::once(1)
+            .chain(values.iter().flat_map(|v| v.to_le_bytes()))
+            .collect()
+    }
+}
+
+fn decode(bytes: &[u8]) -> Vec<f32> {
+    match bytes.split_first() {
+        Some((0, bytes)) => bytes.iter().map(|byte| *byte as f32 / 255.0).collect(),
+        Some((1, bytes)) => bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| f32::from_le_bytes(*v))
+            .collect(),
+        _ => panic!("not a reference file"),
+    }
 }
 
 /// One step of a `u8` color channel, plus rounding.

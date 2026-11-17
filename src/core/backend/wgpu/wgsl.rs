@@ -9,27 +9,32 @@
 //! - **attributes:** the arguments of the vertex entry point with a `@location` (or the members of an argument that is a struct), by their name.
 //!
 //! The shader is written with the conventions of OpenGL like every other shader of this crate: the position it returns is in the clip space of OpenGL
-//! (z from -w to w), and the first row of a texture is the bottom one. The conversion of the position that the GLSL path appends to the vertex shader
+//! (z from -w to w), and the texel (0, 0) of a texture is at the bottom left. The conversion of the position that the GLSL path appends to the vertex shader
 //! is done here on the parsed module, see [convert_clip_space].
 //!
 
 use super::glsl::{SamplerDecl, BLOCK_GROUP, TEXTURE_GROUP, UNIFORM_GROUP};
 use naga::{Expression, Handle, Statement};
 
+/// The bind group with the textures a compute program writes to.
+const STORAGE_GROUP: u32 = 3;
+
 pub(super) struct Shader {
     pub module: naga::Module,
-    /// The names of the vertex and the fragment entry point.
+    /// The names of the vertex and the fragment entry point, or twice the name of the compute entry point.
     pub entry_points: [String; 2],
     pub attributes: Vec<(String, u32)>,
     pub samplers: Vec<SamplerDecl>,
     pub uniform_blocks: Vec<String>,
+    /// The textures a compute program writes to, the binding in [STORAGE_GROUP] is the position in this list.
+    pub storage: Vec<(String, naga::StorageFormat)>,
 }
 
 ///
 /// Parses and validates a WGSL program and finds what [Program](crate::core::Program) addresses by name.
 /// The error is a description of what is wrong.
 ///
-pub(super) fn parse(source: &str) -> Result<Shader, String> {
+pub(super) fn parse(source: &str, compute: bool) -> Result<Shader, String> {
     let mut module = naga::front::wgsl::parse_str(source).map_err(|e| e.emit_to_string(source))?;
     let validate = |module: &naga::Module| {
         naga::valid::Validator::new(
@@ -50,18 +55,22 @@ pub(super) fn parse(source: &str) -> Result<Shader, String> {
             _ => Err(format!("the program has more than one {name} entry point")),
         }
     };
-    let entry_points = [
-        entry_point(naga::ShaderStage::Vertex, "vertex")?,
-        entry_point(naga::ShaderStage::Fragment, "fragment")?,
-    ];
+    let entry_points = if compute {
+        let name = entry_point(naga::ShaderStage::Compute, "compute")?;
+        [name.clone(), name]
+    } else {
+        [
+            entry_point(naga::ShaderStage::Vertex, "vertex")?,
+            entry_point(naga::ShaderStage::Fragment, "fragment")?,
+        ]
+    };
 
     let mut attributes = Vec::new();
     let vertex = module
         .entry_points
         .iter()
-        .find(|e| e.stage == naga::ShaderStage::Vertex)
-        .unwrap();
-    for argument in &vertex.function.arguments {
+        .find(|e| e.stage == naga::ShaderStage::Vertex);
+    for argument in vertex.iter().flat_map(|v| &v.function.arguments) {
         let mut add = |name: &Option<String>, binding: &Option<naga::Binding>| {
             if let (Some(name), Some(naga::Binding::Location { location, .. })) = (name, binding) {
                 attributes.push((name.clone(), *location));
@@ -77,6 +86,7 @@ pub(super) fn parse(source: &str) -> Result<Shader, String> {
 
     let mut textures = Vec::new();
     let mut blocks = Vec::new();
+    let mut storage = Vec::new();
     for (_, variable) in module.global_variables.iter() {
         let Some(binding) = &variable.binding else {
             continue;
@@ -138,6 +148,28 @@ pub(super) fn parse(source: &str) -> Result<Shader, String> {
                 }
                 blocks.push((binding.binding, name));
             }
+            STORAGE_GROUP if compute => match inner {
+                naga::TypeInner::Image {
+                    dim: naga::ImageDimension::D2,
+                    arrayed: false,
+                    class:
+                        naga::ImageClass::Storage {
+                            format:
+                                format @ (naga::StorageFormat::Rgba8Unorm
+                                | naga::StorageFormat::Rgba16Float
+                                | naga::StorageFormat::Rgba32Float
+                                | naga::StorageFormat::R32Float),
+                            access,
+                        },
+                } if *access == naga::StorageAccess::STORE => {
+                    storage.push((binding.binding, name, *format));
+                }
+                _ => {
+                    return Err(format!(
+                        "{name}: group {STORAGE_GROUP} is for the textures the program writes to, of type texture_storage_2d<F, write> with F one of rgba8unorm, rgba16float, rgba32float or r32float"
+                    ))
+                }
+            },
             group => {
                 return Err(format!(
                     "{name}: group {group} is not supported, use group {UNIFORM_GROUP} for uniforms, {TEXTURE_GROUP} for textures and {BLOCK_GROUP} for uniform buffers"
@@ -166,25 +198,42 @@ pub(super) fn parse(source: &str) -> Result<Shader, String> {
             "{name}: the uniform buffers must be at the bindings 0, 1, 2, .. without a gap, binding {index} is free"
         ));
     }
+    storage.sort_by_key(|(binding, ..)| *binding);
+    if let Some((index, (_, name, _))) = storage
+        .iter()
+        .enumerate()
+        .find(|(index, (binding, ..))| *index as u32 != *binding)
+    {
+        return Err(format!(
+            "{name}: the storage textures must be at the bindings 0, 1, 2, .. without a gap, binding {index} is free"
+        ));
+    }
+    let storage = storage
+        .into_iter()
+        .map(|(_, name, format)| (name, format))
+        .collect();
     let samplers = textures
         .into_iter()
         .map(|(_, name, glsl_type)| SamplerDecl {
             name,
             glsl_type: glsl_type.to_string(),
-            in_vertex: true,
-            in_fragment: true,
+            in_vertex: !compute,
+            in_fragment: !compute,
         })
         .collect();
     let uniform_blocks = blocks.into_iter().map(|(_, name)| name).collect();
 
-    convert_clip_space(&mut module)?;
-    validate(&module).map_err(|e| format!("the converted vertex shader is not valid: {e}"))?;
+    if !compute {
+        convert_clip_space(&mut module)?;
+        validate(&module).map_err(|e| format!("the converted vertex shader is not valid: {e}"))?;
+    }
     Ok(Shader {
         module,
         entry_points,
         attributes,
         samplers,
         uniform_blocks,
+        storage,
     })
 }
 

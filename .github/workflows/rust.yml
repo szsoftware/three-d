@@ -56,7 +56,18 @@ jobs:
 
       # Software drivers for Vulkan and OpenGL (through EGL), so that the tests of the wgpu backend run without a GPU and compare it with the OpenGL backend
       - if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get install -y mesa-vulkan-drivers libegl1 libegl-mesa0 libgl1-mesa-dri && echo "THREE_D_REQUIRE_WGPU=1" >> $GITHUB_ENV
+        run: sudo apt-get install -y mesa-vulkan-drivers libegl1 libegl-mesa0 libgl1-mesa-dri && echo "THREE_D_EXPECT_BACKEND=vulkan" >> $GITHUB_ENV
+
+      # macOS tests the wgpu backend on Metal and Windows on DirectX 12 (software adapter), both against what OpenGL returned on Linux
+      - if: startsWith(matrix.os, 'macos')
+        run: echo "THREE_D_EXPECT_BACKEND=metal" >> $GITHUB_ENV
+      - if: startsWith(matrix.os, 'windows')
+        shell: bash
+        run: echo "THREE_D_EXPECT_BACKEND=dx12" >> $GITHUB_ENV
+
+      - name: Graphics adapter of the tests
+        shell: bash
+        run: echo "THREE_D_REQUIRE_WGPU=1" >> $GITHUB_ENV && THREE_D_REQUIRE_WGPU=1 cargo test --all-features --lib adapter_is_the_expected_one -- --nocapture
 
       - name: Test
         uses: actions-rs/cargo@v1

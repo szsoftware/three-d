@@ -1015,7 +1015,7 @@ fn gui() {
 }
 
 /// On OpenGL, the GUI drawn with the core module looks the same as the GUI drawn by `egui_glow`.
-#[cfg(feature = "egui-gui")]
+#[cfg(all(feature = "egui-gui", target_os = "linux"))]
 #[test]
 fn gui_core_painter_matches_egui_glow() {
     super::one_gpu_test_at_a_time();

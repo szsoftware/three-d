@@ -26,10 +26,10 @@ mod builtin;
 mod screen;
 #[cfg_attr(not(feature = "window"), allow(unused_imports))]
 pub(crate) use screen::{AdapterPreference, ScreenDesc};
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod compare_tests;
 pub(crate) mod glsl;
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod renderer_compare_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod shader_tests;
@@ -37,7 +37,7 @@ mod shader_tests;
 mod tests;
 #[cfg(feature = "wgsl")]
 mod wgsl;
-#[cfg(all(test, feature = "wgsl", target_os = "linux"))]
+#[cfg(all(test, feature = "wgsl", not(target_arch = "wasm32")))]
 mod wgsl_tests;
 
 /// The size of the ring buffer for uniforms, it grows if a single program needs more.
@@ -254,6 +254,8 @@ struct ProgramEntry {
     /// The names of the entry points of the vertex and fragment shader.
     entry_points: [String; 2],
     samplers: Vec<(glsl::SamplerDecl, u32)>,
+    /// Set if this is a compute program, then `vertex` is the module with the compute entry point `entry_points[0]`.
+    compute: Option<ComputeEntry>,
     /// The buffer bound to each vertex attribute location.
     attributes: HashMap<u32, (u32, VertexFormat, u32)>,
     attribute_locations: Vec<u32>,
@@ -266,6 +268,17 @@ struct ProgramEntry {
     user_blocks: Vec<(String, Option<u32>)>,
     user_block_layout: w::BindGroupLayout,
     number_of_outputs: usize,
+}
+
+/// What a compute program has in addition to the uniforms, textures and uniform blocks of every program.
+// Compute programs can only be created with the `wgsl` feature
+#[cfg_attr(not(feature = "wgsl"), allow(dead_code))]
+struct ComputeEntry {
+    /// The textures the program writes to: name, format and the texture that is bound.
+    storage: Vec<(String, w::TextureFormat, Option<u32>)>,
+    storage_layout: w::BindGroupLayout,
+    /// The pipelines by the way the textures of the program are sampled.
+    pipelines: HashMap<Vec<SampleKind>, w::ComputePipeline>,
 }
 
 /// How a texture is sampled, which depends on its format.
@@ -912,6 +925,21 @@ fn texture_format(format: TextureFormat) -> (w::TextureFormat, usize) {
     }
 }
 
+/// The formats a compute program can write to get the usage for it, which only matters with the `wgsl` feature.
+fn storage_usage(format: w::TextureFormat) -> w::TextureUsages {
+    use w::TextureFormat as F;
+    if cfg!(feature = "wgsl")
+        && matches!(
+            format,
+            F::Rgba8Unorm | F::Rgba16Float | F::Rgba32Float | F::R32Float
+        )
+    {
+        w::TextureUsages::STORAGE_BINDING
+    } else {
+        w::TextureUsages::empty()
+    }
+}
+
 fn primitive_size(primitive: PrimitiveType) -> usize {
     match primitive {
         PrimitiveType::U8 | PrimitiveType::I8 => 1,
@@ -1433,7 +1461,8 @@ impl BackendApi for WgpuBackend {
             usage: w::TextureUsages::TEXTURE_BINDING
                 | w::TextureUsages::COPY_DST
                 | w::TextureUsages::COPY_SRC
-                | w::TextureUsages::RENDER_ATTACHMENT,
+                | w::TextureUsages::RENDER_ATTACHMENT
+                | storage_usage(format),
             view_formats: &[],
         });
         let entry = TextureEntry {
@@ -1724,7 +1753,181 @@ impl BackendApi for WgpuBackend {
             samplers: translation.samplers,
             attributes: translation.attributes,
             uniform_blocks: translation.uniform_blocks,
+            storage: None,
         }))
+    }
+
+    #[cfg(feature = "wgsl")]
+    fn create_compute_program(
+        &self,
+        source: &str,
+    ) -> Result<(ProgramId, ProgramReflection), CoreError> {
+        let shader = wgsl::parse(source, true).map_err(|e| shader_error("WGSL", source, e))?;
+        let (members, size) = block_members(&shader.module, 0);
+        let (more_members, more_size) = block_members(&shader.module, 1);
+        let mut uniform_names: Vec<String> =
+            members.keys().chain(more_members.keys()).cloned().collect();
+        uniform_names.sort();
+        if let Some(name) = uniform_names.windows(2).find(|n| n[0] == n[1]) {
+            return Err(shader_error(
+                "WGSL",
+                source,
+                format!("the uniform {} is in both uniform structs", name[0]),
+            ));
+        }
+        let storage = shader
+            .storage
+            .into_iter()
+            .map(|(name, format)| {
+                let format = match format {
+                    naga::StorageFormat::Rgba8Unorm => w::TextureFormat::Rgba8Unorm,
+                    naga::StorageFormat::Rgba16Float => w::TextureFormat::Rgba16Float,
+                    naga::StorageFormat::Rgba32Float => w::TextureFormat::Rgba32Float,
+                    _ => w::TextureFormat::R32Float,
+                };
+                (name, format)
+            })
+            .collect();
+        Ok(self.insert_program(ProgramParts {
+            number_of_outputs: 0,
+            vertex: shader.module,
+            fragment: None,
+            entry_points: shader.entry_points,
+            members: [members, more_members],
+            sizes: [size, more_size],
+            block_visibility: [w::ShaderStages::COMPUTE; 2],
+            uniform_names,
+            samplers: shader.samplers,
+            attributes: Vec::new(),
+            uniform_blocks: shader.uniform_blocks,
+            storage: Some(storage),
+        }))
+    }
+
+    #[cfg(feature = "wgsl")]
+    fn bind_storage_texture(&self, program: ProgramId, name: &str, texture: TextureId) -> bool {
+        let mut state = self.lock();
+        let compute = state
+            .programs
+            .get_mut(&program.wgpu())
+            .and_then(|program| program.compute.as_mut())
+            .expect("not a compute program");
+        match compute.storage.iter_mut().find(|(n, ..)| n == name) {
+            Some(slot) => {
+                slot.2 = Some(texture.wgpu());
+                true
+            }
+            None => false,
+        }
+    }
+
+    #[cfg(feature = "wgsl")]
+    fn dispatch(&self, program: ProgramId, groups: [u32; 3]) {
+        let program_id = program.wgpu();
+        let state = &mut *self.lock();
+        let bindings = self.bindings(state, program_id);
+
+        // The textures the program writes to
+        let compute = state.programs[&program_id].compute.as_ref().unwrap();
+        let views: Vec<w::TextureView> = compute
+            .storage
+            .iter()
+            .map(|(name, format, texture)| {
+                let entry = texture
+                    .and_then(|texture| state.textures.get(&texture))
+                    .unwrap_or_else(|| panic!("no texture is bound to the storage texture {name}"));
+                if entry.texture.format() != *format
+                    || entry.texture.dimension() != w::TextureDimension::D2
+                    || entry.texture.depth_or_array_layers() != 1
+                    || !entry.texture.usage().contains(w::TextureUsages::STORAGE_BINDING)
+                {
+                    panic!(
+                        "the texture bound to the storage texture {name} must be a 2D texture with the format {format:?}, it has the format {:?}",
+                        entry.texture.format()
+                    );
+                }
+                entry.texture.create_view(&w::TextureViewDescriptor {
+                    dimension: Some(w::TextureViewDimension::D2),
+                    base_mip_level: 0,
+                    mip_level_count: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let storage_group = self.device.create_bind_group(&w::BindGroupDescriptor {
+            label: None,
+            layout: &compute.storage_layout,
+            entries: &views
+                .iter()
+                .enumerate()
+                .map(|(binding, view)| w::BindGroupEntry {
+                    binding: binding as u32,
+                    resource: w::BindingResource::TextureView(view),
+                })
+                .collect::<Vec<_>>(),
+        });
+
+        let program = state.programs.get_mut(&program_id).unwrap();
+        if !program
+            .compute
+            .as_ref()
+            .unwrap()
+            .pipelines
+            .contains_key(&bindings.sample_kinds)
+        {
+            let compute = program.compute.as_ref().unwrap();
+            let layout = self
+                .device
+                .create_pipeline_layout(&w::PipelineLayoutDescriptor {
+                    label: None,
+                    bind_group_layouts: &[
+                        Some(&program.uniform_layout),
+                        Some(&program.texture_layouts[&bindings.sample_kinds]),
+                        Some(&program.user_block_layout),
+                        Some(&compute.storage_layout),
+                    ],
+                    immediate_size: 0,
+                });
+            let pipeline = self
+                .device
+                .create_compute_pipeline(&w::ComputePipelineDescriptor {
+                    label: None,
+                    layout: Some(&layout),
+                    module: &program.vertex,
+                    entry_point: Some(&program.entry_points[0]),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+            program
+                .compute
+                .as_mut()
+                .unwrap()
+                .pipelines
+                .insert(bindings.sample_kinds.clone(), pipeline);
+        }
+        let pipeline = program.compute.as_ref().unwrap().pipelines[&bindings.sample_kinds].clone();
+        let empty_blocks = bindings.user_block_group.is_none().then(|| {
+            self.device.create_bind_group(&w::BindGroupDescriptor {
+                label: None,
+                layout: &program.user_block_layout,
+                entries: &[],
+            })
+        });
+
+        // Recorded after what was drawn so far, a render pass that is open ends here
+        let mut pass = self
+            .encoder(state)
+            .begin_compute_pass(&w::ComputePassDescriptor::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bindings.uniform_group, &bindings.dynamic_offsets);
+        pass.set_bind_group(1, &bindings.texture_group, &[]);
+        pass.set_bind_group(
+            2,
+            bindings.user_block_group.as_ref().or(empty_blocks.as_ref()),
+            &[],
+        );
+        pass.set_bind_group(3, &storage_group, &[]);
+        pass.dispatch_workgroups(groups[0], groups[1], groups[2]);
     }
 
     #[cfg(feature = "wgsl")]
@@ -1732,7 +1935,7 @@ impl BackendApi for WgpuBackend {
         &self,
         source: &str,
     ) -> Result<(ProgramId, ProgramReflection), CoreError> {
-        let shader = wgsl::parse(source).map_err(|e| shader_error("WGSL", source, e))?;
+        let shader = wgsl::parse(source, false).map_err(|e| shader_error("WGSL", source, e))?;
         let (members, size) = block_members(&shader.module, 0);
         let (more_members, more_size) = block_members(&shader.module, 1);
         let mut uniform_names: Vec<String> =
@@ -1757,6 +1960,7 @@ impl BackendApi for WgpuBackend {
             samplers: shader.samplers,
             attributes: shader.attributes,
             uniform_blocks: shader.uniform_blocks,
+            storage: None,
         }))
     }
 
@@ -1960,209 +2164,14 @@ impl BackendApi for WgpuBackend {
             vertex_buffers.push(state.merged_buffers[&key].clone());
             vertex_layouts.push((true, offset, layout));
         }
-        let program = &state.programs[&program_id];
-
-        // Textures and samplers
-        let mut sample_kinds = Vec::new();
-        let mut textures = Vec::new();
-        for (sampler, unit) in &program.samplers {
-            let texture = state
-                .units
-                .get(unit)
-                .filter(|texture| state.textures.contains_key(texture))
-                .unwrap_or_else(|| panic!("no texture is bound for the uniform {}", sampler.name));
-            sample_kinds.push(match state.textures[texture].format {
-                TextureFormat::Depth(_) => SampleKind::Unfilterable,
-                TextureFormat::Color(ColorFormat {
-                    primitive: PrimitiveType::F32,
-                    ..
-                }) if !self.float32_filterable => SampleKind::Unfilterable,
-                _ => SampleKind::Filterable,
-            });
-            textures.push(*texture);
-        }
-        let texture_key = (program_id, textures);
-        if !state.texture_groups.contains_key(&texture_key) {
-            let program = state.programs.get_mut(&program_id).unwrap();
-            let samplers = &program.samplers;
-            let layout = program
-                .texture_layouts
-                .entry(sample_kinds.clone())
-                .or_insert_with(|| {
-                    let entries: Vec<_> = samplers
-                        .iter()
-                        .zip(&sample_kinds)
-                        .enumerate()
-                        .flat_map(|(index, ((sampler, _), kind))| {
-                            let mut visibility = w::ShaderStages::empty();
-                            if sampler.in_vertex {
-                                visibility |= w::ShaderStages::VERTEX;
-                            }
-                            if sampler.in_fragment {
-                                visibility |= w::ShaderStages::FRAGMENT;
-                            }
-                            [
-                                w::BindGroupLayoutEntry {
-                                    binding: 2 * index as u32,
-                                    visibility,
-                                    ty: w::BindingType::Texture {
-                                        sample_type: match kind {
-                                            SampleKind::Filterable => {
-                                                w::TextureSampleType::Float { filterable: true }
-                                            }
-                                            SampleKind::Unfilterable => {
-                                                w::TextureSampleType::Float { filterable: false }
-                                            }
-                                        },
-                                        view_dimension: texture_view_dimension(&sampler.glsl_type),
-                                        multisampled: false,
-                                    },
-                                    count: None,
-                                },
-                                w::BindGroupLayoutEntry {
-                                    binding: 2 * index as u32 + 1,
-                                    visibility,
-                                    ty: w::BindingType::Sampler(
-                                        if *kind == SampleKind::Filterable {
-                                            w::SamplerBindingType::Filtering
-                                        } else {
-                                            w::SamplerBindingType::NonFiltering
-                                        },
-                                    ),
-                                    count: None,
-                                },
-                            ]
-                        })
-                        .collect();
-                    self.device
-                        .create_bind_group_layout(&w::BindGroupLayoutDescriptor {
-                            label: None,
-                            entries: &entries,
-                        })
-                });
-            let mut resources = Vec::new();
-            for (((sampler, _), kind), texture) in
-                samplers.iter().zip(&sample_kinds).zip(&texture_key.1)
-            {
-                let entry = state.textures.get_mut(texture).unwrap();
-                let dimension = texture_view_dimension(&sampler.glsl_type);
-                let view = entry
-                    .views
-                    .entry(dimension)
-                    .or_insert_with(|| {
-                        entry.texture.create_view(&w::TextureViewDescriptor {
-                            dimension: Some(dimension),
-                            ..Default::default()
-                        })
-                    })
-                    .clone();
-                let sampler = if *kind == SampleKind::Filterable {
-                    entry.sampler.clone()
-                } else {
-                    entry.nearest_sampler.clone()
-                };
-                resources.push((view, sampler));
-            }
-            let entries: Vec<_> = resources
-                .iter()
-                .enumerate()
-                .flat_map(|(index, (view, sampler))| {
-                    [
-                        w::BindGroupEntry {
-                            binding: 2 * index as u32,
-                            resource: w::BindingResource::TextureView(view),
-                        },
-                        w::BindGroupEntry {
-                            binding: 2 * index as u32 + 1,
-                            resource: w::BindingResource::Sampler(sampler),
-                        },
-                    ]
-                })
-                .collect();
-            let group = self.device.create_bind_group(&w::BindGroupDescriptor {
-                label: None,
-                layout,
-                entries: &entries,
-            });
-            state.texture_groups.insert(texture_key.clone(), group);
-        }
-        let texture_group = state.texture_groups[&texture_key].clone();
-
-        // Uniforms: the blocks are only uploaded again if they changed since the last draw call with this program
-        let offsets = match state.programs[&program_id].uploaded {
-            Some((epoch, offsets)) if epoch == state.epoch => offsets,
-            _ => {
-                let blocks =
-                    std::mem::take(&mut state.programs.get_mut(&program_id).unwrap().blocks);
-                // Both blocks in one piece, so that the first one cannot be submitted away while the second one is added
-                let second = blocks[0].len().next_multiple_of(self.uniform_alignment);
-                let mut bytes = blocks[0].clone();
-                bytes.resize(second, 0);
-                bytes.extend_from_slice(&blocks[1]);
-                let first = self.upload_uniforms(state, &bytes);
-                let offsets = [first, first + second as u32];
-                let program = state.programs.get_mut(&program_id).unwrap();
-                program.blocks = blocks;
-                program.uploaded = Some((state.epoch, offsets));
-                offsets
-            }
-        };
-        let generation = state.ring.generation;
-        let program = state.programs.get_mut(&program_id).unwrap();
-        if !matches!(&program.uniform_group, Some((g, _)) if *g == generation) {
-            let entries: Vec<_> = program
-                .blocks
-                .iter()
-                .enumerate()
-                .filter(|(_, bytes)| !bytes.is_empty())
-                .map(|(binding, bytes)| w::BindGroupEntry {
-                    binding: binding as u32,
-                    resource: w::BindingResource::Buffer(w::BufferBinding {
-                        buffer: &state.ring.buffer,
-                        offset: 0,
-                        size: NonZeroU64::new(bytes.len() as u64),
-                    }),
-                })
-                .collect();
-            let group = self.device.create_bind_group(&w::BindGroupDescriptor {
-                label: None,
-                layout: &program.uniform_layout,
-                entries: &entries,
-            });
-            program.uniform_group = Some((generation, group));
-        }
-        let uniform_group = program.uniform_group.as_ref().unwrap().1.clone();
-        let dynamic_offsets: Vec<u32> = (0..2)
-            .filter(|block| !program.blocks[*block].is_empty())
-            .map(|block| offsets[block])
-            .collect();
-
-        // The uniform blocks declared in the shaders
-        let user_block_group = (!program.user_blocks.is_empty()).then(|| {
-            let buffers: Vec<_> = program
-                .user_blocks
-                .iter()
-                .map(|(name, buffer)| {
-                    buffer
-                        .and_then(|buffer| state.buffers.get(&buffer))
-                        .and_then(|entry| entry.buffer.clone())
-                        .unwrap_or_else(|| panic!("no buffer is bound to the uniform block {name}"))
-                })
-                .collect();
-            let entries: Vec<_> = buffers
-                .iter()
-                .enumerate()
-                .map(|(binding, buffer)| w::BindGroupEntry {
-                    binding: binding as u32,
-                    resource: buffer.as_entire_binding(),
-                })
-                .collect();
-            self.device.create_bind_group(&w::BindGroupDescriptor {
-                label: None,
-                layout: &program.user_block_layout,
-                entries: &entries,
-            })
-        });
+        // Uniforms, textures and uniform blocks. This can submit the recorded commands, so it comes before the pass is looked up
+        let Bindings {
+            sample_kinds,
+            texture_group,
+            uniform_group,
+            dynamic_offsets,
+            user_block_group,
+        } = self.bindings(state, program_id);
 
         let index_buffer = call.indices.map(|indices| {
             let entry = state.buffers.get_mut(&indices.buffer.wgpu()).unwrap();
@@ -2416,6 +2425,8 @@ struct ProgramParts {
     attributes: Vec<(String, u32)>,
     uniform_blocks: Vec<String>,
     number_of_outputs: usize,
+    /// For a compute program, the names and formats of the textures it writes to.
+    storage: Option<Vec<(String, w::TextureFormat)>>,
 }
 
 /// The number of color outputs of the fragment shader.
@@ -2449,6 +2460,7 @@ impl WgpuBackend {
             attributes,
             uniform_blocks,
             number_of_outputs,
+            storage,
         } = parts;
         let mut reflection = ProgramReflection::default();
         let mut uniforms = Vec::new();
@@ -2504,7 +2516,11 @@ impl WgpuBackend {
         let user_block_entries: Vec<_> = (0..uniform_blocks.len())
             .map(|binding| w::BindGroupLayoutEntry {
                 binding: binding as u32,
-                visibility: w::ShaderStages::VERTEX_FRAGMENT,
+                visibility: if storage.is_some() {
+                    w::ShaderStages::COMPUTE
+                } else {
+                    w::ShaderStages::VERTEX_FRAGMENT
+                },
                 ty: w::BindingType::Buffer {
                     ty: w::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -2526,10 +2542,37 @@ impl WgpuBackend {
             // Both stages are in the same module
             None => vertex.clone(),
         };
+        let compute = storage.map(|storage| ComputeEntry {
+            storage_layout: self
+                .device
+                .create_bind_group_layout(&w::BindGroupLayoutDescriptor {
+                    label: None,
+                    entries: &storage
+                        .iter()
+                        .enumerate()
+                        .map(|(binding, (_, format))| w::BindGroupLayoutEntry {
+                            binding: binding as u32,
+                            visibility: w::ShaderStages::COMPUTE,
+                            ty: w::BindingType::StorageTexture {
+                                access: w::StorageTextureAccess::WriteOnly,
+                                format: *format,
+                                view_dimension: w::TextureViewDimension::D2,
+                            },
+                            count: None,
+                        })
+                        .collect::<Vec<_>>(),
+                }),
+            storage: storage
+                .into_iter()
+                .map(|(name, format)| (name, format, None))
+                .collect(),
+            pipelines: HashMap::new(),
+        });
         let entry = ProgramEntry {
             vertex,
             fragment,
             entry_points,
+            compute,
             blocks: [vec![0; vertex_size], vec![0; fragment_size]],
             uploaded: None,
             uniforms,
@@ -2554,5 +2597,239 @@ impl WgpuBackend {
         let id = Self::id(&mut state);
         state.programs.insert(id, entry);
         (ProgramId::Wgpu(id), reflection)
+    }
+}
+
+/// The bind groups of a program with what is currently bound to it.
+struct Bindings {
+    sample_kinds: Vec<SampleKind>,
+    texture_group: w::BindGroup,
+    uniform_group: w::BindGroup,
+    /// Where the uniform blocks of the program are in the ring buffer.
+    dynamic_offsets: Vec<u32>,
+    user_block_group: Option<w::BindGroup>,
+}
+
+impl WgpuBackend {
+    ///
+    /// Creates or looks up the bind groups for the uniforms, textures and uniform blocks of the program.
+    /// Submits the recorded commands if the ring buffer for the uniforms is full.
+    ///
+    fn bindings(&self, state: &mut State, program_id: u32) -> Bindings {
+        let program = &state.programs[&program_id];
+
+        // Textures and samplers
+        let mut sample_kinds = Vec::new();
+        let mut textures = Vec::new();
+        for (sampler, unit) in &program.samplers {
+            let texture = state
+                .units
+                .get(unit)
+                .filter(|texture| state.textures.contains_key(texture))
+                .unwrap_or_else(|| panic!("no texture is bound for the uniform {}", sampler.name));
+            sample_kinds.push(match state.textures[texture].format {
+                TextureFormat::Depth(_) => SampleKind::Unfilterable,
+                TextureFormat::Color(ColorFormat {
+                    primitive: PrimitiveType::F32,
+                    ..
+                }) if !self.float32_filterable => SampleKind::Unfilterable,
+                _ => SampleKind::Filterable,
+            });
+            textures.push(*texture);
+        }
+        let texture_key = (program_id, textures);
+        if !state.texture_groups.contains_key(&texture_key) {
+            let program = state.programs.get_mut(&program_id).unwrap();
+            let compute = program.compute.is_some();
+            let samplers = &program.samplers;
+            let layout = program
+                .texture_layouts
+                .entry(sample_kinds.clone())
+                .or_insert_with(|| {
+                    let entries: Vec<_> = samplers
+                        .iter()
+                        .zip(&sample_kinds)
+                        .enumerate()
+                        .flat_map(|(index, ((sampler, _), kind))| {
+                            let mut visibility = w::ShaderStages::empty();
+                            if compute {
+                                visibility |= w::ShaderStages::COMPUTE;
+                            }
+                            if sampler.in_vertex {
+                                visibility |= w::ShaderStages::VERTEX;
+                            }
+                            if sampler.in_fragment {
+                                visibility |= w::ShaderStages::FRAGMENT;
+                            }
+                            [
+                                w::BindGroupLayoutEntry {
+                                    binding: 2 * index as u32,
+                                    visibility,
+                                    ty: w::BindingType::Texture {
+                                        sample_type: match kind {
+                                            SampleKind::Filterable => {
+                                                w::TextureSampleType::Float { filterable: true }
+                                            }
+                                            SampleKind::Unfilterable => {
+                                                w::TextureSampleType::Float { filterable: false }
+                                            }
+                                        },
+                                        view_dimension: texture_view_dimension(&sampler.glsl_type),
+                                        multisampled: false,
+                                    },
+                                    count: None,
+                                },
+                                w::BindGroupLayoutEntry {
+                                    binding: 2 * index as u32 + 1,
+                                    visibility,
+                                    ty: w::BindingType::Sampler(
+                                        if *kind == SampleKind::Filterable {
+                                            w::SamplerBindingType::Filtering
+                                        } else {
+                                            w::SamplerBindingType::NonFiltering
+                                        },
+                                    ),
+                                    count: None,
+                                },
+                            ]
+                        })
+                        .collect();
+                    self.device
+                        .create_bind_group_layout(&w::BindGroupLayoutDescriptor {
+                            label: None,
+                            entries: &entries,
+                        })
+                });
+            let mut resources = Vec::new();
+            for (((sampler, _), kind), texture) in
+                samplers.iter().zip(&sample_kinds).zip(&texture_key.1)
+            {
+                let entry = state.textures.get_mut(texture).unwrap();
+                let dimension = texture_view_dimension(&sampler.glsl_type);
+                let view = entry
+                    .views
+                    .entry(dimension)
+                    .or_insert_with(|| {
+                        entry.texture.create_view(&w::TextureViewDescriptor {
+                            dimension: Some(dimension),
+                            ..Default::default()
+                        })
+                    })
+                    .clone();
+                let sampler = if *kind == SampleKind::Filterable {
+                    entry.sampler.clone()
+                } else {
+                    entry.nearest_sampler.clone()
+                };
+                resources.push((view, sampler));
+            }
+            let entries: Vec<_> = resources
+                .iter()
+                .enumerate()
+                .flat_map(|(index, (view, sampler))| {
+                    [
+                        w::BindGroupEntry {
+                            binding: 2 * index as u32,
+                            resource: w::BindingResource::TextureView(view),
+                        },
+                        w::BindGroupEntry {
+                            binding: 2 * index as u32 + 1,
+                            resource: w::BindingResource::Sampler(sampler),
+                        },
+                    ]
+                })
+                .collect();
+            let group = self.device.create_bind_group(&w::BindGroupDescriptor {
+                label: None,
+                layout,
+                entries: &entries,
+            });
+            state.texture_groups.insert(texture_key.clone(), group);
+        }
+        let texture_group = state.texture_groups[&texture_key].clone();
+
+        // Uniforms: the blocks are only uploaded again if they changed since the last draw call with this program
+        let offsets = match state.programs[&program_id].uploaded {
+            Some((epoch, offsets)) if epoch == state.epoch => offsets,
+            _ => {
+                let blocks =
+                    std::mem::take(&mut state.programs.get_mut(&program_id).unwrap().blocks);
+                // Both blocks in one piece, so that the first one cannot be submitted away while the second one is added
+                let second = blocks[0].len().next_multiple_of(self.uniform_alignment);
+                let mut bytes = blocks[0].clone();
+                bytes.resize(second, 0);
+                bytes.extend_from_slice(&blocks[1]);
+                let first = self.upload_uniforms(state, &bytes);
+                let offsets = [first, first + second as u32];
+                let program = state.programs.get_mut(&program_id).unwrap();
+                program.blocks = blocks;
+                program.uploaded = Some((state.epoch, offsets));
+                offsets
+            }
+        };
+        let generation = state.ring.generation;
+        let program = state.programs.get_mut(&program_id).unwrap();
+        if !matches!(&program.uniform_group, Some((g, _)) if *g == generation) {
+            let entries: Vec<_> = program
+                .blocks
+                .iter()
+                .enumerate()
+                .filter(|(_, bytes)| !bytes.is_empty())
+                .map(|(binding, bytes)| w::BindGroupEntry {
+                    binding: binding as u32,
+                    resource: w::BindingResource::Buffer(w::BufferBinding {
+                        buffer: &state.ring.buffer,
+                        offset: 0,
+                        size: NonZeroU64::new(bytes.len() as u64),
+                    }),
+                })
+                .collect();
+            let group = self.device.create_bind_group(&w::BindGroupDescriptor {
+                label: None,
+                layout: &program.uniform_layout,
+                entries: &entries,
+            });
+            program.uniform_group = Some((generation, group));
+        }
+        let uniform_group = program.uniform_group.as_ref().unwrap().1.clone();
+        let dynamic_offsets: Vec<u32> = (0..2)
+            .filter(|block| !program.blocks[*block].is_empty())
+            .map(|block| offsets[block])
+            .collect();
+
+        // The uniform blocks declared in the shaders
+        let user_block_group = (!program.user_blocks.is_empty()).then(|| {
+            let buffers: Vec<_> = program
+                .user_blocks
+                .iter()
+                .map(|(name, buffer)| {
+                    buffer
+                        .and_then(|buffer| state.buffers.get(&buffer))
+                        .and_then(|entry| entry.buffer.clone())
+                        .unwrap_or_else(|| panic!("no buffer is bound to the uniform block {name}"))
+                })
+                .collect();
+            let entries: Vec<_> = buffers
+                .iter()
+                .enumerate()
+                .map(|(binding, buffer)| w::BindGroupEntry {
+                    binding: binding as u32,
+                    resource: buffer.as_entire_binding(),
+                })
+                .collect();
+            self.device.create_bind_group(&w::BindGroupDescriptor {
+                label: None,
+                layout: &program.user_block_layout,
+                entries: &entries,
+            })
+        });
+
+        Bindings {
+            sample_kinds,
+            texture_group,
+            uniform_group,
+            dynamic_offsets,
+            user_block_group,
+        }
     }
 }
