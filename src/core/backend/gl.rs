@@ -1152,7 +1152,7 @@ fn shader_compilation_error(typ: &str, log: String, source: String) -> CoreError
 
 fn buffer_target(kind: BufferKind) -> u32 {
     match kind {
-        BufferKind::Vertex(_) => crate::context::ARRAY_BUFFER,
+        BufferKind::Vertex(_) | BufferKind::Instance(_) => crate::context::ARRAY_BUFFER,
         BufferKind::Element => crate::context::ELEMENT_ARRAY_BUFFER,
         BufferKind::Uniform => crate::context::UNIFORM_BUFFER,
     }

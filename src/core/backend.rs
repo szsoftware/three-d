@@ -243,6 +243,8 @@ pub enum UniformValue {
 pub(crate) enum BufferKind {
     /// Vertex attributes in the given format, tightly packed.
     Vertex(VertexFormat),
+    /// Vertex attributes per instance in the given format, tightly packed.
+    Instance(VertexFormat),
     Element,
     Uniform,
 }
