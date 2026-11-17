@@ -1,0 +1,1293 @@
+//!
+//! The OpenGL/WebGL2 backend, using [glow](https://crates.io/crates/glow).
+//!
+//! The code in here is the GL code that used to live directly in the public types in [core](crate::core),
+//! moved as literally as possible so the sequence of GL calls is unchanged.
+//!
+
+use super::*;
+use crate::context::HasContext;
+use std::sync::Arc;
+
+///
+/// The GL backend: a glow context and the one vertex array object that is reused for every draw.
+///
+pub(crate) struct GlBackend {
+    pub context: Arc<crate::context::Context>,
+    vao: crate::context::VertexArray,
+}
+
+impl GlBackend {
+    pub fn new(context: Arc<crate::context::Context>) -> Result<Self, CoreError> {
+        unsafe {
+            if !context.version().is_embedded {
+                // Enable seamless cube map textures - not available on OpenGL ES and WebGL
+                context.enable(crate::context::TEXTURE_CUBE_MAP_SEAMLESS);
+            }
+            context.pixel_store_i32(crate::context::UNPACK_ALIGNMENT, 1);
+            context.pixel_store_i32(crate::context::PACK_ALIGNMENT, 1);
+        };
+        let backend = unsafe {
+            // Create one Vertex Array Object which is then reused all the time.
+            let vao = context
+                .create_vertex_array()
+                .map_err(CoreError::ContextCreation)?;
+            Self { context, vao }
+        };
+        Ok(backend)
+    }
+
+    ///
+    /// Sets up the draw state for the program, calls `draw` and cleans up afterwards.
+    /// This is the implementation of [Program::draw_with], which hands raw GL calls to the user.
+    ///
+    pub fn draw_with(
+        &self,
+        program: ProgramId,
+        attribute_locations: &[u32],
+        render_states: RenderStates,
+        viewport: Viewport,
+        draw: &mut dyn FnMut(),
+    ) {
+        self.set_viewport(viewport);
+        self.set_render_states(render_states);
+        self.use_program(program);
+
+        draw();
+
+        unsafe {
+            for location in attribute_locations {
+                self.context.disable_vertex_attrib_array(*location);
+            }
+            self.context.bind_vertex_array(None);
+        }
+
+        self.unuse_program();
+
+        #[cfg(debug_assertions)]
+        self.error_check()
+            .expect("Unexpected rendering error occured")
+    }
+
+    fn use_program(&self, program: ProgramId) {
+        unsafe {
+            self.context.use_program(Some(program.gl()));
+        }
+    }
+
+    fn unuse_program(&self) {
+        unsafe {
+            self.context.use_program(None);
+        }
+    }
+
+    fn bind_buffer(&self, kind: BufferKind, buffer: BufferId) {
+        unsafe {
+            self.context
+                .bind_buffer(buffer_target(kind), Some(buffer.gl()));
+        }
+    }
+
+    fn bind_texture_object(&self, texture: TextureId, kind: TextureKind) {
+        unsafe {
+            self.context
+                .bind_texture(texture_target(kind), Some(texture.gl()));
+        }
+    }
+
+    fn bind_target(&self, target: &PassTarget, binding: u32) {
+        unsafe {
+            self.context
+                .bind_framebuffer(binding, target.framebuffer.map(|f| f.gl()));
+        }
+        if let Some(ref color) = target.color {
+            self.attach_color(color);
+        }
+        if let Some(ref depth) = target.depth {
+            self.attach_depth(depth);
+        }
+    }
+
+    fn attach_color(&self, color: &ColorAttachment) {
+        unsafe {
+            match color {
+                ColorAttachment::Texture2D { texture, mip_level } => {
+                    self.context
+                        .draw_buffers(&[crate::context::COLOR_ATTACHMENT0]);
+                    self.context.framebuffer_texture_2d(
+                        crate::context::FRAMEBUFFER,
+                        crate::context::COLOR_ATTACHMENT0,
+                        crate::context::TEXTURE_2D,
+                        Some(texture.gl()),
+                        *mip_level as i32,
+                    );
+                }
+                ColorAttachment::Texture2DArray {
+                    texture,
+                    layers,
+                    mip_level,
+                } => {
+                    self.context.draw_buffers(
+                        &(0..layers.len())
+                            .map(|i| crate::context::COLOR_ATTACHMENT0 + i as u32)
+                            .collect::<Vec<u32>>(),
+                    );
+                    (0..layers.len()).for_each(|channel| {
+                        self.context.framebuffer_texture_layer(
+                            crate::context::DRAW_FRAMEBUFFER,
+                            crate::context::COLOR_ATTACHMENT0 + channel as u32,
+                            Some(texture.gl()),
+                            *mip_level as i32,
+                            layers[channel] as i32,
+                        );
+                    });
+                }
+                ColorAttachment::CubeMap {
+                    texture,
+                    sides,
+                    mip_level,
+                } => {
+                    self.context.draw_buffers(
+                        &(0..sides.len())
+                            .map(|i| crate::context::COLOR_ATTACHMENT0 + i as u32)
+                            .collect::<Vec<u32>>(),
+                    );
+                    (0..sides.len()).for_each(|channel| {
+                        self.context.framebuffer_texture_2d(
+                            crate::context::DRAW_FRAMEBUFFER,
+                            crate::context::COLOR_ATTACHMENT0 + channel as u32,
+                            cube_map_side_target(sides[channel]),
+                            Some(texture.gl()),
+                            *mip_level as i32,
+                        );
+                    });
+                }
+                ColorAttachment::Multisample(renderbuffer) => {
+                    self.context
+                        .draw_buffers(&[crate::context::COLOR_ATTACHMENT0]);
+                    self.context.framebuffer_renderbuffer(
+                        crate::context::FRAMEBUFFER,
+                        crate::context::COLOR_ATTACHMENT0,
+                        crate::context::RENDERBUFFER,
+                        Some(renderbuffer.gl()),
+                    );
+                }
+            }
+        }
+    }
+
+    fn attach_depth(&self, depth: &DepthAttachment) {
+        unsafe {
+            match depth {
+                DepthAttachment::Texture2D(texture) => {
+                    self.context.framebuffer_texture_2d(
+                        crate::context::FRAMEBUFFER,
+                        crate::context::DEPTH_ATTACHMENT,
+                        crate::context::TEXTURE_2D,
+                        Some(texture.gl()),
+                        0,
+                    );
+                }
+                DepthAttachment::Texture2DArray { texture, layer } => {
+                    self.context.framebuffer_texture_layer(
+                        crate::context::DRAW_FRAMEBUFFER,
+                        crate::context::DEPTH_ATTACHMENT,
+                        Some(texture.gl()),
+                        0,
+                        *layer as i32,
+                    );
+                }
+                DepthAttachment::CubeMap { texture, side } => {
+                    self.context.framebuffer_texture_2d(
+                        crate::context::DRAW_FRAMEBUFFER,
+                        crate::context::DEPTH_ATTACHMENT,
+                        cube_map_side_target(*side),
+                        Some(texture.gl()),
+                        0,
+                    );
+                }
+                DepthAttachment::Multisample(renderbuffer) => {
+                    self.context.framebuffer_renderbuffer(
+                        crate::context::FRAMEBUFFER,
+                        crate::context::DEPTH_ATTACHMENT,
+                        crate::context::RENDERBUFFER,
+                        Some(renderbuffer.gl()),
+                    );
+                }
+            }
+        }
+    }
+
+    fn set_texture_parameters(&self, target: u32, sampler: &SamplerDesc) {
+        let context = &self.context;
+        let SamplerDesc {
+            min_filter,
+            mag_filter,
+            mipmap,
+            wrap_s,
+            wrap_t,
+            wrap_r,
+        } = *sampler;
+        unsafe {
+            match mipmap {
+                None => context.tex_parameter_i32(
+                    target,
+                    crate::context::TEXTURE_MIN_FILTER,
+                    interpolation_from(min_filter),
+                ),
+                Some(Mipmap {
+                    filter: Interpolation::Nearest,
+                    ..
+                }) => {
+                    if min_filter == Interpolation::Nearest {
+                        context.tex_parameter_i32(
+                            target,
+                            crate::context::TEXTURE_MIN_FILTER,
+                            crate::context::NEAREST_MIPMAP_NEAREST as i32,
+                        );
+                    } else {
+                        context.tex_parameter_i32(
+                            target,
+                            crate::context::TEXTURE_MIN_FILTER,
+                            crate::context::LINEAR_MIPMAP_NEAREST as i32,
+                        )
+                    }
+                }
+                Some(Mipmap {
+                    filter: Interpolation::Linear,
+                    ..
+                }) => {
+                    if min_filter == Interpolation::Nearest {
+                        context.tex_parameter_i32(
+                            target,
+                            crate::context::TEXTURE_MIN_FILTER,
+                            crate::context::NEAREST_MIPMAP_LINEAR as i32,
+                        );
+                    } else {
+                        context.tex_parameter_i32(
+                            target,
+                            crate::context::TEXTURE_MIN_FILTER,
+                            crate::context::LINEAR_MIPMAP_LINEAR as i32,
+                        )
+                    }
+                }
+                _ => panic!("Can only sample textures using 'NEAREST' or 'LINEAR' interpolation"),
+            }
+            if let Some(Mipmap { max_ratio, .. }) = mipmap {
+                let extensions = context.supported_extensions();
+                // Desktop
+                if extensions.contains("GL_ARB_texture_filter_anisotropic") ||
+                    extensions.contains("GL_EXT_texture_filter_anisotropic") ||
+                    // Web
+                    extensions.contains("EXT_texture_filter_anisotropic")
+                {
+                    let max_ratio = max_ratio.min(
+                        context.get_parameter_i32(crate::context::MAX_TEXTURE_MAX_ANISOTROPY_EXT)
+                            as u32,
+                    );
+                    context.tex_parameter_i32(
+                        target,
+                        crate::context::TEXTURE_MAX_ANISOTROPY_EXT,
+                        max_ratio as i32,
+                    );
+                }
+            }
+            context.tex_parameter_i32(
+                target,
+                crate::context::TEXTURE_MAG_FILTER,
+                interpolation_from(mag_filter),
+            );
+            context.tex_parameter_i32(
+                target,
+                crate::context::TEXTURE_WRAP_S,
+                wrapping_from(wrap_s),
+            );
+            context.tex_parameter_i32(
+                target,
+                crate::context::TEXTURE_WRAP_T,
+                wrapping_from(wrap_t),
+            );
+            if let Some(r) = wrap_r {
+                context.tex_parameter_i32(target, crate::context::TEXTURE_WRAP_R, wrapping_from(r));
+            }
+        }
+    }
+
+    fn blend_const_from_multiplier(multiplier: BlendMultiplierType) -> u32 {
+        match multiplier {
+            BlendMultiplierType::Zero => crate::context::ZERO,
+            BlendMultiplierType::One => crate::context::ONE,
+            BlendMultiplierType::SrcColor => crate::context::SRC_COLOR,
+            BlendMultiplierType::OneMinusSrcColor => crate::context::ONE_MINUS_SRC_COLOR,
+            BlendMultiplierType::DstColor => crate::context::DST_COLOR,
+            BlendMultiplierType::OneMinusDstColor => crate::context::ONE_MINUS_DST_COLOR,
+            BlendMultiplierType::SrcAlpha => crate::context::SRC_ALPHA,
+            BlendMultiplierType::OneMinusSrcAlpha => crate::context::ONE_MINUS_SRC_ALPHA,
+            BlendMultiplierType::DstAlpha => crate::context::DST_ALPHA,
+            BlendMultiplierType::OneMinusDstAlpha => crate::context::ONE_MINUS_DST_ALPHA,
+            BlendMultiplierType::SrcAlphaSaturate => crate::context::SRC_ALPHA_SATURATE,
+        }
+    }
+
+    fn blend_const_from_equation(equation: BlendEquationType) -> u32 {
+        match equation {
+            BlendEquationType::Add => crate::context::FUNC_ADD,
+            BlendEquationType::Subtract => crate::context::FUNC_SUBTRACT,
+            BlendEquationType::ReverseSubtract => crate::context::FUNC_REVERSE_SUBTRACT,
+            BlendEquationType::Min => crate::context::MIN,
+            BlendEquationType::Max => crate::context::MAX,
+        }
+    }
+
+    fn framebuffer_check(&self) -> Result<(), CoreError> {
+        unsafe {
+            match self
+                .context
+                .check_framebuffer_status(crate::context::FRAMEBUFFER)
+            {
+                crate::context::FRAMEBUFFER_COMPLETE => Ok(()),
+                crate::context::FRAMEBUFFER_INCOMPLETE_ATTACHMENT => Err(CoreError::ContextError(
+                    "FRAMEBUFFER_INCOMPLETE_ATTACHMENT".to_string(),
+                )),
+                crate::context::FRAMEBUFFER_INCOMPLETE_DRAW_BUFFER => Err(CoreError::ContextError(
+                    "FRAMEBUFFER_INCOMPLETE_DRAW_BUFFER".to_string(),
+                )),
+                crate::context::FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT => {
+                    Err(CoreError::ContextError(
+                        "FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT".to_string(),
+                    ))
+                }
+                crate::context::FRAMEBUFFER_UNSUPPORTED => Err(CoreError::ContextError(
+                    "FRAMEBUFFER_UNSUPPORTED".to_string(),
+                )),
+                crate::context::FRAMEBUFFER_UNDEFINED => {
+                    Err(CoreError::ContextError("FRAMEBUFFER_UNDEFINED".to_string()))
+                }
+                crate::context::FRAMEBUFFER_INCOMPLETE_READ_BUFFER => Err(CoreError::ContextError(
+                    "FRAMEBUFFER_INCOMPLETE_READ_BUFFER".to_string(),
+                )),
+                crate::context::FRAMEBUFFER_INCOMPLETE_MULTISAMPLE => Err(CoreError::ContextError(
+                    "FRAMEBUFFER_INCOMPLETE_MULTISAMPLE".to_string(),
+                )),
+                crate::context::FRAMEBUFFER_INCOMPLETE_LAYER_TARGETS => Err(
+                    CoreError::ContextError("FRAMEBUFFER_INCOMPLETE_LAYER_TARGETS".to_string()),
+                ),
+                _ => Err(CoreError::ContextError(
+                    "Unknown framebuffer error".to_string(),
+                )),
+            }?;
+        }
+        Ok(())
+    }
+}
+
+impl BackendApi for GlBackend {
+    fn set_viewport(&self, viewport: Viewport) {
+        unsafe {
+            self.context.viewport(
+                viewport.x,
+                viewport.y,
+                viewport.width as i32,
+                viewport.height as i32,
+            );
+        }
+    }
+
+    fn set_scissor(&self, scissor_box: ScissorBox) {
+        unsafe {
+            if scissor_box.width > 0 && scissor_box.height > 0 {
+                self.context.enable(crate::context::SCISSOR_TEST);
+                self.context.scissor(
+                    scissor_box.x,
+                    scissor_box.y,
+                    scissor_box.width as i32,
+                    scissor_box.height as i32,
+                );
+            } else {
+                self.context.disable(crate::context::SCISSOR_TEST);
+            }
+        }
+    }
+
+    fn set_cull(&self, cull: Cull) {
+        unsafe {
+            match cull {
+                Cull::None => {
+                    self.context.disable(crate::context::CULL_FACE);
+                }
+                Cull::Back => {
+                    self.context.enable(crate::context::CULL_FACE);
+                    self.context.cull_face(crate::context::BACK);
+                }
+                Cull::Front => {
+                    self.context.enable(crate::context::CULL_FACE);
+                    self.context.cull_face(crate::context::FRONT);
+                }
+                Cull::FrontAndBack => {
+                    self.context.enable(crate::context::CULL_FACE);
+                    self.context.cull_face(crate::context::FRONT_AND_BACK);
+                }
+            }
+        }
+    }
+
+    fn set_write_mask(&self, write_mask: WriteMask) {
+        unsafe {
+            self.context.color_mask(
+                write_mask.red,
+                write_mask.green,
+                write_mask.blue,
+                write_mask.alpha,
+            );
+            self.context.depth_mask(write_mask.depth);
+        }
+    }
+
+    fn set_depth_test(&self, depth_test: DepthTest) {
+        unsafe {
+            self.context.enable(crate::context::DEPTH_TEST);
+            match depth_test {
+                DepthTest::Never => {
+                    self.context.depth_func(crate::context::NEVER);
+                }
+                DepthTest::Less => {
+                    self.context.depth_func(crate::context::LESS);
+                }
+                DepthTest::Equal => {
+                    self.context.depth_func(crate::context::EQUAL);
+                }
+                DepthTest::LessOrEqual => {
+                    self.context.depth_func(crate::context::LEQUAL);
+                }
+                DepthTest::Greater => {
+                    self.context.depth_func(crate::context::GREATER);
+                }
+                DepthTest::NotEqual => {
+                    self.context.depth_func(crate::context::NOTEQUAL);
+                }
+                DepthTest::GreaterOrEqual => {
+                    self.context.depth_func(crate::context::GEQUAL);
+                }
+                DepthTest::Always => {
+                    self.context.depth_func(crate::context::ALWAYS);
+                }
+            }
+        }
+    }
+
+    fn set_blend(&self, blend: Blend) {
+        unsafe {
+            if let Blend::Enabled {
+                source_rgb_multiplier,
+                source_alpha_multiplier,
+                destination_rgb_multiplier,
+                destination_alpha_multiplier,
+                rgb_equation,
+                alpha_equation,
+            } = blend
+            {
+                self.context.enable(crate::context::BLEND);
+                self.context.blend_func_separate(
+                    Self::blend_const_from_multiplier(source_rgb_multiplier),
+                    Self::blend_const_from_multiplier(destination_rgb_multiplier),
+                    Self::blend_const_from_multiplier(source_alpha_multiplier),
+                    Self::blend_const_from_multiplier(destination_alpha_multiplier),
+                );
+                self.context.blend_equation_separate(
+                    Self::blend_const_from_equation(rgb_equation),
+                    Self::blend_const_from_equation(alpha_equation),
+                );
+            } else {
+                self.context.disable(crate::context::BLEND);
+            }
+        }
+    }
+
+    fn set_render_states(&self, render_states: RenderStates) {
+        self.set_cull(render_states.cull);
+        self.set_write_mask(render_states.write_mask);
+        if !render_states.write_mask.depth && render_states.depth_test == DepthTest::Always {
+            unsafe { self.context.disable(crate::context::DEPTH_TEST) }
+        } else {
+            self.set_depth_test(render_states.depth_test);
+        }
+        self.set_blend(render_states.blend);
+    }
+
+    fn error_check(&self) -> Result<(), CoreError> {
+        self.framebuffer_check()?;
+        unsafe {
+            let e = self.context.get_error();
+            if e != crate::context::NO_ERROR {
+                Err(CoreError::ContextError(
+                    match e {
+                        crate::context::INVALID_ENUM => "Invalid enum",
+                        crate::context::INVALID_VALUE => "Invalid value",
+                        crate::context::INVALID_OPERATION => "Invalid operation",
+                        crate::context::INVALID_FRAMEBUFFER_OPERATION => {
+                            "Invalid framebuffer operation"
+                        }
+                        crate::context::OUT_OF_MEMORY => "Out of memory",
+                        crate::context::STACK_OVERFLOW => "Stack overflow",
+                        crate::context::STACK_UNDERFLOW => "Stack underflow",
+                        _ => "Unknown",
+                    }
+                    .to_string(),
+                ))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn max_samples(&self) -> u32 {
+        unsafe {
+            self.context
+                .get_parameter_i32(crate::context::MAX_SAMPLES)
+                .try_into()
+                .unwrap()
+        }
+    }
+
+    fn create_buffer(&self) -> BufferId {
+        BufferId::Gl(unsafe {
+            self.context
+                .create_buffer()
+                .expect("Failed creating buffer")
+        })
+    }
+
+    fn delete_buffer(&self, buffer: BufferId) {
+        unsafe {
+            self.context.delete_buffer(buffer.gl());
+        }
+    }
+
+    fn write_buffer(&self, buffer: BufferId, kind: BufferKind, bytes: &[u8], usage: BufferUsage) {
+        self.bind_buffer(kind, buffer);
+        unsafe {
+            self.context.buffer_data_u8_slice(
+                buffer_target(kind),
+                bytes,
+                match usage {
+                    BufferUsage::Static => crate::context::STATIC_DRAW,
+                    BufferUsage::Dynamic => crate::context::DYNAMIC_DRAW,
+                },
+            );
+            self.context.bind_buffer(buffer_target(kind), None);
+        }
+    }
+
+    fn write_buffer_subset(&self, buffer: BufferId, kind: BufferKind, offset: u32, bytes: &[u8]) {
+        self.bind_buffer(kind, buffer);
+        unsafe {
+            self.context
+                .buffer_sub_data_u8_slice(buffer_target(kind), offset as i32, bytes);
+            self.context.bind_buffer(buffer_target(kind), None);
+        }
+    }
+
+    fn create_texture(&self, desc: &TextureDesc) -> TextureId {
+        let id = unsafe {
+            self.context
+                .create_texture()
+                .expect("Failed creating texture")
+        };
+        let target = texture_target(desc.kind);
+        unsafe {
+            self.context.bind_texture(target, Some(id));
+        }
+        self.set_texture_parameters(target, &desc.sampler);
+        if let Some(storage) = desc.storage {
+            let internal_format = internal_format(storage.format);
+            unsafe {
+                match desc.kind {
+                    TextureKind::D2 | TextureKind::CubeMap => self.context.tex_storage_2d(
+                        target,
+                        storage.mip_levels as i32,
+                        internal_format,
+                        storage.width as i32,
+                        storage.height as i32,
+                    ),
+                    TextureKind::D2Array | TextureKind::D3 => self.context.tex_storage_3d(
+                        target,
+                        storage.mip_levels as i32,
+                        internal_format,
+                        storage.width as i32,
+                        storage.height as i32,
+                        storage.depth as i32,
+                    ),
+                }
+            }
+        }
+        TextureId::Gl(id)
+    }
+
+    fn delete_texture(&self, texture: TextureId) {
+        unsafe {
+            self.context.delete_texture(texture.gl());
+        }
+    }
+
+    fn write_texture(
+        &self,
+        texture: TextureId,
+        kind: TextureKind,
+        region: TextureRegion,
+        width: u32,
+        height: u32,
+        depth: u32,
+        format: ColorFormat,
+        bytes: &[u8],
+    ) {
+        self.bind_texture_object(texture, kind);
+        let pixels = crate::context::PixelUnpackData::Slice(Some(bytes));
+        unsafe {
+            match (kind, region) {
+                (TextureKind::D2, _) => self.context.tex_sub_image_2d(
+                    crate::context::TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    width as i32,
+                    height as i32,
+                    format_from_channels(format.channels),
+                    data_type(format.primitive),
+                    pixels,
+                ),
+                (TextureKind::CubeMap, TextureRegion::Side(side)) => self.context.tex_sub_image_2d(
+                    cube_map_side_target(side),
+                    0,
+                    0,
+                    0,
+                    width as i32,
+                    height as i32,
+                    format_from_channels(format.channels),
+                    data_type(format.primitive),
+                    pixels,
+                ),
+                (TextureKind::D2Array, TextureRegion::Layer(layer)) => {
+                    self.context.tex_sub_image_3d(
+                        crate::context::TEXTURE_2D_ARRAY,
+                        0,
+                        0,
+                        0,
+                        layer as i32,
+                        width as i32,
+                        height as i32,
+                        1,
+                        format_from_channels(format.channels),
+                        data_type(format.primitive),
+                        pixels,
+                    )
+                }
+                (TextureKind::D3, _) => self.context.tex_sub_image_3d(
+                    crate::context::TEXTURE_3D,
+                    0,
+                    0,
+                    0,
+                    0,
+                    width as i32,
+                    height as i32,
+                    depth as i32,
+                    format_from_channels(format.channels),
+                    data_type(format.primitive),
+                    pixels,
+                ),
+                _ => unreachable!("invalid texture region {:?} for {:?}", region, kind),
+            }
+        }
+    }
+
+    fn generate_mipmaps(&self, texture: TextureId, kind: TextureKind) {
+        self.bind_texture_object(texture, kind);
+        unsafe {
+            self.context.generate_mipmap(texture_target(kind));
+        }
+    }
+
+    fn create_renderbuffer(
+        &self,
+        format: TextureFormat,
+        width: u32,
+        height: u32,
+        number_of_samples: u32,
+    ) -> RenderbufferId {
+        let id = unsafe {
+            self.context
+                .create_renderbuffer()
+                .expect("Failed creating render buffer")
+        };
+        unsafe {
+            self.context
+                .bind_renderbuffer(crate::context::RENDERBUFFER, Some(id));
+            self.context.renderbuffer_storage_multisample(
+                crate::context::RENDERBUFFER,
+                number_of_samples as i32,
+                internal_format(format),
+                width as i32,
+                height as i32,
+            );
+        }
+        RenderbufferId::Gl(id)
+    }
+
+    fn delete_renderbuffer(&self, renderbuffer: RenderbufferId) {
+        unsafe {
+            self.context.delete_renderbuffer(renderbuffer.gl());
+        }
+    }
+
+    fn create_framebuffer(&self) -> FramebufferId {
+        FramebufferId::Gl(unsafe {
+            self.context
+                .create_framebuffer()
+                .expect("Failed creating frame buffer")
+        })
+    }
+
+    fn delete_framebuffer(&self, framebuffer: FramebufferId) {
+        unsafe {
+            self.context.delete_framebuffer(framebuffer.gl());
+        }
+    }
+
+    fn begin_pass(&self, target: &PassTarget, scissor_box: ScissorBox, load: LoadOp) {
+        match load {
+            LoadOp::Load => {}
+        }
+        self.set_scissor(scissor_box);
+        self.bind_target(target, crate::context::DRAW_FRAMEBUFFER);
+    }
+
+    fn end_pass(&self) {
+        // GL renders immediately and keeps the framebuffer bound, exactly as before the backend layer existed.
+    }
+
+    fn clear(&self, target: &PassTarget, scissor_box: ScissorBox, clear_state: ClearState) {
+        self.set_scissor(scissor_box);
+        self.bind_target(target, crate::context::DRAW_FRAMEBUFFER);
+        self.set_write_mask(WriteMask {
+            red: clear_state.red.is_some(),
+            green: clear_state.green.is_some(),
+            blue: clear_state.blue.is_some(),
+            alpha: clear_state.alpha.is_some(),
+            depth: clear_state.depth.is_some(),
+        });
+        unsafe {
+            let clear_color = clear_state.red.is_some()
+                || clear_state.green.is_some()
+                || clear_state.blue.is_some()
+                || clear_state.alpha.is_some();
+            if clear_color {
+                self.context.clear_color(
+                    clear_state.red.unwrap_or(0.0),
+                    clear_state.green.unwrap_or(0.0),
+                    clear_state.blue.unwrap_or(0.0),
+                    clear_state.alpha.unwrap_or(1.0),
+                );
+            }
+            if let Some(depth) = clear_state.depth {
+                self.context.clear_depth_f32(depth);
+            }
+            self.context
+                .clear(if clear_color && clear_state.depth.is_some() {
+                    crate::context::COLOR_BUFFER_BIT | crate::context::DEPTH_BUFFER_BIT
+                } else if clear_color {
+                    crate::context::COLOR_BUFFER_BIT
+                } else {
+                    crate::context::DEPTH_BUFFER_BIT
+                });
+        }
+    }
+
+    fn copy_target(&self, source: &PassTarget, destination: &PassTarget, mask: CopyMask) {
+        self.bind_target(source, crate::context::DRAW_FRAMEBUFFER);
+        self.bind_target(destination, crate::context::DRAW_FRAMEBUFFER);
+        let mask = match (mask.color, mask.depth) {
+            (true, true) => crate::context::COLOR_BUFFER_BIT | crate::context::DEPTH_BUFFER_BIT,
+            (true, false) => crate::context::COLOR_BUFFER_BIT,
+            (false, true) => crate::context::DEPTH_BUFFER_BIT,
+            (false, false) => unreachable!(),
+        };
+        self.set_scissor(ScissorBox::new_at_origo(
+            destination.width,
+            destination.height,
+        ));
+        unsafe {
+            self.context.bind_framebuffer(
+                crate::context::READ_FRAMEBUFFER,
+                source.framebuffer.map(|f| f.gl()),
+            );
+
+            self.context.blit_framebuffer(
+                0,
+                0,
+                source.width as i32,
+                source.height as i32,
+                0,
+                0,
+                destination.width as i32,
+                destination.height as i32,
+                mask,
+                crate::context::NEAREST,
+            );
+        }
+    }
+
+    fn read_pixels(&self, source: &PassTarget, rect: ScissorBox, format: ReadFormat) -> Vec<u8> {
+        self.bind_target(source, crate::context::DRAW_FRAMEBUFFER);
+        self.bind_target(source, crate::context::READ_FRAMEBUFFER);
+        let (gl_format, gl_data_type, pixel_size) = match format {
+            ReadFormat::Color(format) => (
+                format_from_channels(format.channels),
+                data_type(format.primitive),
+                format.channels as usize * primitive_size(format.primitive),
+            ),
+            ReadFormat::Depth => (crate::context::DEPTH_COMPONENT, crate::context::FLOAT, 4),
+        };
+        let mut bytes = vec![0u8; rect.width as usize * rect.height as usize * pixel_size];
+        unsafe {
+            self.context.read_pixels(
+                rect.x,
+                rect.y,
+                rect.width as i32,
+                rect.height as i32,
+                gl_format,
+                gl_data_type,
+                crate::context::PixelPackData::Slice(Some(&mut bytes)),
+            );
+        }
+        bytes
+    }
+
+    fn create_program(
+        &self,
+        vertex_shader_source: &str,
+        fragment_shader_source: &str,
+    ) -> Result<(ProgramId, ProgramReflection), CoreError> {
+        let context = &self.context;
+        unsafe {
+            let vert_shader = context
+                .create_shader(crate::context::VERTEX_SHADER)
+                .expect("Failed creating vertex shader");
+            let frag_shader = context
+                .create_shader(crate::context::FRAGMENT_SHADER)
+                .expect("Failed creating fragment shader");
+
+            let header: &str = if context.version().is_embedded {
+                "#version 300 es
+                    #ifdef GL_FRAGMENT_PRECISION_HIGH
+                        precision highp float;
+                        precision highp int;
+                        precision highp sampler2DArray;
+                        precision highp sampler3D;
+                    #else
+                        precision mediump float;
+                        precision mediump int;
+                        precision mediump sampler2DArray;
+                        precision mediump sampler3D;
+                    #endif\n"
+            } else {
+                "#version 330 core\n"
+            };
+            let vertex_shader_source = format!("{}{}", header, vertex_shader_source);
+            let fragment_shader_source = format!("{}{}", header, fragment_shader_source);
+
+            context.shader_source(vert_shader, &vertex_shader_source);
+            context.shader_source(frag_shader, &fragment_shader_source);
+            context.compile_shader(vert_shader);
+            context.compile_shader(frag_shader);
+
+            let id = context.create_program().expect("Failed creating program");
+            context.attach_shader(id, vert_shader);
+            context.attach_shader(id, frag_shader);
+            context.link_program(id);
+
+            if !context.get_program_link_status(id) {
+                let log = context.get_shader_info_log(vert_shader);
+                if !log.is_empty() {
+                    Err(shader_compilation_error(
+                        "vertex",
+                        log,
+                        vertex_shader_source,
+                    ))?;
+                }
+                let log = context.get_shader_info_log(frag_shader);
+                if !log.is_empty() {
+                    Err(shader_compilation_error(
+                        "fragment",
+                        log,
+                        fragment_shader_source,
+                    ))?;
+                }
+                let log = context.get_program_info_log(id);
+                if !log.is_empty() {
+                    Err(CoreError::ShaderLink(log))?;
+                }
+                Err(CoreError::ShaderCompilerError)?;
+            }
+
+            context.detach_shader(id, vert_shader);
+            context.detach_shader(id, frag_shader);
+            context.delete_shader(vert_shader);
+            context.delete_shader(frag_shader);
+
+            // Init vertex attributes
+            let num_attribs = context.get_active_attributes(id);
+            let mut attributes = HashMap::new();
+            for i in 0..num_attribs {
+                if let Some(crate::context::ActiveAttribute { name, .. }) = context
+                    .get_active_attribute(id, i)
+                    .filter(|a| !a.name.starts_with("gl_"))
+                {
+                    if let Some(location) = context.get_attrib_location(id, &name) {
+                        attributes.insert(name, location);
+                    }
+                }
+            }
+
+            // Init uniforms
+            let num_uniforms = context.get_active_uniforms(id);
+            let mut uniforms = HashMap::new();
+            for i in 0..num_uniforms {
+                if let Some(crate::context::ActiveUniform { name, .. }) = context
+                    .get_active_uniform(id, i)
+                    .filter(|a| !a.name.starts_with("gl_"))
+                {
+                    if let Some(location) = context.get_uniform_location(id, &name) {
+                        let name = name.split('[').next().unwrap().to_string();
+                        uniforms.insert(name, UniformLocation::Gl(location));
+                    }
+                }
+            }
+
+            Ok((
+                ProgramId::Gl(id),
+                ProgramReflection {
+                    attributes,
+                    uniforms,
+                },
+            ))
+        }
+    }
+
+    fn delete_program(&self, program: ProgramId) {
+        unsafe {
+            self.context.delete_program(program.gl());
+        }
+    }
+
+    fn set_uniform(&self, program: ProgramId, location: &UniformLocation, value: &UniformValue) {
+        self.use_program(program);
+        let location = Some(location.gl());
+        unsafe {
+            match value {
+                UniformValue::F32(type_, data) => match type_ {
+                    UniformType::Value => self.context.uniform_1_f32_slice(location, data),
+                    UniformType::Vec2 => self.context.uniform_2_f32_slice(location, data),
+                    UniformType::Vec3 => self.context.uniform_3_f32_slice(location, data),
+                    UniformType::Vec4 => self.context.uniform_4_f32_slice(location, data),
+                    UniformType::Mat2 => self
+                        .context
+                        .uniform_matrix_2_f32_slice(location, false, data),
+                    UniformType::Mat3 => self
+                        .context
+                        .uniform_matrix_3_f32_slice(location, false, data),
+                    UniformType::Mat4 => self
+                        .context
+                        .uniform_matrix_4_f32_slice(location, false, data),
+                },
+                UniformValue::I32(type_, data) => match type_ {
+                    UniformType::Value => self.context.uniform_1_i32_slice(location, data),
+                    UniformType::Vec2 => self.context.uniform_2_i32_slice(location, data),
+                    UniformType::Vec3 => self.context.uniform_3_i32_slice(location, data),
+                    UniformType::Vec4 => self.context.uniform_4_i32_slice(location, data),
+                    _ => unimplemented!(),
+                },
+                UniformValue::U32(type_, data) => match type_ {
+                    UniformType::Value => self.context.uniform_1_u32_slice(location, data),
+                    UniformType::Vec2 => self.context.uniform_2_u32_slice(location, data),
+                    UniformType::Vec3 => self.context.uniform_3_u32_slice(location, data),
+                    UniformType::Vec4 => self.context.uniform_4_u32_slice(location, data),
+                    _ => unimplemented!(),
+                },
+            }
+        }
+        self.unuse_program();
+    }
+
+    fn bind_texture(&self, unit: u32, texture: TextureId, kind: TextureKind) {
+        unsafe {
+            self.context.active_texture(crate::context::TEXTURE0 + unit);
+        }
+        self.bind_texture_object(texture, kind);
+    }
+
+    fn uniform_block_index(&self, program: ProgramId, name: &str) -> Option<u32> {
+        unsafe { self.context.get_uniform_block_index(program.gl(), name) }
+    }
+
+    fn bind_uniform_block(
+        &self,
+        program: ProgramId,
+        block_index: u32,
+        binding: u32,
+        buffer: BufferId,
+    ) {
+        unsafe {
+            self.context
+                .uniform_block_binding(program.gl(), block_index, binding);
+            self.context.bind_buffer_base(
+                crate::context::UNIFORM_BUFFER,
+                binding,
+                Some(buffer.gl()),
+            );
+            self.context
+                .bind_buffer(crate::context::UNIFORM_BUFFER, None);
+        }
+    }
+
+    fn bind_vertex_attribute(
+        &self,
+        program: ProgramId,
+        location: u32,
+        buffer: BufferId,
+        format: VertexFormat,
+        divisor: u32,
+    ) {
+        self.bind_buffer(BufferKind::Vertex, buffer);
+        self.use_program(program);
+        unsafe {
+            self.context.bind_vertex_array(Some(self.vao));
+            self.context.enable_vertex_attrib_array(location);
+            if !format.normalized && format.primitive.is_integer() {
+                self.context.vertex_attrib_pointer_i32(
+                    location,
+                    format.components as i32,
+                    data_type(format.primitive),
+                    0,
+                    0,
+                );
+            } else {
+                self.context.vertex_attrib_pointer_f32(
+                    location,
+                    format.components as i32,
+                    data_type(format.primitive),
+                    format.normalized,
+                    0,
+                    0,
+                );
+            }
+            self.context.vertex_attrib_divisor(location, divisor);
+            self.context.bind_buffer(crate::context::ARRAY_BUFFER, None);
+        }
+        self.unuse_program();
+    }
+
+    fn prepare_attributeless_draw(&self) {
+        unsafe { self.context.bind_vertex_array(Some(self.vao)) };
+    }
+
+    fn draw(&self, call: &DrawCall) {
+        let context = &self.context;
+        let mut draw = || unsafe {
+            match (call.indices, call.instances) {
+                (None, None) => {
+                    context.draw_arrays(crate::context::TRIANGLES, 0, call.count as i32);
+                }
+                (None, Some(instances)) => {
+                    context.draw_arrays_instanced(
+                        crate::context::TRIANGLES,
+                        0,
+                        call.count as i32,
+                        instances as i32,
+                    );
+                    context.bind_buffer(crate::context::ELEMENT_ARRAY_BUFFER, None);
+                }
+                (Some(indices), instances) => {
+                    context.bind_buffer(
+                        crate::context::ELEMENT_ARRAY_BUFFER,
+                        Some(indices.buffer.gl()),
+                    );
+                    if let Some(instances) = instances {
+                        context.draw_elements_instanced(
+                            crate::context::TRIANGLES,
+                            call.count as i32,
+                            data_type(indices.index_type),
+                            indices.first as i32,
+                            instances as i32,
+                        );
+                    } else {
+                        context.draw_elements(
+                            crate::context::TRIANGLES,
+                            call.count as i32,
+                            data_type(indices.index_type),
+                            indices.first as i32,
+                        );
+                    }
+                    context.bind_buffer(crate::context::ELEMENT_ARRAY_BUFFER, None);
+                }
+            }
+        };
+        self.draw_with(
+            call.program,
+            call.attribute_locations,
+            call.render_states,
+            call.viewport,
+            &mut draw,
+        );
+    }
+}
+
+// CONVERSIONS TO GL CONSTANTS
+
+fn shader_compilation_error(typ: &str, log: String, source: String) -> CoreError {
+    let lines: Vec<String> = source
+        .lines()
+        .enumerate()
+        .map(|(index, l)| format!("{:0>3}: {}", index + 1, l))
+        .collect();
+    CoreError::ShaderCompilation(typ.to_string(), lines.join("\n"), log)
+}
+
+fn buffer_target(kind: BufferKind) -> u32 {
+    match kind {
+        BufferKind::Vertex => crate::context::ARRAY_BUFFER,
+        BufferKind::Element => crate::context::ELEMENT_ARRAY_BUFFER,
+        BufferKind::Uniform => crate::context::UNIFORM_BUFFER,
+    }
+}
+
+pub(crate) fn texture_target(kind: TextureKind) -> u32 {
+    match kind {
+        TextureKind::D2 => crate::context::TEXTURE_2D,
+        TextureKind::D2Array => crate::context::TEXTURE_2D_ARRAY,
+        TextureKind::D3 => crate::context::TEXTURE_3D,
+        TextureKind::CubeMap => crate::context::TEXTURE_CUBE_MAP,
+    }
+}
+
+fn cube_map_side_target(side: CubeMapSide) -> u32 {
+    match side {
+        CubeMapSide::Right => crate::context::TEXTURE_CUBE_MAP_POSITIVE_X,
+        CubeMapSide::Left => crate::context::TEXTURE_CUBE_MAP_NEGATIVE_X,
+        CubeMapSide::Top => crate::context::TEXTURE_CUBE_MAP_POSITIVE_Y,
+        CubeMapSide::Bottom => crate::context::TEXTURE_CUBE_MAP_NEGATIVE_Y,
+        CubeMapSide::Front => crate::context::TEXTURE_CUBE_MAP_POSITIVE_Z,
+        CubeMapSide::Back => crate::context::TEXTURE_CUBE_MAP_NEGATIVE_Z,
+    }
+}
+
+pub(crate) fn data_type(primitive: PrimitiveType) -> u32 {
+    match primitive {
+        PrimitiveType::U8 => crate::context::UNSIGNED_BYTE,
+        PrimitiveType::U16 => crate::context::UNSIGNED_SHORT,
+        PrimitiveType::U32 => crate::context::UNSIGNED_INT,
+        PrimitiveType::I8 => crate::context::BYTE,
+        PrimitiveType::I16 => crate::context::SHORT,
+        PrimitiveType::I32 => crate::context::INT,
+        PrimitiveType::F16 => crate::context::HALF_FLOAT,
+        PrimitiveType::F32 => crate::context::FLOAT,
+    }
+}
+
+fn primitive_size(primitive: PrimitiveType) -> usize {
+    match primitive {
+        PrimitiveType::U8 | PrimitiveType::I8 => 1,
+        PrimitiveType::U16 | PrimitiveType::I16 | PrimitiveType::F16 => 2,
+        PrimitiveType::U32 | PrimitiveType::I32 | PrimitiveType::F32 => 4,
+    }
+}
+
+pub(crate) fn format_from_channels(channels: u32) -> u32 {
+    match channels {
+        1 => crate::context::RED,
+        2 => crate::context::RG,
+        3 => crate::context::RGB,
+        4 => crate::context::RGBA,
+        _ => unreachable!(),
+    }
+}
+
+pub(crate) fn internal_format(format: TextureFormat) -> u32 {
+    match format {
+        TextureFormat::Depth(DepthFormat::Depth16) => crate::context::DEPTH_COMPONENT16,
+        TextureFormat::Depth(DepthFormat::Depth24) => crate::context::DEPTH_COMPONENT24,
+        TextureFormat::Depth(DepthFormat::Depth32F) => crate::context::DEPTH_COMPONENT32F,
+        TextureFormat::Color(ColorFormat {
+            primitive,
+            channels,
+        }) => {
+            let formats = match primitive {
+                PrimitiveType::U8 => [
+                    crate::context::R8,
+                    crate::context::RG8,
+                    crate::context::RGB8,
+                    crate::context::RGBA8,
+                ],
+                PrimitiveType::U16 => [
+                    crate::context::R16UI,
+                    crate::context::RG16UI,
+                    crate::context::RGB16UI,
+                    crate::context::RGBA16UI,
+                ],
+                PrimitiveType::U32 => [
+                    crate::context::R32UI,
+                    crate::context::RG32UI,
+                    crate::context::RGB32UI,
+                    crate::context::RGBA32UI,
+                ],
+                PrimitiveType::I8 => [
+                    crate::context::R8I,
+                    crate::context::RG8I,
+                    crate::context::RGB8I,
+                    crate::context::RGBA8I,
+                ],
+                PrimitiveType::I16 => [
+                    crate::context::R16I,
+                    crate::context::RG16I,
+                    crate::context::RGB16I,
+                    crate::context::RGBA16I,
+                ],
+                PrimitiveType::I32 => [
+                    crate::context::R32I,
+                    crate::context::RG32I,
+                    crate::context::RGB32I,
+                    crate::context::RGBA32I,
+                ],
+                PrimitiveType::F16 => [
+                    crate::context::R16F,
+                    crate::context::RG16F,
+                    crate::context::RGB16F,
+                    crate::context::RGBA16F,
+                ],
+                PrimitiveType::F32 => [
+                    crate::context::R32F,
+                    crate::context::RG32F,
+                    crate::context::RGB32F,
+                    crate::context::RGBA32F,
+                ],
+            };
+            match channels {
+                1..=4 => formats[channels as usize - 1],
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+fn wrapping_from(wrapping: Wrapping) -> i32 {
+    (match wrapping {
+        Wrapping::Repeat => crate::context::REPEAT,
+        Wrapping::MirroredRepeat => crate::context::MIRRORED_REPEAT,
+        Wrapping::ClampToEdge => crate::context::CLAMP_TO_EDGE,
+    }) as i32
+}
+
+fn interpolation_from(interpolation: Interpolation) -> i32 {
+    (match interpolation {
+        Interpolation::Nearest => crate::context::NEAREST,
+        Interpolation::Linear => crate::context::LINEAR,
+        _ => panic!("Can only sample textures using 'NEAREST' or 'LINEAR' interpolation"),
+    }) as i32
+}

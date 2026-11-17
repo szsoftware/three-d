@@ -44,7 +44,7 @@ impl BufferDataType for Quat {}
 
 struct Buffer<T: BufferDataType> {
     context: Context,
-    id: crate::context::Buffer,
+    id: backend::BufferId,
     attribute_count: u32,
     _d: PhantomData<T>,
 }
@@ -53,7 +53,7 @@ impl<T: BufferDataType> Buffer<T> {
     pub fn new(context: &Context) -> Self {
         Self {
             context: context.clone(),
-            id: unsafe { context.create_buffer().expect("Failed creating buffer") },
+            id: context.backend().create_buffer(),
             attribute_count: 0,
             _d: PhantomData,
         }
@@ -68,32 +68,26 @@ impl<T: BufferDataType> Buffer<T> {
     }
 
     pub fn fill(&mut self, data: &[T]) {
-        self.bind();
-        unsafe {
-            self.context.buffer_data_u8_slice(
-                crate::context::ARRAY_BUFFER,
-                to_byte_slice(data),
-                if self.attribute_count > 0 {
-                    crate::context::DYNAMIC_DRAW
-                } else {
-                    crate::context::STATIC_DRAW
-                },
-            );
-            self.context.bind_buffer(crate::context::ARRAY_BUFFER, None);
-        }
+        self.context.backend().write_buffer(
+            self.id,
+            backend::BufferKind::Vertex,
+            to_byte_slice(data),
+            if self.attribute_count > 0 {
+                backend::BufferUsage::Dynamic
+            } else {
+                backend::BufferUsage::Static
+            },
+        );
         self.attribute_count = data.len() as u32;
     }
 
     pub fn fill_subset(&mut self, offset: u32, data: &[T]) {
-        self.bind();
-        unsafe {
-            self.context.buffer_sub_data_u8_slice(
-                crate::context::ARRAY_BUFFER,
-                offset as i32,
-                to_byte_slice(data),
-            );
-            self.context.bind_buffer(crate::context::ARRAY_BUFFER, None);
-        }
+        self.context.backend().write_buffer_subset(
+            self.id,
+            backend::BufferKind::Vertex,
+            offset,
+            to_byte_slice(data),
+        );
         self.attribute_count = (offset + data.len() as u32).max(self.attribute_count);
     }
 
@@ -101,18 +95,13 @@ impl<T: BufferDataType> Buffer<T> {
         self.attribute_count
     }
 
-    pub fn bind(&self) {
-        unsafe {
-            self.context
-                .bind_buffer(crate::context::ARRAY_BUFFER, Some(self.id));
-        }
+    pub fn id(&self) -> backend::BufferId {
+        self.id
     }
 }
 
 impl<T: BufferDataType> Drop for Buffer<T> {
     fn drop(&mut self) {
-        unsafe {
-            self.context.delete_buffer(self.id);
-        }
+        self.context.backend().delete_buffer(self.id);
     }
 }

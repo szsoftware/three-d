@@ -274,103 +274,80 @@ use crate::core::*;
 
 // COMMON TEXTURE FUNCTIONS
 
-fn generate(context: &Context) -> crate::context::Texture {
-    unsafe { context.create_texture().expect("Failed creating texture") }
-}
-
-fn set_parameters(
+///
+/// Creates a texture with the given sampler state and, if `storage` is true, allocated storage for `T`.
+///
+#[allow(clippy::too_many_arguments)]
+fn create_texture<T: TextureDataType>(
     context: &Context,
-    target: u32,
+    kind: backend::TextureKind,
+    width: u32,
+    height: u32,
+    depth: u32,
+    number_of_mip_maps: u32,
     min_filter: Interpolation,
     mag_filter: Interpolation,
     mipmap: Option<Mipmap>,
     wrap_s: Wrapping,
     wrap_t: Wrapping,
     wrap_r: Option<Wrapping>,
-) {
-    unsafe {
-        match mipmap {
-            None => context.tex_parameter_i32(
-                target,
-                crate::context::TEXTURE_MIN_FILTER,
-                interpolation_from(min_filter),
-            ),
-            Some(Mipmap {
-                filter: Interpolation::Nearest,
-                ..
-            }) => {
-                if min_filter == Interpolation::Nearest {
-                    context.tex_parameter_i32(
-                        target,
-                        crate::context::TEXTURE_MIN_FILTER,
-                        crate::context::NEAREST_MIPMAP_NEAREST as i32,
-                    );
-                } else {
-                    context.tex_parameter_i32(
-                        target,
-                        crate::context::TEXTURE_MIN_FILTER,
-                        crate::context::LINEAR_MIPMAP_NEAREST as i32,
-                    )
-                }
-            }
-            Some(Mipmap {
-                filter: Interpolation::Linear,
-                ..
-            }) => {
-                if min_filter == Interpolation::Nearest {
-                    context.tex_parameter_i32(
-                        target,
-                        crate::context::TEXTURE_MIN_FILTER,
-                        crate::context::NEAREST_MIPMAP_LINEAR as i32,
-                    );
-                } else {
-                    context.tex_parameter_i32(
-                        target,
-                        crate::context::TEXTURE_MIN_FILTER,
-                        crate::context::LINEAR_MIPMAP_LINEAR as i32,
-                    )
-                }
-            }
-            _ => panic!("Can only sample textures using 'NEAREST' or 'LINEAR' interpolation"),
-        }
-        if let Some(Mipmap { max_ratio, .. }) = mipmap {
-            let extensions = context.supported_extensions();
-            // Desktop
-            if extensions.contains("GL_ARB_texture_filter_anisotropic") ||
-                extensions.contains("GL_EXT_texture_filter_anisotropic") ||
-                // Web
-                extensions.contains("EXT_texture_filter_anisotropic")
-            {
-                let max_ratio = max_ratio.min(
-                    context.get_parameter_i32(crate::context::MAX_TEXTURE_MAX_ANISOTROPY_EXT)
-                        as u32,
-                );
-                context.tex_parameter_i32(
-                    target,
-                    crate::context::TEXTURE_MAX_ANISOTROPY_EXT,
-                    max_ratio as i32,
-                );
-            }
-        }
-        context.tex_parameter_i32(
-            target,
-            crate::context::TEXTURE_MAG_FILTER,
-            interpolation_from(mag_filter),
-        );
-        context.tex_parameter_i32(
-            target,
-            crate::context::TEXTURE_WRAP_S,
-            wrapping_from(wrap_s),
-        );
-        context.tex_parameter_i32(
-            target,
-            crate::context::TEXTURE_WRAP_T,
-            wrapping_from(wrap_t),
-        );
-        if let Some(r) = wrap_r {
-            context.tex_parameter_i32(target, crate::context::TEXTURE_WRAP_R, wrapping_from(r));
-        }
-    }
+    storage: bool,
+) -> backend::TextureId {
+    context.backend().create_texture(&backend::TextureDesc {
+        kind,
+        sampler: backend::SamplerDesc {
+            min_filter,
+            mag_filter,
+            mipmap: if number_of_mip_maps == 1 {
+                None
+            } else {
+                mipmap
+            },
+            wrap_s,
+            wrap_t,
+            wrap_r,
+        },
+        storage: storage.then_some(backend::TextureStorage {
+            format: backend::TextureFormat::Color(backend::ColorFormat::of::<T>()),
+            mip_levels: number_of_mip_maps,
+            width,
+            height,
+            depth,
+        }),
+    })
+}
+
+///
+/// Creates a depth texture with the given wrapping and allocated storage for `T`.
+///
+fn create_depth_texture<T: DepthTextureDataType>(
+    context: &Context,
+    kind: backend::TextureKind,
+    width: u32,
+    height: u32,
+    depth: u32,
+    wrap_s: Wrapping,
+    wrap_t: Wrapping,
+    wrap_r: Option<Wrapping>,
+) -> backend::TextureId {
+    context.backend().create_texture(&backend::TextureDesc {
+        kind,
+        sampler: backend::SamplerDesc {
+            min_filter: Interpolation::Nearest,
+            mag_filter: Interpolation::Nearest,
+            mipmap: None,
+            wrap_s,
+            wrap_t,
+            wrap_r,
+        },
+        storage: Some(backend::TextureStorage {
+            format: backend::TextureFormat::Depth(T::depth_format()),
+            mip_levels: 1,
+            width,
+            height,
+            depth,
+        }),
+    })
 }
 
 fn calculate_number_of_mip_maps<T: TextureDataType>(
@@ -380,9 +357,7 @@ fn calculate_number_of_mip_maps<T: TextureDataType>(
     depth: Option<u32>,
 ) -> u32 {
     // Cannot generate mip maps for RGB16F or RGB32F textures on web (https://registry.khronos.org/webgl/extensions/EXT_color_buffer_float/)
-    if (T::data_type() == crate::context::FLOAT || T::data_type() == crate::context::HALF_FLOAT)
-        && T::size() == 3
-    {
+    if T::primitive_type().is_float() && T::size() == 3 {
         return 1;
     }
 
@@ -397,22 +372,6 @@ fn calculate_number_of_mip_maps<T: TextureDataType>(
     } else {
         1
     }
-}
-
-fn wrapping_from(wrapping: Wrapping) -> i32 {
-    (match wrapping {
-        Wrapping::Repeat => crate::context::REPEAT,
-        Wrapping::MirroredRepeat => crate::context::MIRRORED_REPEAT,
-        Wrapping::ClampToEdge => crate::context::CLAMP_TO_EDGE,
-    }) as i32
-}
-
-fn interpolation_from(interpolation: Interpolation) -> i32 {
-    (match interpolation {
-        Interpolation::Nearest => crate::context::NEAREST,
-        Interpolation::Linear => crate::context::LINEAR,
-        _ => panic!("Can only sample textures using 'NEAREST' or 'LINEAR' interpolation"),
-    }) as i32
 }
 
 fn check_data_length<T: TextureDataType>(

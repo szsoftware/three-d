@@ -1,5 +1,3 @@
-use crate::core::*;
-
 ///
 /// Defines which channels (red, green, blue, alpha and depth) to clear when starting to write to a [RenderTarget].
 /// If `None` then the channel is not cleared and if `Some(value)` the channel is cleared to that value (the value must be between 0 and 1).
@@ -68,40 +66,6 @@ impl ClearState {
             blue: Some(blue),
             alpha: Some(alpha),
             depth: Some(depth),
-        }
-    }
-
-    pub(in crate::core) fn apply(&self, context: &Context) {
-        context.set_write_mask(WriteMask {
-            red: self.red.is_some(),
-            green: self.green.is_some(),
-            blue: self.blue.is_some(),
-            alpha: self.alpha.is_some(),
-            depth: self.depth.is_some(),
-        });
-        unsafe {
-            let clear_color = self.red.is_some()
-                || self.green.is_some()
-                || self.blue.is_some()
-                || self.alpha.is_some();
-            if clear_color {
-                context.clear_color(
-                    self.red.unwrap_or(0.0),
-                    self.green.unwrap_or(0.0),
-                    self.blue.unwrap_or(0.0),
-                    self.alpha.unwrap_or(1.0),
-                );
-            }
-            if let Some(depth) = self.depth {
-                context.clear_depth_f32(depth);
-            }
-            context.clear(if clear_color && self.depth.is_some() {
-                crate::context::COLOR_BUFFER_BIT | crate::context::DEPTH_BUFFER_BIT
-            } else if clear_color {
-                crate::context::COLOR_BUFFER_BIT
-            } else {
-                crate::context::DEPTH_BUFFER_BIT
-            });
         }
     }
 }

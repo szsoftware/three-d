@@ -65,17 +65,6 @@ impl CubeMapSide {
         CubeMapSideIterator::new()
     }
 
-    pub(in crate::core) fn to_const(self) -> u32 {
-        match self {
-            CubeMapSide::Right => crate::context::TEXTURE_CUBE_MAP_POSITIVE_X,
-            CubeMapSide::Left => crate::context::TEXTURE_CUBE_MAP_NEGATIVE_X,
-            CubeMapSide::Top => crate::context::TEXTURE_CUBE_MAP_POSITIVE_Y,
-            CubeMapSide::Bottom => crate::context::TEXTURE_CUBE_MAP_NEGATIVE_Y,
-            CubeMapSide::Front => crate::context::TEXTURE_CUBE_MAP_POSITIVE_Z,
-            CubeMapSide::Back => crate::context::TEXTURE_CUBE_MAP_NEGATIVE_Z,
-        }
-    }
-
     /// The up direction that should be used when rendering into this cube map side.
     pub fn up(&self) -> Vec3 {
         match self {
@@ -106,7 +95,7 @@ impl CubeMapSide {
 ///
 pub struct TextureCubeMap {
     context: Context,
-    id: crate::context::Texture,
+    id: backend::TextureId,
     width: u32,
     height: u32,
     number_of_mip_maps: u32,
@@ -314,28 +303,19 @@ impl TextureCubeMap {
         wrap_t: Wrapping,
         wrap_r: Wrapping,
     ) -> Self {
-        unsafe {
-            Self::new_unchecked::<T>(
-                context,
-                width,
-                height,
-                min_filter,
-                mag_filter,
-                mipmap,
-                wrap_s,
-                wrap_t,
-                wrap_r,
-                |texture| {
-                    context.tex_storage_2d(
-                        crate::context::TEXTURE_CUBE_MAP,
-                        texture.number_of_mip_maps() as i32,
-                        T::internal_format(),
-                        width as i32,
-                        height as i32,
-                    )
-                },
-            )
-        }
+        Self::new_internal::<T>(
+            context,
+            width,
+            height,
+            min_filter,
+            mag_filter,
+            mipmap,
+            wrap_s,
+            wrap_t,
+            wrap_r,
+            true,
+            |_| {},
+        )
     }
 
     ///
@@ -396,30 +376,24 @@ impl TextureCubeMap {
             self.data_byte_size,
             back_data.len(),
         );
-        self.bind();
-        for i in 0..6 {
-            let data = match i {
-                0 => right_data,
-                1 => left_data,
-                2 => top_data,
-                3 => bottom_data,
-                4 => front_data,
-                5 => back_data,
-                _ => unreachable!(),
-            };
-            unsafe {
-                self.context.tex_sub_image_2d(
-                    crate::context::TEXTURE_CUBE_MAP_POSITIVE_X + i as u32,
-                    0,
-                    0,
-                    0,
-                    self.width as i32,
-                    self.height as i32,
-                    format_from_data_type::<T>(),
-                    T::data_type(),
-                    crate::context::PixelUnpackData::Slice(Some(to_byte_slice(data))),
-                );
-            }
+        for (side, data) in [
+            (CubeMapSide::Right, right_data),
+            (CubeMapSide::Left, left_data),
+            (CubeMapSide::Top, top_data),
+            (CubeMapSide::Bottom, bottom_data),
+            (CubeMapSide::Front, front_data),
+            (CubeMapSide::Back, back_data),
+        ] {
+            self.context.backend().write_texture(
+                self.id,
+                backend::TextureKind::CubeMap,
+                backend::TextureRegion::Side(side),
+                self.width,
+                self.height,
+                1,
+                backend::ColorFormat::of::<T>(),
+                to_byte_slice(data),
+            );
         }
         self.generate_mip_maps();
     }
@@ -521,36 +495,14 @@ impl TextureCubeMap {
 
     pub(in crate::core) fn generate_mip_maps(&self) {
         if self.number_of_mip_maps > 1 {
-            self.bind();
-            unsafe {
-                self.context
-                    .generate_mipmap(crate::context::TEXTURE_CUBE_MAP);
-            }
-        }
-    }
-
-    pub(in crate::core) fn bind_as_color_target(
-        &self,
-        side: CubeMapSide,
-        channel: u32,
-        mip_level: u32,
-    ) {
-        unsafe {
-            self.context.framebuffer_texture_2d(
-                crate::context::DRAW_FRAMEBUFFER,
-                crate::context::COLOR_ATTACHMENT0 + channel,
-                side.to_const(),
-                Some(self.id),
-                mip_level as i32,
-            );
-        }
-    }
-
-    pub(in crate::core) fn bind(&self) {
-        unsafe {
             self.context
-                .bind_texture(crate::context::TEXTURE_CUBE_MAP, Some(self.id));
+                .backend()
+                .generate_mipmaps(self.id, backend::TextureKind::CubeMap);
         }
+    }
+
+    pub(in crate::core) fn id(&self) -> backend::TextureId {
+        self.id
     }
 
     ///
@@ -575,8 +527,42 @@ impl TextureCubeMap {
         wrap_r: Wrapping,
         callback: impl FnOnce(&Self),
     ) -> Self {
-        let id = generate(context);
+        Self::new_internal::<T>(
+            context, width, height, min_filter, mag_filter, mipmap, wrap_s, wrap_t, wrap_r, false,
+            callback,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_internal<T: TextureDataType>(
+        context: &Context,
+        width: u32,
+        height: u32,
+        min_filter: Interpolation,
+        mag_filter: Interpolation,
+        mipmap: Option<Mipmap>,
+        wrap_s: Wrapping,
+        wrap_t: Wrapping,
+        wrap_r: Wrapping,
+        allocate: bool,
+        callback: impl FnOnce(&Self),
+    ) -> Self {
         let number_of_mip_maps = calculate_number_of_mip_maps::<T>(mipmap, width, height, None);
+        let id = create_texture::<T>(
+            context,
+            backend::TextureKind::CubeMap,
+            width,
+            height,
+            1,
+            number_of_mip_maps,
+            min_filter,
+            mag_filter,
+            mipmap,
+            wrap_s,
+            wrap_t,
+            Some(wrap_r),
+            allocate,
+        );
         let texture = Self {
             context: context.clone(),
             id,
@@ -585,21 +571,6 @@ impl TextureCubeMap {
             number_of_mip_maps,
             data_byte_size: std::mem::size_of::<T>(),
         };
-        texture.bind();
-        set_parameters(
-            context,
-            crate::context::TEXTURE_CUBE_MAP,
-            min_filter,
-            mag_filter,
-            if number_of_mip_maps == 1 {
-                None
-            } else {
-                mipmap
-            },
-            wrap_s,
-            wrap_t,
-            Some(wrap_r),
-        );
         callback(&texture);
         texture.generate_mip_maps();
         texture
@@ -608,8 +579,6 @@ impl TextureCubeMap {
 
 impl Drop for TextureCubeMap {
     fn drop(&mut self) {
-        unsafe {
-            self.context.delete_texture(self.id);
-        }
+        self.context.backend().delete_texture(self.id);
     }
 }

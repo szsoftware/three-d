@@ -13,8 +13,7 @@ pub use crate::context::HasContext;
 ///
 #[derive(Clone)]
 pub struct Context {
-    context: Arc<crate::context::Context>,
-    pub(super) vao: crate::context::VertexArray,
+    backend: Arc<backend::Backend>,
     /// A cache of programs to avoid recompiling a [Program] every frame.
     pub programs: Arc<RwLock<HashMap<Vec<u8>, Program>>>,
 }
@@ -27,204 +26,99 @@ impl Context {
     /// you can also call this method with a reference counter to a glow context created using glow and not the re-export in [context](crate::context).
     ///
     pub fn from_gl_context(context: Arc<crate::context::Context>) -> Result<Self, CoreError> {
-        unsafe {
-            if !context.version().is_embedded {
-                // Enable seamless cube map textures - not available on OpenGL ES and WebGL
-                context.enable(crate::context::TEXTURE_CUBE_MAP_SEAMLESS);
-            }
-            context.pixel_store_i32(crate::context::UNPACK_ALIGNMENT, 1);
-            context.pixel_store_i32(crate::context::PACK_ALIGNMENT, 1);
-        };
-        let c = unsafe {
-            // Create one Vertex Array Object which is then reused all the time.
-            let vao = context
-                .create_vertex_array()
-                .map_err(CoreError::ContextCreation)?;
-            Self {
-                context,
-                vao,
-                programs: Arc::new(RwLock::new(HashMap::new())),
-            }
-        };
-        Ok(c)
+        Ok(Self::from_backend(backend::Backend::Gl(
+            backend::gl::GlBackend::new(context)?,
+        )))
+    }
+
+    pub(crate) fn from_backend(backend: backend::Backend) -> Self {
+        Self {
+            backend: Arc::new(backend),
+            programs: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    ///
+    /// Returns the low-level OpenGL/WebGL context if this context uses the OpenGL/WebGL backend, otherwise `None`.
+    /// Dereferencing a [Context] gives the same low-level context but panics if another backend is used.
+    ///
+    pub fn as_gl(&self) -> Option<&Arc<crate::context::Context>> {
+        match &*self.backend {
+            backend::Backend::Gl(gl) => Some(&gl.context),
+            #[cfg(test)]
+            backend::Backend::Null(_) => None,
+        }
+    }
+
+    /// The backend which executes all graphics calls of the [core](crate::core) module.
+    pub(crate) fn backend(&self) -> &dyn backend::BackendApi {
+        self.backend.api()
+    }
+
+    /// The GL backend. Used for the functionality that hands raw GL calls to the user.
+    pub(crate) fn gl_backend(&self) -> &backend::gl::GlBackend {
+        match &*self.backend {
+            backend::Backend::Gl(gl) => gl,
+            #[cfg(test)]
+            backend::Backend::Null(_) => panic!("{}", NOT_GL),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn null_backend(&self) -> &backend::null::NullBackend {
+        match &*self.backend {
+            backend::Backend::Null(null) => null,
+            _ => panic!("not the null backend"),
+        }
     }
 
     ///
     /// Set the scissor test for this context (see [ScissorBox]).
     ///
     pub fn set_scissor(&self, scissor_box: ScissorBox) {
-        unsafe {
-            if scissor_box.width > 0 && scissor_box.height > 0 {
-                self.enable(crate::context::SCISSOR_TEST);
-                self.scissor(
-                    scissor_box.x,
-                    scissor_box.y,
-                    scissor_box.width as i32,
-                    scissor_box.height as i32,
-                );
-            } else {
-                self.disable(crate::context::SCISSOR_TEST);
-            }
-        }
+        self.backend().set_scissor(scissor_box);
     }
 
     ///
     /// Set the viewport for this context (See [Viewport]).
     ///
     pub fn set_viewport(&self, viewport: Viewport) {
-        unsafe {
-            self.viewport(
-                viewport.x,
-                viewport.y,
-                viewport.width as i32,
-                viewport.height as i32,
-            );
-        }
+        self.backend().set_viewport(viewport);
     }
 
     ///
     /// Set the face culling for this context (see [Cull]).
     ///
     pub fn set_cull(&self, cull: Cull) {
-        unsafe {
-            match cull {
-                Cull::None => {
-                    self.disable(crate::context::CULL_FACE);
-                }
-                Cull::Back => {
-                    self.enable(crate::context::CULL_FACE);
-                    self.cull_face(crate::context::BACK);
-                }
-                Cull::Front => {
-                    self.enable(crate::context::CULL_FACE);
-                    self.cull_face(crate::context::FRONT);
-                }
-                Cull::FrontAndBack => {
-                    self.enable(crate::context::CULL_FACE);
-                    self.cull_face(crate::context::FRONT_AND_BACK);
-                }
-            }
-        }
+        self.backend().set_cull(cull);
     }
 
     ///
     /// Set the write mask for this context (see [WriteMask]).
     ///
     pub fn set_write_mask(&self, write_mask: WriteMask) {
-        unsafe {
-            self.color_mask(
-                write_mask.red,
-                write_mask.green,
-                write_mask.blue,
-                write_mask.alpha,
-            );
-            self.depth_mask(write_mask.depth);
-        }
+        self.backend().set_write_mask(write_mask);
     }
 
     ///
     /// Set the depth test for this context (see [DepthTest]).
     ///
     pub fn set_depth_test(&self, depth_test: DepthTest) {
-        unsafe {
-            self.enable(crate::context::DEPTH_TEST);
-            match depth_test {
-                DepthTest::Never => {
-                    self.depth_func(crate::context::NEVER);
-                }
-                DepthTest::Less => {
-                    self.depth_func(crate::context::LESS);
-                }
-                DepthTest::Equal => {
-                    self.depth_func(crate::context::EQUAL);
-                }
-                DepthTest::LessOrEqual => {
-                    self.depth_func(crate::context::LEQUAL);
-                }
-                DepthTest::Greater => {
-                    self.depth_func(crate::context::GREATER);
-                }
-                DepthTest::NotEqual => {
-                    self.depth_func(crate::context::NOTEQUAL);
-                }
-                DepthTest::GreaterOrEqual => {
-                    self.depth_func(crate::context::GEQUAL);
-                }
-                DepthTest::Always => {
-                    self.depth_func(crate::context::ALWAYS);
-                }
-            }
-        }
+        self.backend().set_depth_test(depth_test);
     }
 
     ///
     /// Set the blend state for this context (see [Blend]).
     ///
     pub fn set_blend(&self, blend: Blend) {
-        unsafe {
-            if let Blend::Enabled {
-                source_rgb_multiplier,
-                source_alpha_multiplier,
-                destination_rgb_multiplier,
-                destination_alpha_multiplier,
-                rgb_equation,
-                alpha_equation,
-            } = blend
-            {
-                self.enable(crate::context::BLEND);
-                self.blend_func_separate(
-                    Self::blend_const_from_multiplier(source_rgb_multiplier),
-                    Self::blend_const_from_multiplier(destination_rgb_multiplier),
-                    Self::blend_const_from_multiplier(source_alpha_multiplier),
-                    Self::blend_const_from_multiplier(destination_alpha_multiplier),
-                );
-                self.blend_equation_separate(
-                    Self::blend_const_from_equation(rgb_equation),
-                    Self::blend_const_from_equation(alpha_equation),
-                );
-            } else {
-                self.disable(crate::context::BLEND);
-            }
-        }
-    }
-
-    fn blend_const_from_multiplier(multiplier: BlendMultiplierType) -> u32 {
-        match multiplier {
-            BlendMultiplierType::Zero => crate::context::ZERO,
-            BlendMultiplierType::One => crate::context::ONE,
-            BlendMultiplierType::SrcColor => crate::context::SRC_COLOR,
-            BlendMultiplierType::OneMinusSrcColor => crate::context::ONE_MINUS_SRC_COLOR,
-            BlendMultiplierType::DstColor => crate::context::DST_COLOR,
-            BlendMultiplierType::OneMinusDstColor => crate::context::ONE_MINUS_DST_COLOR,
-            BlendMultiplierType::SrcAlpha => crate::context::SRC_ALPHA,
-            BlendMultiplierType::OneMinusSrcAlpha => crate::context::ONE_MINUS_SRC_ALPHA,
-            BlendMultiplierType::DstAlpha => crate::context::DST_ALPHA,
-            BlendMultiplierType::OneMinusDstAlpha => crate::context::ONE_MINUS_DST_ALPHA,
-            BlendMultiplierType::SrcAlphaSaturate => crate::context::SRC_ALPHA_SATURATE,
-        }
-    }
-    fn blend_const_from_equation(equation: BlendEquationType) -> u32 {
-        match equation {
-            BlendEquationType::Add => crate::context::FUNC_ADD,
-            BlendEquationType::Subtract => crate::context::FUNC_SUBTRACT,
-            BlendEquationType::ReverseSubtract => crate::context::FUNC_REVERSE_SUBTRACT,
-            BlendEquationType::Min => crate::context::MIN,
-            BlendEquationType::Max => crate::context::MAX,
-        }
+        self.backend().set_blend(blend);
     }
 
     ///
     /// Set the render states for this context (see [RenderStates]).
     ///
     pub fn set_render_states(&self, render_states: RenderStates) {
-        self.set_cull(render_states.cull);
-        self.set_write_mask(render_states.write_mask);
-        if !render_states.write_mask.depth && render_states.depth_test == DepthTest::Always {
-            unsafe { self.disable(crate::context::DEPTH_TEST) }
-        } else {
-            self.set_depth_test(render_states.depth_test);
-        }
-        self.set_blend(render_states.blend);
+        self.backend().set_render_states(render_states);
     }
 
     ///
@@ -232,68 +126,12 @@ impl Context {
     /// Can also be used in production to handle unexpected rendering errors, but do not call it too often to avoid performance problems.
     ///
     pub fn error_check(&self) -> Result<(), CoreError> {
-        self.framebuffer_check()?;
-        unsafe {
-            let e = self.get_error();
-            if e != crate::context::NO_ERROR {
-                Err(CoreError::ContextError(
-                    match e {
-                        crate::context::INVALID_ENUM => "Invalid enum",
-                        crate::context::INVALID_VALUE => "Invalid value",
-                        crate::context::INVALID_OPERATION => "Invalid operation",
-                        crate::context::INVALID_FRAMEBUFFER_OPERATION => {
-                            "Invalid framebuffer operation"
-                        }
-                        crate::context::OUT_OF_MEMORY => "Out of memory",
-                        crate::context::STACK_OVERFLOW => "Stack overflow",
-                        crate::context::STACK_UNDERFLOW => "Stack underflow",
-                        _ => "Unknown",
-                    }
-                    .to_string(),
-                ))?;
-            }
-        }
-        Ok(())
-    }
-
-    fn framebuffer_check(&self) -> Result<(), CoreError> {
-        unsafe {
-            match self.check_framebuffer_status(crate::context::FRAMEBUFFER) {
-                crate::context::FRAMEBUFFER_COMPLETE => Ok(()),
-                crate::context::FRAMEBUFFER_INCOMPLETE_ATTACHMENT => Err(CoreError::ContextError(
-                    "FRAMEBUFFER_INCOMPLETE_ATTACHMENT".to_string(),
-                )),
-                crate::context::FRAMEBUFFER_INCOMPLETE_DRAW_BUFFER => Err(CoreError::ContextError(
-                    "FRAMEBUFFER_INCOMPLETE_DRAW_BUFFER".to_string(),
-                )),
-                crate::context::FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT => {
-                    Err(CoreError::ContextError(
-                        "FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT".to_string(),
-                    ))
-                }
-                crate::context::FRAMEBUFFER_UNSUPPORTED => Err(CoreError::ContextError(
-                    "FRAMEBUFFER_UNSUPPORTED".to_string(),
-                )),
-                crate::context::FRAMEBUFFER_UNDEFINED => {
-                    Err(CoreError::ContextError("FRAMEBUFFER_UNDEFINED".to_string()))
-                }
-                crate::context::FRAMEBUFFER_INCOMPLETE_READ_BUFFER => Err(CoreError::ContextError(
-                    "FRAMEBUFFER_INCOMPLETE_READ_BUFFER".to_string(),
-                )),
-                crate::context::FRAMEBUFFER_INCOMPLETE_MULTISAMPLE => Err(CoreError::ContextError(
-                    "FRAMEBUFFER_INCOMPLETE_MULTISAMPLE".to_string(),
-                )),
-                crate::context::FRAMEBUFFER_INCOMPLETE_LAYER_TARGETS => Err(
-                    CoreError::ContextError("FRAMEBUFFER_INCOMPLETE_LAYER_TARGETS".to_string()),
-                ),
-                _ => Err(CoreError::ContextError(
-                    "Unknown framebuffer error".to_string(),
-                )),
-            }?;
-        }
-        Ok(())
+        self.backend().error_check()
     }
 }
+
+const NOT_GL: &str =
+    "this functionality needs the OpenGL/WebGL backend, but the context uses another backend";
 
 impl std::fmt::Debug for Context {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -306,6 +144,6 @@ impl std::fmt::Debug for Context {
 impl std::ops::Deref for Context {
     type Target = Arc<crate::context::Context>;
     fn deref(&self) -> &Self::Target {
-        &self.context
+        self.as_gl().expect(NOT_GL)
     }
 }

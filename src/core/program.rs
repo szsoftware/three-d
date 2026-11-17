@@ -10,10 +10,11 @@ use std::sync::RwLock;
 ///
 pub struct Program {
     context: Context,
-    id: crate::context::Program,
+    id: backend::ProgramId,
     attributes: HashMap<String, u32>,
+    attribute_locations: Vec<u32>,
     textures: RwLock<HashMap<String, u32>>,
-    uniforms: HashMap<String, crate::context::UniformLocation>,
+    uniforms: HashMap<String, backend::UniformLocation>,
     uniform_blocks: RwLock<HashMap<String, (u32, u32)>>,
 }
 
@@ -26,110 +27,19 @@ impl Program {
         vertex_shader_source: &str,
         fragment_shader_source: &str,
     ) -> Result<Self, CoreError> {
-        unsafe {
-            let vert_shader = context
-                .create_shader(crate::context::VERTEX_SHADER)
-                .expect("Failed creating vertex shader");
-            let frag_shader = context
-                .create_shader(crate::context::FRAGMENT_SHADER)
-                .expect("Failed creating fragment shader");
-
-            let header: &str = if context.version().is_embedded {
-                "#version 300 es
-                    #ifdef GL_FRAGMENT_PRECISION_HIGH
-                        precision highp float;
-                        precision highp int;
-                        precision highp sampler2DArray;
-                        precision highp sampler3D;
-                    #else
-                        precision mediump float;
-                        precision mediump int;
-                        precision mediump sampler2DArray;
-                        precision mediump sampler3D;
-                    #endif\n"
-            } else {
-                "#version 330 core\n"
-            };
-            let vertex_shader_source = format!("{}{}", header, vertex_shader_source);
-            let fragment_shader_source = format!("{}{}", header, fragment_shader_source);
-
-            context.shader_source(vert_shader, &vertex_shader_source);
-            context.shader_source(frag_shader, &fragment_shader_source);
-            context.compile_shader(vert_shader);
-            context.compile_shader(frag_shader);
-
-            let id = context.create_program().expect("Failed creating program");
-            context.attach_shader(id, vert_shader);
-            context.attach_shader(id, frag_shader);
-            context.link_program(id);
-
-            if !context.get_program_link_status(id) {
-                let log = context.get_shader_info_log(vert_shader);
-                if !log.is_empty() {
-                    Err(shader_compilation_error(
-                        "vertex",
-                        log,
-                        vertex_shader_source,
-                    ))?;
-                }
-                let log = context.get_shader_info_log(frag_shader);
-                if !log.is_empty() {
-                    Err(shader_compilation_error(
-                        "fragment",
-                        log,
-                        fragment_shader_source,
-                    ))?;
-                }
-                let log = context.get_program_info_log(id);
-                if !log.is_empty() {
-                    Err(CoreError::ShaderLink(log))?;
-                }
-                Err(CoreError::ShaderCompilerError)?;
-            }
-
-            context.detach_shader(id, vert_shader);
-            context.detach_shader(id, frag_shader);
-            context.delete_shader(vert_shader);
-            context.delete_shader(frag_shader);
-
-            // Init vertex attributes
-            let num_attribs = context.get_active_attributes(id);
-            let mut attributes = HashMap::new();
-            for i in 0..num_attribs {
-                if let Some(crate::context::ActiveAttribute { name, .. }) = context
-                    .get_active_attribute(id, i)
-                    .filter(|a| !a.name.starts_with("gl_"))
-                {
-                    if let Some(location) = context.get_attrib_location(id, &name) {
-                        attributes.insert(name, location);
-                    }
-                }
-            }
-
-            // Init uniforms
-            let num_uniforms = context.get_active_uniforms(id);
-            let mut uniforms = HashMap::new();
-            for i in 0..num_uniforms {
-                if let Some(crate::context::ActiveUniform { name, .. }) = context
-                    .get_active_uniform(id, i)
-                    .filter(|a| !a.name.starts_with("gl_"))
-                {
-                    if let Some(location) = context.get_uniform_location(id, &name) {
-                        let name = name.split('[').next().unwrap().to_string();
-                        uniforms.insert(name, location);
-                    }
-                }
-            }
-
-            Ok(Program {
-                context: context.clone(),
-                id,
-                attributes,
-                uniforms,
-                uniform_blocks: RwLock::new(HashMap::new()),
-                textures: RwLock::new(HashMap::new()),
-            })
-        }
+        let (id, reflection) = context
+            .backend()
+            .create_program(vertex_shader_source, fragment_shader_source)?;
+        let attribute_locations = reflection.attributes.values().copied().collect();
+        Ok(Program {
+            context: context.clone(),
+            id,
+            attributes: reflection.attributes,
+            attribute_locations,
+            uniforms: reflection.uniforms,
+            uniform_blocks: RwLock::new(HashMap::new()),
+            textures: RwLock::new(HashMap::new()),
+        })
     }
 
     ///
@@ -143,8 +53,9 @@ impl Program {
     ///
     pub fn use_uniform<T: UniformDataType>(&self, name: &str, data: T) {
         let location = self.get_uniform_location(name);
-        T::send_uniform(&self.context, location, &[data]);
-        self.unuse_program();
+        self.context
+            .backend()
+            .set_uniform(self.id, location, &T::uniform_value(&[data]));
     }
 
     ///
@@ -167,12 +78,12 @@ impl Program {
     ///
     pub fn use_uniform_array<T: UniformDataType>(&self, name: &str, data: &[T]) {
         let location = self.get_uniform_location(name);
-        T::send_uniform(&self.context, location, data);
-        self.unuse_program();
+        self.context
+            .backend()
+            .set_uniform(self.id, location, &T::uniform_value(data));
     }
 
-    fn get_uniform_location(&self, name: &str) -> &crate::context::UniformLocation {
-        self.use_program();
+    fn get_uniform_location(&self, name: &str) -> &backend::UniformLocation {
         self.uniforms.get(name).unwrap_or_else(|| {
             panic!(
                 "the uniform {} is sent to the shader but not defined or never used",
@@ -190,8 +101,10 @@ impl Program {
     /// In the latter case the variable is removed by the shader compiler.
     ///
     pub fn use_texture(&self, name: &str, texture: &Texture2D) {
-        self.use_texture_internal(name);
-        texture.bind();
+        let unit = self.use_texture_internal(name);
+        self.context
+            .backend()
+            .bind_texture(unit, texture.id(), backend::TextureKind::D2);
     }
 
     ///
@@ -203,8 +116,10 @@ impl Program {
     /// In the latter case the variable is removed by the shader compiler.
     ///
     pub fn use_depth_texture(&self, name: &str, texture: &DepthTexture2D) {
-        self.use_texture_internal(name);
-        texture.bind();
+        let unit = self.use_texture_internal(name);
+        self.context
+            .backend()
+            .bind_texture(unit, texture.id(), backend::TextureKind::D2);
     }
 
     ///
@@ -216,8 +131,10 @@ impl Program {
     /// In the latter case the variable is removed by the shader compiler.
     ///
     pub fn use_texture_array(&self, name: &str, texture: &Texture2DArray) {
-        self.use_texture_internal(name);
-        texture.bind();
+        let unit = self.use_texture_internal(name);
+        self.context
+            .backend()
+            .bind_texture(unit, texture.id(), backend::TextureKind::D2Array);
     }
 
     ///
@@ -229,8 +146,10 @@ impl Program {
     /// In the latter case the variable is removed by the shader compiler.
     ///
     pub fn use_depth_texture_array(&self, name: &str, texture: &DepthTexture2DArray) {
-        self.use_texture_internal(name);
-        texture.bind();
+        let unit = self.use_texture_internal(name);
+        self.context
+            .backend()
+            .bind_texture(unit, texture.id(), backend::TextureKind::D2Array);
     }
 
     ///
@@ -242,8 +161,10 @@ impl Program {
     /// In the latter case the variable is removed by the shader compiler.
     ///
     pub fn use_texture_cube(&self, name: &str, texture: &TextureCubeMap) {
-        self.use_texture_internal(name);
-        texture.bind();
+        let unit = self.use_texture_internal(name);
+        self.context
+            .backend()
+            .bind_texture(unit, texture.id(), backend::TextureKind::CubeMap);
     }
 
     ///
@@ -255,8 +176,10 @@ impl Program {
     /// In the latter case the variable is removed by the shader compiler.
     ///
     pub fn use_depth_texture_cube(&self, name: &str, texture: &DepthTextureCubeMap) {
-        self.use_texture_internal(name);
-        texture.bind();
+        let unit = self.use_texture_internal(name);
+        self.context
+            .backend()
+            .bind_texture(unit, texture.id(), backend::TextureKind::CubeMap);
     }
 
     ///
@@ -268,8 +191,10 @@ impl Program {
     /// In the latter case the variable is removed by the shader compiler.
     ///
     pub fn use_texture_3d(&self, name: &str, texture: &Texture3D) {
-        self.use_texture_internal(name);
-        texture.bind();
+        let unit = self.use_texture_internal(name);
+        self.context
+            .backend()
+            .bind_texture(unit, texture.id(), backend::TextureKind::D3);
     }
 
     ///
@@ -278,8 +203,9 @@ impl Program {
     ///
     #[deprecated = "Instead, create normal textures, eg. Texture2D, using the new_unchecked() methods, eg. Texture2D::new_unchecked()"]
     pub fn use_raw_texture(&self, name: &str, target: u32, id: crate::context::Texture) {
-        self.use_texture_internal(name);
+        let unit = self.use_texture_internal(name);
         unsafe {
+            self.context.active_texture(crate::context::TEXTURE0 + unit);
             self.context.bind_texture(target, Some(id));
         }
     }
@@ -292,10 +218,6 @@ impl Program {
         };
         let index = *self.textures.read().unwrap().get(name).unwrap();
         self.use_uniform(name, index as i32);
-        unsafe {
-            self.context
-                .active_texture(crate::context::TEXTURE0 + index);
-        }
         index
     }
 
@@ -305,22 +227,23 @@ impl Program {
     pub fn use_uniform_block(&self, name: &str, buffer: &UniformBuffer) {
         if !self.uniform_blocks.read().unwrap().contains_key(name) {
             let mut map = self.uniform_blocks.write().unwrap();
-            let location = unsafe {
-                self.context
-                    .get_uniform_block_index(self.id, name)
-                    .unwrap_or_else(|| panic!("the uniform block {} is sent to the shader but not defined or never used",
-                        name))
-            };
+            let location = self
+                .context
+                .backend()
+                .uniform_block_index(self.id, name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the uniform block {} is sent to the shader but not defined or never used",
+                        name
+                    )
+                });
             let index = map.len() as u32;
             map.insert(name.to_owned(), (location, index));
         };
         let (location, index) = *self.uniform_blocks.read().unwrap().get(name).unwrap();
-        unsafe {
-            self.context.uniform_block_binding(self.id, location, index);
-            buffer.bind(index);
-            self.context
-                .bind_buffer(crate::context::UNIFORM_BUFFER, None);
-        }
+        self.context
+            .backend()
+            .bind_uniform_block(self.id, location, index, buffer.id());
     }
 
     ///
@@ -334,40 +257,14 @@ impl Program {
     ///
     pub fn use_vertex_attribute<T: BufferDataType>(&self, name: &str, buffer: &VertexBuffer<T>) {
         if buffer.count() > 0 {
-            buffer.bind();
             let loc = self.location(name);
-            unsafe {
-                self.context.bind_vertex_array(Some(self.context.vao));
-                self.context.enable_vertex_attrib_array(loc);
-                if !T::normalized()
-                    && (T::data_type() == crate::context::UNSIGNED_BYTE
-                        || T::data_type() == crate::context::BYTE
-                        || T::data_type() == crate::context::UNSIGNED_SHORT
-                        || T::data_type() == crate::context::SHORT
-                        || T::data_type() == crate::context::UNSIGNED_INT
-                        || T::data_type() == crate::context::INT)
-                {
-                    self.context.vertex_attrib_pointer_i32(
-                        loc,
-                        T::size() as i32,
-                        T::data_type(),
-                        0,
-                        0,
-                    );
-                } else {
-                    self.context.vertex_attrib_pointer_f32(
-                        loc,
-                        T::size() as i32,
-                        T::data_type(),
-                        T::normalized(),
-                        0,
-                        0,
-                    );
-                }
-                self.context.vertex_attrib_divisor(loc, 0);
-                self.context.bind_buffer(crate::context::ARRAY_BUFFER, None);
-            }
-            self.unuse_program();
+            self.context.backend().bind_vertex_attribute(
+                self.id,
+                loc,
+                buffer.id(),
+                backend::VertexFormat::of::<T>(),
+                0,
+            );
         }
     }
 
@@ -386,40 +283,14 @@ impl Program {
         buffer: &InstanceBuffer<T>,
     ) {
         if buffer.count() > 0 {
-            buffer.bind();
             let loc = self.location(name);
-            unsafe {
-                self.context.bind_vertex_array(Some(self.context.vao));
-                self.context.enable_vertex_attrib_array(loc);
-                if !T::normalized()
-                    && (T::data_type() == crate::context::UNSIGNED_BYTE
-                        || T::data_type() == crate::context::BYTE
-                        || T::data_type() == crate::context::UNSIGNED_SHORT
-                        || T::data_type() == crate::context::SHORT
-                        || T::data_type() == crate::context::UNSIGNED_INT
-                        || T::data_type() == crate::context::INT)
-                {
-                    self.context.vertex_attrib_pointer_i32(
-                        loc,
-                        T::size() as i32,
-                        T::data_type(),
-                        0,
-                        0,
-                    );
-                } else {
-                    self.context.vertex_attrib_pointer_f32(
-                        loc,
-                        T::size() as i32,
-                        T::data_type(),
-                        T::normalized(),
-                        0,
-                        0,
-                    );
-                }
-                self.context.vertex_attrib_divisor(loc, 1);
-                self.context.bind_buffer(crate::context::ARRAY_BUFFER, None);
-            }
-            self.unuse_program();
+            self.context.backend().bind_vertex_attribute(
+                self.id,
+                loc,
+                buffer.id(),
+                backend::VertexFormat::of::<T>(),
+                1,
+            );
         }
     }
 
@@ -431,10 +302,7 @@ impl Program {
     /// If you want to use an [ElementBuffer], see [Program::draw_elements].
     ///
     pub fn draw_arrays(&self, render_states: RenderStates, viewport: Viewport, count: u32) {
-        self.draw_with(render_states, viewport, move || unsafe {
-            self.context
-                .draw_arrays(crate::context::TRIANGLES, 0, count as i32);
-        })
+        self.draw(render_states, viewport, None, count, None)
     }
 
     ///
@@ -448,16 +316,7 @@ impl Program {
         count: u32,
         instance_count: u32,
     ) {
-        self.draw_with(render_states, viewport, move || unsafe {
-            self.context.draw_arrays_instanced(
-                crate::context::TRIANGLES,
-                0,
-                count as i32,
-                instance_count as i32,
-            );
-            self.context
-                .bind_buffer(crate::context::ELEMENT_ARRAY_BUFFER, None);
-        })
+        self.draw(render_states, viewport, None, count, Some(instance_count))
     }
 
     ///
@@ -494,14 +353,13 @@ impl Program {
         first: u32,
         count: u32,
     ) {
-        self.draw_elements_with(render_states, viewport, element_buffer, move || unsafe {
-            self.context.draw_elements(
-                crate::context::TRIANGLES,
-                count as i32,
-                T::data_type(),
-                first as i32,
-            );
-        })
+        self.draw(
+            render_states,
+            viewport,
+            Some(Self::index_buffer(element_buffer, first)),
+            count,
+            None,
+        )
     }
 
     ///
@@ -538,46 +396,37 @@ impl Program {
         count: u32,
         instance_count: u32,
     ) {
-        self.draw_elements_with(render_states, viewport, element_buffer, move || unsafe {
-            self.context.draw_elements_instanced(
-                crate::context::TRIANGLES,
-                count as i32,
-                T::data_type(),
-                first as i32,
-                instance_count as i32,
-            );
-        })
+        self.draw(
+            render_states,
+            viewport,
+            Some(Self::index_buffer(element_buffer, first)),
+            count,
+            Some(instance_count),
+        )
     }
 
     ///
     /// Calls drawing callback `draw` after setting up rendering to use this shader program, cleaning up before return.
     /// Requires that all attributes and uniforms have been defined using the [use_attribute] and [use_uniform] methods.
     ///
+    /// **Note:** Only available with the OpenGL/WebGL backend, since the callback is expected to make low-level GL calls.
+    ///
     pub fn draw_with(&self, render_states: RenderStates, viewport: Viewport, draw: impl FnOnce()) {
-        self.context.set_viewport(viewport);
-        self.context.set_render_states(render_states);
-        self.use_program();
-
-        draw();
-
-        unsafe {
-            for location in self.attributes.values() {
-                self.context.disable_vertex_attrib_array(*location);
-            }
-            self.context.bind_vertex_array(None);
-        }
-
-        self.unuse_program();
-
-        #[cfg(debug_assertions)]
-        self.context
-            .error_check()
-            .expect("Unexpected rendering error occured")
+        let mut draw = Some(draw);
+        self.context.gl_backend().draw_with(
+            self.id,
+            &self.attribute_locations,
+            render_states,
+            viewport,
+            &mut || (draw.take().unwrap())(),
+        );
     }
 
     ///
     /// Calls drawing callback `draw` after setting up rendering to use this shader program and element buffer `elements`, cleaning up before return.
     /// Requires that all attributes and uniforms have been defined using the [use_attribute] and [use_uniform] methods.
+    ///
+    /// **Note:** Only available with the OpenGL/WebGL backend, since the callback is expected to make low-level GL calls.
     ///
     pub fn draw_elements_with<T: ElementBufferDataType>(
         &self,
@@ -587,13 +436,29 @@ impl Program {
         draw: impl FnOnce(),
     ) {
         self.draw_with(render_states, viewport, move || {
-            element_buffer.bind();
+            unsafe {
+                self.context.bind_buffer(
+                    crate::context::ELEMENT_ARRAY_BUFFER,
+                    Some(element_buffer.id().gl()),
+                );
+            }
             draw();
             unsafe {
                 self.context
                     .bind_buffer(crate::context::ELEMENT_ARRAY_BUFFER, None);
             }
         })
+    }
+
+    fn index_buffer<T: ElementBufferDataType>(
+        element_buffer: &ElementBuffer<T>,
+        first: u32,
+    ) -> backend::IndexBuffer {
+        backend::IndexBuffer {
+            buffer: element_buffer.id(),
+            index_type: T::primitive_type(),
+            first,
+        }
     }
 
     ///
@@ -611,7 +476,6 @@ impl Program {
     }
 
     fn location(&self, name: &str) -> u32 {
-        self.use_program();
         *self.attributes.get(name).unwrap_or_else(|| {
             panic!(
                 "the attribute {} is sent to the shader but not defined or never used",
@@ -620,31 +484,28 @@ impl Program {
         })
     }
 
-    fn use_program(&self) {
-        unsafe {
-            self.context.use_program(Some(self.id));
-        }
-    }
-
-    fn unuse_program(&self) {
-        unsafe {
-            self.context.use_program(None);
-        }
+    fn draw(
+        &self,
+        render_states: RenderStates,
+        viewport: Viewport,
+        indices: Option<backend::IndexBuffer>,
+        count: u32,
+        instances: Option<u32>,
+    ) {
+        self.context.backend().draw(&backend::DrawCall {
+            program: self.id,
+            attribute_locations: &self.attribute_locations,
+            render_states,
+            viewport,
+            indices,
+            count,
+            instances,
+        });
     }
 }
 
 impl Drop for Program {
     fn drop(&mut self) {
-        unsafe {
-            self.context.delete_program(self.id);
-        }
+        self.context.backend().delete_program(self.id);
     }
-}
-fn shader_compilation_error(typ: &str, log: String, source: String) -> CoreError {
-    let lines: Vec<String> = source
-        .lines()
-        .enumerate()
-        .map(|(index, l)| format!("{:0>3}: {}", index + 1, l))
-        .collect();
-    CoreError::ShaderCompilation(typ.to_string(), lines.join("\n"), log)
 }

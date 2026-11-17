@@ -60,7 +60,7 @@ impl<T: BufferDataType> VertexBuffer<T> {
         self.buffer.attribute_count()
     }
 
-    pub(in crate::core) fn bind(&self) {
-        self.buffer.bind();
+    pub(in crate::core) fn id(&self) -> backend::BufferId {
+        self.buffer.id()
     }
 }

@@ -151,24 +151,23 @@ impl<'a> DepthTarget<'a> {
         }
     }
 
-    pub(super) fn bind(&self) {
+    pub(super) fn attachment(&self) -> backend::DepthAttachment {
         if let Some(target) = &self.target {
             match target {
-                DepthTexture::Single(texture) => {
-                    texture.bind_as_depth_target();
-                }
+                DepthTexture::Single(texture) => backend::DepthAttachment::Texture2D(texture.id()),
                 DepthTexture::Array { texture, layer } => {
-                    texture.bind_as_depth_target(*layer);
+                    backend::DepthAttachment::Texture2DArray {
+                        texture: texture.id(),
+                        layer: *layer,
+                    }
                 }
-                DepthTexture::CubeMap { texture, side } => {
-                    texture.bind_as_depth_target(*side);
-                }
+                DepthTexture::CubeMap { texture, side } => backend::DepthAttachment::CubeMap {
+                    texture: texture.id(),
+                    side: *side,
+                },
             }
         } else {
-            self.multisample_target
-                .as_ref()
-                .unwrap()
-                .bind_as_depth_target()
+            backend::DepthAttachment::Multisample(self.multisample_target.as_ref().unwrap().id())
         }
     }
 }

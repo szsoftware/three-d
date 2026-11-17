@@ -4,6 +4,8 @@
 //!
 #![allow(unsafe_code)]
 
+pub(crate) mod backend;
+
 mod context;
 #[doc(inline)]
 pub use context::*;
@@ -71,7 +73,7 @@ pub(crate) fn full_screen_draw(
     render_states: RenderStates,
     viewport: Viewport,
 ) {
-    unsafe { context.bind_vertex_array(Some(context.vao)) };
+    context.backend().prepare_attributeless_draw();
     program.draw_arrays(render_states, viewport, 3);
 }
 
@@ -106,16 +108,6 @@ fn from_byte_slice<T: DataType>(data: &[u8]) -> &[T] {
     unsafe {
         let (_prefix, values, _suffix) = data.align_to::<T>();
         values
-    }
-}
-
-fn format_from_data_type<T: DataType>() -> u32 {
-    match T::size() {
-        1 => crate::context::RED,
-        2 => crate::context::RG,
-        3 => crate::context::RGB,
-        4 => crate::context::RGBA,
-        _ => unreachable!(),
     }
 }
 
