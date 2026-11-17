@@ -45,8 +45,48 @@ impl Context {
     pub fn as_gl(&self) -> Option<&Arc<crate::context::Context>> {
         match &*self.backend {
             backend::Backend::Gl(gl) => Some(&gl.context),
-            #[cfg(test)]
-            backend::Backend::Null(_) => None,
+            #[cfg(any(test, feature = "wgpu"))]
+            _ => None,
+        }
+    }
+
+    ///
+    /// Creates a new context which uses the wgpu backend with the given device and queue, for example if another part of the application also uses wgpu.
+    ///
+    /// **Note:** The wgpu backend is work in progress and supports only a part of the functionality of the [core](crate::core) module yet.
+    /// Functionality that is not supported yet panics with a message. The OpenGL/WebGL backend is not affected.
+    ///
+    #[cfg(feature = "wgpu")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "wgpu")))]
+    pub fn from_wgpu(device: wgpu::Device, queue: wgpu::Queue) -> Self {
+        Self::from_backend(backend::Backend::Wgpu(Box::new(
+            backend::wgpu::WgpuBackend::new(device, queue),
+        )))
+    }
+
+    ///
+    /// Creates a new context which uses the wgpu backend without a window, for example for tests or for rendering on a server.
+    /// Render into textures by using [Texture2D::as_color_target] and read the result with [RenderTarget::read_color].
+    ///
+    /// **Note:** The wgpu backend is work in progress, see [Context::from_wgpu].
+    ///
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "wgpu")))]
+    pub fn new_headless_wgpu() -> Result<Self, CoreError> {
+        Ok(Self::from_backend(backend::Backend::Wgpu(Box::new(
+            backend::wgpu::WgpuBackend::new_headless()?,
+        ))))
+    }
+
+    ///
+    /// Returns the wgpu device and queue if this context uses the wgpu backend, otherwise `None`.
+    ///
+    #[cfg(feature = "wgpu")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "wgpu")))]
+    pub fn as_wgpu(&self) -> Option<(&wgpu::Device, &wgpu::Queue)> {
+        match &*self.backend {
+            backend::Backend::Wgpu(wgpu) => Some((&wgpu.device, &wgpu.queue)),
+            _ => None,
         }
     }
 
@@ -59,8 +99,8 @@ impl Context {
     pub(crate) fn gl_backend(&self) -> &backend::gl::GlBackend {
         match &*self.backend {
             backend::Backend::Gl(gl) => gl,
-            #[cfg(test)]
-            backend::Backend::Null(_) => panic!("{}", NOT_GL),
+            #[cfg(any(test, feature = "wgpu"))]
+            _ => panic!("{}", NOT_GL),
         }
     }
 

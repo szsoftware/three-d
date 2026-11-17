@@ -78,7 +78,6 @@ mod circle;
 #[doc(inline)]
 pub use circle::*;
 
-use crate::core::*;
 use crate::renderer::*;
 
 pub use three_d_asset::{

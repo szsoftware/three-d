@@ -71,12 +71,19 @@ pub(crate) struct NullBackend {
     next_id: AtomicU32,
     calls: Mutex<Vec<Call>>,
     uniform_blocks: Mutex<HashMap<(ProgramId, String), u32>>,
+    program_sources: Mutex<Vec<(String, String)>>,
 }
 
 impl NullBackend {
     /// Returns and forgets all calls recorded so far.
     pub fn take_calls(&self) -> Vec<Call> {
         std::mem::take(&mut *self.calls.lock().unwrap())
+    }
+
+    /// Returns and forgets the vertex and fragment shader source of all programs created so far.
+    #[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
+    pub fn take_program_sources(&self) -> Vec<(String, String)> {
+        std::mem::take(&mut *self.program_sources.lock().unwrap())
     }
 
     fn record(&self, call: Call) {
@@ -246,6 +253,10 @@ impl BackendApi for NullBackend {
                 .uniforms
                 .insert(name.clone(), UniformLocation::Null(name));
         }
+        self.program_sources.lock().unwrap().push((
+            vertex_shader_source.to_string(),
+            fragment_shader_source.to_string(),
+        ));
         self.record(Call::CreateProgram(id));
         Ok((id, reflection))
     }

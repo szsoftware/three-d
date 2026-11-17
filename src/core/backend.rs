@@ -7,7 +7,8 @@
 //! The interface follows the stricter WebGPU object model (buffers, textures, programs, passes and draw calls)
 //! so that other backends can be added later without changing the public API.
 //!
-//! Currently there is one real backend, [gl], which contains the OpenGL/WebGL code that used to live directly in the public types.
+//! The default backend is [gl], which contains the OpenGL/WebGL code that used to live directly in the public types.
+//! With the `wgpu` feature there is a second backend, `wgpu`, which is work in progress.
 //! In tests there is an additional recording backend without a GPU, see `null`.
 //!
 
@@ -17,12 +18,16 @@ use std::collections::HashMap;
 pub(crate) mod gl;
 #[cfg(test)]
 pub(crate) mod null;
+#[cfg(feature = "wgpu")]
+pub(crate) mod wgpu;
 
 ///
 /// The backend of a [Context]. Dispatch to the actual backend happens in [Backend::api].
 ///
 pub(crate) enum Backend {
     Gl(gl::GlBackend),
+    #[cfg(feature = "wgpu")]
+    Wgpu(Box<wgpu::WgpuBackend>),
     #[cfg(test)]
     Null(null::NullBackend),
 }
@@ -31,6 +36,8 @@ impl Backend {
     pub fn api(&self) -> &dyn BackendApi {
         match self {
             Self::Gl(backend) => backend,
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(backend) => &**backend,
             #[cfg(test)]
             Self::Null(backend) => backend,
         }
@@ -44,6 +51,9 @@ macro_rules! backend_handle {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
         pub(crate) enum $name {
             Gl($gl),
+            #[cfg(feature = "wgpu")]
+            #[allow(dead_code)]
+            Wgpu(u32),
             #[cfg(test)]
             Null(u32),
         }
@@ -53,8 +63,16 @@ macro_rules! backend_handle {
             pub fn gl(self) -> $gl {
                 match self {
                     Self::Gl(id) => id,
-                    #[cfg(test)]
-                    Self::Null(_) => wrong_backend(),
+                    #[cfg(any(test, feature = "wgpu"))]
+                    _ => wrong_backend(),
+                }
+            }
+
+            #[cfg(feature = "wgpu")]
+            pub fn wgpu(self) -> u32 {
+                match self {
+                    Self::Wgpu(id) => id,
+                    _ => wrong_backend(),
                 }
             }
         }
@@ -73,6 +91,9 @@ backend_handle!(ProgramId, crate::context::Program);
 #[derive(Clone, Debug)]
 pub(crate) enum UniformLocation {
     Gl(crate::context::UniformLocation),
+    /// Index into the uniforms of the program.
+    #[cfg(feature = "wgpu")]
+    Wgpu(u32),
     #[cfg(test)]
     Null(String),
 }
@@ -82,13 +103,21 @@ impl UniformLocation {
     pub fn gl(&self) -> &crate::context::UniformLocation {
         match self {
             Self::Gl(location) => location,
-            #[cfg(test)]
-            Self::Null(_) => wrong_backend(),
+            #[cfg(any(test, feature = "wgpu"))]
+            _ => wrong_backend(),
+        }
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub fn wgpu(&self) -> u32 {
+        match self {
+            Self::Wgpu(index) => *index,
+            _ => wrong_backend(),
         }
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "wgpu"))]
 fn wrong_backend() -> ! {
     panic!("a handle from one backend was used with another backend")
 }

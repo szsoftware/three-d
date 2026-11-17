@@ -1,4 +1,3 @@
-use crate::core::*;
 use crate::renderer::*;
 
 /// Renders a triangle mesh as a screen-space wireframe.

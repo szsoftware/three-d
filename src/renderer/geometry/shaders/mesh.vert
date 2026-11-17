@@ -68,7 +68,7 @@ void main()
 
 #ifdef PARTICLES
     mat4 animationTransform = mat4(1.0);
-    animationTransform[3].xyz = start_position + start_velocity * time + 0.5 * acceleration * time * time;
+    animationTransform[3] = vec4(start_position + start_velocity * time + 0.5 * acceleration * time * time, 1.0);
     local2World = local2World * animationTransform;
 #endif
 

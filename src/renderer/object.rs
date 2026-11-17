@@ -58,7 +58,6 @@ mod wireframe;
 #[doc(inline)]
 pub use wireframe::*;
 
-use crate::core::*;
 use crate::renderer::*;
 
 ///
