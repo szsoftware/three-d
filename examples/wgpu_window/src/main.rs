@@ -8,6 +8,8 @@ pub fn settings() -> WindowSettings {
     }
 }
 
+// Not used on the web, see `lib.rs`
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub fn main() {
     // Create a window which renders with wgpu (Vulkan, Metal or DirectX 12) if the system supports it and with OpenGL otherwise.
     // In a browser, `Window::new_async` is needed to get WebGPU, see `lib.rs`.
