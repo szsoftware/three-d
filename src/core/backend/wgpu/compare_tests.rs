@@ -1343,3 +1343,119 @@ fn renderer_with_shadows() {
         floats(pixels)
     });
 }
+
+/// The geometry pass of the deferred pipeline packs two integers into one color channel.
+#[test]
+fn bits_packed_into_a_color_channel() {
+    compare(0.1 / 255.0, |context| {
+        let program = screen_program(
+            context,
+            "
+            in vec2 uvs;
+            layout (location = 0) out vec4 outColor;
+            void main() {
+                int o = int(uvs.x * 127.0);
+                int nz = 1;
+                if (uvs.y < 0.5) {
+                    nz = 0;
+                }
+                outColor = vec4(float(o | nz << 7) / 255.0, float(o) / 255.0, float(nz), 1.0);
+            }
+        ",
+        );
+        draw_screen(context, 16, &program, || {})
+    });
+}
+
+/// The lighting pass of the deferred pipeline takes the two integers apart again, for every value a color channel can have.
+#[test]
+fn bits_unpacked_from_a_color_channel() {
+    compare(0.1 / 255.0, |context| {
+        let texture = Texture2D::new(
+            context,
+            &CpuTexture {
+                data: TextureData::RgbaU8((0..=255).map(|i| [i, i, i, 255]).collect()),
+                width: 16,
+                height: 16,
+                min_filter: Interpolation::Nearest,
+                mag_filter: Interpolation::Nearest,
+                mipmap: None,
+                wrap_s: Wrapping::ClampToEdge,
+                wrap_t: Wrapping::ClampToEdge,
+                ..Default::default()
+            },
+        );
+        let program = screen_program(
+            context,
+            "
+            uniform sampler2D tex;
+            in vec2 uvs;
+            layout (location = 0) out vec4 outColor;
+            void main() {
+                float value = texture(tex, uvs).r;
+                int bits = int(floor(value * 255.0));
+                outColor = vec4((bits & 128) == 128 ? 1.0 : 0.0, float(bits & 127) / 127.0, value, 1.0);
+            }
+        ",
+        );
+        draw_screen(context, 16, &program, || {
+            program.use_texture("tex", &texture)
+        })
+    });
+}
+
+/// The lighting pass of the deferred pipeline copies the depth of the geometry pass and leaves out the background.
+#[test]
+fn depth_is_written_by_the_fragment_shader() {
+    compare(1.0e-4, |context| {
+        let program = Program::from_source(context, POSITION_VERTEX, COLOR_FRAGMENT).unwrap();
+        let positions = quad(context, 0.5);
+        let source = depth_texture::<f32>(context, 8, 8);
+        source
+            .as_depth_target()
+            .clear(ClearState::depth(1.0))
+            .write::<CoreError>(|| {
+                program.use_uniform("color", vec4(1.0, 0.0, 0.0, 1.0));
+                program.use_uniform("placement", vec4(0.25, -0.25, 0.5, 0.5));
+                program.use_vertex_attribute("position", &positions);
+                program.draw_arrays(RenderStates::default(), Viewport::new_at_origo(8, 8), 6);
+                Ok(())
+            })
+            .unwrap();
+        let copy = screen_program(
+            context,
+            "
+            uniform sampler2D depthMap;
+            in vec2 uvs;
+            layout (location = 0) out vec4 outColor;
+            void main() {
+                float depth = texture(depthMap, uvs).r;
+                if (depth > 0.99999) {
+                    discard;
+                }
+                gl_FragDepth = depth;
+                outColor = vec4(depth, uvs, 1.0);
+            }
+        ",
+        );
+        let color = color_texture(context, 8, 8);
+        let depth = depth_texture::<f32>(context, 8, 8);
+        let target = RenderTarget::new(color.as_color_target(None), depth.as_depth_target());
+        target
+            .clear(ClearState::color_and_depth(0.2, 0.2, 0.2, 1.0, 0.9))
+            .write::<CoreError>(|| {
+                copy.use_depth_texture("depthMap", &source);
+                full_screen_draw(
+                    context,
+                    &copy,
+                    RenderStates::default(),
+                    Viewport::new_at_origo(8, 8),
+                );
+                Ok(())
+            })
+            .unwrap();
+        let mut values = floats(target.read_color());
+        values.extend(target.read_depth());
+        values
+    });
+}
