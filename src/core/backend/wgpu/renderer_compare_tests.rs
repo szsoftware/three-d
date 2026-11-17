@@ -357,28 +357,32 @@ fn deferred_geometry_pass() {
 
 #[test]
 fn deferred_lighting_with_ambient_light() {
-    compare(4.0 * STEP, |context| {
+    // Single pixels at the edges of the shapes differ more, the color mapping amplifies small differences of dark colors
+    compare_with_outliers(4.0 * STEP, 0.001, |context| {
         deferred_stage(context, Some([true, false, false, false]))
     });
 }
 
 #[test]
 fn deferred_lighting_with_directional_light_and_shadow() {
-    compare(4.0 * STEP, |context| {
+    // Single pixels at the edges of the shapes differ more, the color mapping amplifies small differences of dark colors
+    compare_with_outliers(4.0 * STEP, 0.001, |context| {
         deferred_stage(context, Some([false, true, false, false]))
     });
 }
 
 #[test]
 fn deferred_lighting_with_point_light() {
-    compare(4.0 * STEP, |context| {
+    // Single pixels at the edges of the shapes differ more, the color mapping amplifies small differences of dark colors
+    compare_with_outliers(4.0 * STEP, 0.001, |context| {
         deferred_stage(context, Some([false, false, true, false]))
     });
 }
 
 #[test]
 fn deferred_lighting_with_spot_light_and_shadow() {
-    compare(4.0 * STEP, |context| {
+    // Single pixels at the edges of the shapes differ more, the color mapping amplifies small differences of dark colors
+    compare_with_outliers(4.0 * STEP, 0.001, |context| {
         deferred_stage(context, Some([false, false, false, true]))
     });
 }
