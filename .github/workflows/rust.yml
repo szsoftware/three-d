@@ -54,9 +54,9 @@ jobs:
         with:
           command: clippy
 
-      # Software Vulkan driver, so that the tests of the wgpu backend run without a GPU
+      # Software drivers for Vulkan and OpenGL (through EGL), so that the tests of the wgpu backend run without a GPU and compare it with the OpenGL backend
       - if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get install -y mesa-vulkan-drivers && echo "THREE_D_REQUIRE_WGPU=1" >> $GITHUB_ENV
+        run: sudo apt-get install -y mesa-vulkan-drivers libegl1 libegl-mesa0 libgl1-mesa-dri && echo "THREE_D_REQUIRE_WGPU=1" >> $GITHUB_ENV
 
       - name: Test
         uses: actions-rs/cargo@v1

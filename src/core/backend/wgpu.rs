@@ -1,25 +1,37 @@
 //!
 //! The wgpu backend (work in progress, only available with the `wgpu` feature).
 //!
-//! This is the first stage of the backend: a context without a window, buffers, 2D textures as render targets,
-//! programs translated from GLSL (see [glsl]), draw calls and reading back colors. It is deliberately simple:
-//! every clear and every draw call is its own render pass which is submitted immediately, so the calls take effect
-//! in the order they are made, like on OpenGL. Batching passes, caching bind groups, multisampling, mipmaps,
-//! the screen and the remaining formats follow in the next stages and panic with a message until then.
+//! It covers everything the [core](crate::core) module needs except the screen: buffers, all kinds of textures including mipmaps,
+//! multisample targets, programs translated from GLSL (see [glsl]), draw calls, copies between targets and reading back colors and depth.
 //!
 //! Conventions: The backend keeps the conventions of OpenGL instead of changing them.
 //! The vertex shader epilogue added by the translation flips the y axis and converts the depth range,
 //! so the first row of a texture in memory is the bottom row and all coordinates (viewport, scissor box, `gl_FragCoord`, UVs)
 //! mean the same as on OpenGL. Because of the flip, the front face is clockwise for wgpu.
 //!
+//! Order of execution: The calls take effect in the order they are made, like on OpenGL, but they are not sent to the GPU one by one.
+//! Draw calls and clears on the same target are recorded into one render pass, and all passes are recorded into one command encoder.
+//! The encoder is submitted when the outermost pass ends, when pixels are read and before data is written into a buffer or texture
+//! that recorded commands may use (see [WgpuBackend::flush]).
+//! The uniforms of all recorded draw calls live in one ring buffer which is uploaded right before the encoder is submitted.
+//!
 
 use super::*;
 use ::wgpu as w;
-use std::sync::Mutex;
+use std::num::NonZeroU64;
+use std::sync::{Arc, Mutex};
 
+mod builtin;
+#[cfg(all(test, target_os = "linux"))]
+mod compare_tests;
 pub(crate) mod glsl;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod shader_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests;
+
+/// The size of the ring buffer for uniforms, it grows if a single program needs more.
+const RING_CAPACITY: usize = 1 << 20;
 
 ///
 /// The wgpu backend, see the module documentation.
@@ -28,6 +40,11 @@ pub(crate) struct WgpuBackend {
     pub device: w::Device,
     pub queue: w::Queue,
     state: Mutex<State>,
+    /// The validation errors since the last error check, only collected if the backend created the device itself.
+    errors: Option<Arc<Mutex<Vec<String>>>>,
+    /// Offsets into the ring buffer must be a multiple of this.
+    uniform_alignment: usize,
+    float32_filterable: bool,
 }
 
 // The backend only holds handles and plain data behind a mutex, a panic cannot leave it in a state that is unsafe to observe.
@@ -35,28 +52,91 @@ pub(crate) struct WgpuBackend {
 impl std::panic::UnwindSafe for WgpuBackend {}
 impl std::panic::RefUnwindSafe for WgpuBackend {}
 
-#[derive(Default)]
 struct State {
     next_id: u32,
-    buffers: HashMap<u32, Option<w::Buffer>>,
-    /// The content of the element buffers, kept because 8 bit indices do not exist in wgpu and are widened when they are drawn.
-    element_bytes: HashMap<u32, Vec<u8>>,
+    buffers: HashMap<u32, BufferEntry>,
     textures: HashMap<u32, TextureEntry>,
+    /// Multisample textures.
+    renderbuffers: HashMap<u32, w::Texture>,
     programs: HashMap<u32, ProgramEntry>,
     /// The texture bound to each texture unit, as on OpenGL.
     units: HashMap<u32, u32>,
     /// The targets and scissor boxes of the passes that are open, innermost last.
     passes: Vec<(PassTarget, ScissorBox)>,
-    pipelines: HashMap<String, w::RenderPipeline>,
+    pipelines: HashMap<PipelineKey, w::RenderPipeline>,
+    /// The bind groups with the textures of a program, by program and textures.
+    texture_groups: HashMap<(u32, Vec<u32>), w::BindGroup>,
+    builtin: builtin::Builtin,
+    ring: Ring,
+    /// Increased with every submit, the uniforms uploaded before are gone after it.
+    epoch: u64,
+    frame: Frame,
+    /// The number of render passes for draw calls and clears and the number of submits so far.
+    #[cfg(test)]
+    statistics: (u32, u32),
+}
+
+/// The commands that are recorded but not submitted yet. The pass must be dropped before the encoder is finished.
+#[derive(Default)]
+struct Frame {
+    pass: Option<OpenPass>,
+    encoder: Option<w::CommandEncoder>,
+}
+
+struct OpenPass {
+    pass: w::RenderPass<'static>,
+    target: PassTarget,
+    formats: TargetFormats,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct TargetFormats {
+    colors: Vec<w::TextureFormat>,
+    depth: Option<w::TextureFormat>,
+    samples: u32,
+}
+
+/// One mip level of one layer of a texture.
+struct Slice {
+    texture: w::Texture,
+    mip_level: u32,
+    layer: u32,
+}
+
+impl Slice {
+    fn view(&self) -> w::TextureView {
+        attachment_view(&self.texture, self.mip_level, self.layer)
+    }
+}
+
+/// The uniforms of the recorded draw calls, uploaded in one go before the commands are submitted.
+struct Ring {
+    buffer: w::Buffer,
+    capacity: usize,
+    staging: Vec<u8>,
+    /// Increased when the buffer is replaced by a larger one.
+    generation: u64,
+}
+
+struct BufferEntry {
+    buffer: Option<w::Buffer>,
+    usage: w::BufferUsages,
+    /// The content as it was written, kept for element buffers and for vertex buffers that are stored in another layout.
+    bytes: Option<Vec<u8>>,
+    /// 8 bit indices do not exist in wgpu, this is the same content with 16 bit indices, created when it is drawn.
+    wide_indices: Option<w::Buffer>,
+    /// The format of the data, if it is stored with more components per vertex than the data has.
+    widened: Option<VertexFormat>,
 }
 
 struct TextureEntry {
     texture: w::Texture,
     format: TextureFormat,
-    kind: TextureKind,
     sampler: w::Sampler,
     /// Used when the format cannot be filtered.
     nearest_sampler: w::Sampler,
+    /// The views used for sampling the texture.
+    views: HashMap<w::TextureViewDimension, w::TextureView>,
 }
 
 /// Where a uniform lives inside one of the two uniform blocks of a program.
@@ -82,13 +162,44 @@ struct ProgramEntry {
     fragment: w::ShaderModule,
     /// The content of the uniform blocks of the vertex and fragment shader, empty if the stage has no uniforms.
     blocks: [Vec<u8>; 2],
+    /// Where the blocks were uploaded to the ring buffer and in which epoch, `None` if they changed since.
+    uploaded: Option<(u64, [u32; 2])>,
     uniforms: Vec<UniformSlot>,
     samplers: Vec<(glsl::SamplerDecl, u32)>,
     /// The buffer bound to each vertex attribute location.
     attributes: HashMap<u32, (u32, VertexFormat, u32)>,
     attribute_locations: Vec<u32>,
     uniform_layout: w::BindGroupLayout,
+    /// The bind group for the uniform blocks in the ring buffer of the given generation.
+    uniform_group: Option<(u64, w::BindGroup)>,
+    /// The layouts of the textures, by the sample type of each texture.
+    texture_layouts: HashMap<Vec<SampleKind>, w::BindGroupLayout>,
+    /// The uniform blocks declared in the shaders and the buffers bound to them.
+    user_blocks: Vec<(String, Option<u32>)>,
+    user_block_layout: w::BindGroupLayout,
     number_of_outputs: usize,
+}
+
+/// How a texture is sampled, which depends on its format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SampleKind {
+    Filterable,
+    /// Float textures that cannot be filtered on the device and depth textures, which are sampled as float textures.
+    Unfilterable,
+}
+
+/// Everything a render pipeline depends on.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PipelineKey {
+    program: u32,
+    cull: u8,
+    depth_test: u8,
+    write_mask: u8,
+    blend: Option<[u8; 6]>,
+    formats: TargetFormats,
+    /// Location, format and whether the attribute is per instance.
+    attributes: Vec<(u32, w::VertexFormat, bool)>,
+    textures: Vec<SampleKind>,
 }
 
 fn unsupported(what: &str) -> ! {
@@ -97,10 +208,30 @@ fn unsupported(what: &str) -> ! {
 
 impl WgpuBackend {
     pub fn new(device: w::Device, queue: w::Queue) -> Self {
+        let ring = Ring::new(&device, RING_CAPACITY, 0);
         Self {
+            uniform_alignment: device.limits().min_uniform_buffer_offset_alignment as usize,
+            float32_filterable: device.features().contains(w::Features::FLOAT32_FILTERABLE),
+            state: Mutex::new(State {
+                next_id: 0,
+                buffers: HashMap::new(),
+                textures: HashMap::new(),
+                renderbuffers: HashMap::new(),
+                programs: HashMap::new(),
+                units: HashMap::new(),
+                passes: Vec::new(),
+                pipelines: HashMap::new(),
+                texture_groups: HashMap::new(),
+                builtin: Default::default(),
+                ring,
+                epoch: 0,
+                frame: Default::default(),
+                #[cfg(test)]
+                statistics: (0, 0),
+            }),
+            errors: None,
             device,
             queue,
-            state: Mutex::new(State::default()),
         }
     }
 
@@ -123,7 +254,17 @@ impl WgpuBackend {
             ..Default::default()
         }))
         .map_err(|e| CoreError::ContextCreation(e.to_string()))?;
-        Ok(Self::new(device, queue))
+        // The device belongs to this backend, so errors can be collected for Context::error_check instead of the default, which is to panic
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let sink = errors.clone();
+        device.on_uncaptured_error(Arc::new(move |error: w::Error| {
+            sink.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(error.to_string());
+        }));
+        let mut backend = Self::new(device, queue);
+        backend.errors = Some(errors);
+        Ok(backend)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -136,22 +277,80 @@ impl WgpuBackend {
         state.next_id
     }
 
-    fn color_views(
-        &self,
-        state: &State,
-        target: &PassTarget,
-    ) -> Vec<(w::TextureView, w::TextureFormat)> {
-        let view = |texture: TextureId, mip_level: u32, layer: u32| {
-            let entry = &state.textures[&texture.wgpu()];
-            (
-                attachment_view(&entry.texture, mip_level, layer),
-                entry.texture.format(),
-            )
+    ///
+    /// The encoder all commands are recorded into, after ending the open render pass.
+    ///
+    fn encoder<'a>(&self, state: &'a mut State) -> &'a mut w::CommandEncoder {
+        state.frame.pass = None;
+        state
+            .frame
+            .encoder
+            .get_or_insert_with(|| self.device.create_command_encoder(&Default::default()))
+    }
+
+    ///
+    /// Submits everything that is recorded. Must be called before data is written through the queue into a resource that recorded commands may use,
+    /// because such writes take effect before the commands of an encoder that is submitted later.
+    ///
+    fn flush(&self, state: &mut State) {
+        state.frame.pass = None;
+        if let Some(encoder) = state.frame.encoder.take() {
+            if !state.ring.staging.is_empty() {
+                let size = state.ring.staging.len().next_multiple_of(4);
+                state.ring.staging.resize(size, 0);
+                self.queue
+                    .write_buffer(&state.ring.buffer, 0, &state.ring.staging);
+                state.ring.staging.clear();
+            }
+            state.epoch += 1;
+            self.queue.submit([encoder.finish()]);
+            #[cfg(test)]
+            {
+                state.statistics.1 += 1;
+            }
+            // Lets wgpu free what the submitted commands no longer need
+            #[cfg(not(target_arch = "wasm32"))]
+            let _ = self.device.poll(w::PollType::Poll);
+        }
+    }
+
+    ///
+    /// Reserves space for the given uniform block in the ring buffer and returns the offset.
+    /// Submits the recorded commands if the ring buffer is full, so this must be called before the pass of a draw call is looked up.
+    ///
+    fn upload_uniforms(&self, state: &mut State, bytes: &[u8]) -> u32 {
+        let mut offset = state
+            .ring
+            .staging
+            .len()
+            .next_multiple_of(self.uniform_alignment);
+        if offset + bytes.len() > state.ring.capacity {
+            self.flush(state);
+            offset = 0;
+            if bytes.len() > state.ring.capacity {
+                state.ring = Ring::new(
+                    &self.device,
+                    bytes.len().next_power_of_two(),
+                    state.ring.generation + 1,
+                );
+            }
+        }
+        state.ring.staging.resize(offset, 0);
+        state.ring.staging.extend_from_slice(bytes);
+        offset as u32
+    }
+
+    /// The color attachments of a target.
+    fn color_slices(&self, state: &State, target: &PassTarget) -> Vec<Slice> {
+        let slice = |texture: &TextureId, mip_level: u32, layer: u32| Slice {
+            texture: state.textures[&texture.wgpu()].texture.clone(),
+            mip_level,
+            layer,
         };
         match &target.color {
             None => Vec::new(),
             Some(ColorAttachment::Texture2D { texture, mip_level }) => {
-                vec![view(*texture, *mip_level, 0)]
+                vec![slice(texture, *mip_level, 0)]
             }
             Some(ColorAttachment::Texture2DArray {
                 texture,
@@ -159,7 +358,7 @@ impl WgpuBackend {
                 mip_level,
             }) => layers
                 .iter()
-                .map(|layer| view(*texture, *mip_level, *layer))
+                .map(|layer| slice(texture, *mip_level, *layer))
                 .collect(),
             Some(ColorAttachment::CubeMap {
                 texture,
@@ -167,118 +366,137 @@ impl WgpuBackend {
                 mip_level,
             }) => sides
                 .iter()
-                .map(|side| view(*texture, *mip_level, cube_layer(*side)))
+                .map(|side| slice(texture, *mip_level, cube_layer(*side)))
                 .collect(),
-            Some(ColorAttachment::Multisample(_)) => unsupported("a multisample render target"),
+            Some(ColorAttachment::Multisample(renderbuffer)) => vec![Slice {
+                texture: state.renderbuffers[&renderbuffer.wgpu()].clone(),
+                mip_level: 0,
+                layer: 0,
+            }],
         }
     }
 
-    fn depth_view(
-        &self,
-        state: &State,
-        target: &PassTarget,
-    ) -> Option<(w::TextureView, w::TextureFormat)> {
-        let view = |texture: TextureId, layer: u32| {
-            let entry = &state.textures[&texture.wgpu()];
-            (
-                attachment_view(&entry.texture, 0, layer),
-                entry.texture.format(),
-            )
+    /// The depth attachment of a target.
+    fn depth_slice(&self, state: &State, target: &PassTarget) -> Option<Slice> {
+        let slice = |texture: &TextureId, layer: u32| Slice {
+            texture: state.textures[&texture.wgpu()].texture.clone(),
+            mip_level: 0,
+            layer,
         };
         match &target.depth {
             None => None,
-            Some(DepthAttachment::Texture2D(texture)) => Some(view(*texture, 0)),
+            Some(DepthAttachment::Texture2D(texture)) => Some(slice(texture, 0)),
             Some(DepthAttachment::Texture2DArray { texture, layer }) => {
-                Some(view(*texture, *layer))
+                Some(slice(texture, *layer))
             }
             Some(DepthAttachment::CubeMap { texture, side }) => {
-                Some(view(*texture, cube_layer(*side)))
+                Some(slice(texture, cube_layer(*side)))
             }
-            Some(DepthAttachment::Multisample(_)) => unsupported("a multisample render target"),
+            Some(DepthAttachment::Multisample(renderbuffer)) => Some(Slice {
+                texture: state.renderbuffers[&renderbuffer.wgpu()].clone(),
+                mip_level: 0,
+                layer: 0,
+            }),
         }
     }
 
-    /// Runs one render pass on the given target and submits it.
-    fn run_pass(
+    ///
+    /// Makes sure that a render pass on the given target is open and returns it.
+    /// A pass on the same target that is already open is continued, unless the target is cleared.
+    ///
+    fn pass<'a>(
         &self,
-        state: &State,
+        state: &'a mut State,
         target: &PassTarget,
         clear: Option<ClearState>,
-        render: impl FnOnce(&mut w::RenderPass, &[w::TextureFormat], Option<w::TextureFormat>),
-    ) {
+    ) -> &'a mut OpenPass {
         if target.framebuffer.is_none() {
             unsupported("rendering to the screen");
         }
-        let colors = self.color_views(state, target);
-        let depth = self.depth_view(state, target);
-        let color_load = match clear {
-            Some(ClearState {
-                red: Some(r),
-                green: Some(g),
-                blue: Some(b),
-                alpha: Some(a),
-                ..
-            }) => w::LoadOp::Clear(w::Color {
-                r: r as f64,
-                g: g as f64,
-                b: b as f64,
-                a: a as f64,
-            }),
-            Some(ClearState {
-                red: None,
-                green: None,
-                blue: None,
-                alpha: None,
-                ..
-            })
-            | None => w::LoadOp::Load,
-            _ => unsupported("clearing only some of the color channels"),
+        let same_target = |open: &OpenPass| {
+            open.target.color == target.color
+                && open.target.depth == target.depth
+                && open.target.width == target.width
+                && open.target.height == target.height
         };
-        let depth_load = match clear.and_then(|c| c.depth) {
-            Some(depth) => w::LoadOp::Clear(depth),
-            None => w::LoadOp::Load,
-        };
-        let color_attachments: Vec<_> = colors
-            .iter()
-            .map(|(view, _)| {
-                Some(w::RenderPassColorAttachment {
-                    view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: w::Operations {
-                        load: color_load,
-                        store: w::StoreOp::Store,
-                    },
-                })
-            })
-            .collect();
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = encoder.begin_render_pass(&w::RenderPassDescriptor {
-                label: None,
-                color_attachments: &color_attachments,
-                depth_stencil_attachment: depth.as_ref().map(|(view, _)| {
-                    w::RenderPassDepthStencilAttachment {
-                        view,
-                        depth_ops: Some(w::Operations {
-                            load: depth_load,
-                            store: w::StoreOp::Store,
-                        }),
-                        stencil_ops: None,
-                    }
+        if clear.is_some() || !state.frame.pass.as_ref().is_some_and(same_target) {
+            let colors = self.color_slices(state, target);
+            let depth = self.depth_slice(state, target);
+            let formats = TargetFormats {
+                colors: colors.iter().map(|s| s.texture.format()).collect(),
+                depth: depth.as_ref().map(|s| s.texture.format()),
+                samples: colors
+                    .first()
+                    .or(depth.as_ref())
+                    .map(|s| s.texture.sample_count())
+                    .unwrap_or(1),
+            };
+            let color_load = match clear {
+                Some(ClearState {
+                    red: Some(r),
+                    green: Some(g),
+                    blue: Some(b),
+                    alpha: Some(a),
+                    ..
+                }) => w::LoadOp::Clear(w::Color {
+                    r: r as f64,
+                    g: g as f64,
+                    b: b as f64,
+                    a: a as f64,
                 }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
+                _ => w::LoadOp::Load,
+            };
+            let depth_load = match clear.and_then(|c| c.depth) {
+                Some(depth) => w::LoadOp::Clear(depth),
+                None => w::LoadOp::Load,
+            };
+            let color_views: Vec<_> = colors.iter().map(Slice::view).collect();
+            let depth_view = depth.as_ref().map(Slice::view);
+            let color_attachments: Vec<_> = color_views
+                .iter()
+                .map(|view| {
+                    Some(w::RenderPassColorAttachment {
+                        view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: w::Operations {
+                            load: color_load,
+                            store: w::StoreOp::Store,
+                        },
+                    })
+                })
+                .collect();
+            let pass = self
+                .encoder(state)
+                .begin_render_pass(&w::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &color_attachments,
+                    depth_stencil_attachment: depth_view.as_ref().map(|view| {
+                        w::RenderPassDepthStencilAttachment {
+                            view,
+                            depth_ops: Some(w::Operations {
+                                load: depth_load,
+                                store: w::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
+                        }
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                })
+                .forget_lifetime();
+            #[cfg(test)]
+            {
+                state.statistics.0 += 1;
+            }
+            state.frame.pass = Some(OpenPass {
+                pass,
+                target: target.clone(),
+                formats,
             });
-            let formats: Vec<_> = colors.iter().map(|(_, format)| *format).collect();
-            render(
-                &mut pass,
-                &formats,
-                depth.as_ref().map(|(_, format)| *format),
-            );
         }
-        self.queue.submit([encoder.finish()]);
+        state.frame.pass.as_mut().unwrap()
     }
 
     fn new_buffer(&self, bytes: &[u8], usage: w::BufferUsages) -> w::Buffer {
@@ -311,14 +529,184 @@ impl WgpuBackend {
             Wrapping::MirroredRepeat => w::AddressMode::MirrorRepeat,
             Wrapping::ClampToEdge => w::AddressMode::ClampToEdge,
         };
+        let (mag_filter, min_filter) = (filter(desc.mag_filter), filter(desc.min_filter));
+        let mipmap_filter = match desc.mipmap {
+            Some(mipmap) if filter(mipmap.filter) == w::FilterMode::Linear => {
+                w::MipmapFilterMode::Linear
+            }
+            _ => w::MipmapFilterMode::Nearest,
+        };
+        // Anisotropic filtering needs linear filtering everywhere
+        let anisotropy_clamp = match desc.mipmap {
+            Some(mipmap)
+                if mag_filter == w::FilterMode::Linear
+                    && min_filter == w::FilterMode::Linear
+                    && mipmap_filter == w::MipmapFilterMode::Linear =>
+            {
+                mipmap.max_ratio.clamp(1, 16) as u16
+            }
+            _ => 1,
+        };
         self.device.create_sampler(&w::SamplerDescriptor {
             address_mode_u: address(desc.wrap_s),
             address_mode_v: address(desc.wrap_t),
             address_mode_w: address(desc.wrap_r.unwrap_or(desc.wrap_s)),
-            mag_filter: filter(desc.mag_filter),
-            min_filter: filter(desc.min_filter),
+            mag_filter,
+            min_filter,
+            mipmap_filter,
+            // Without mipmaps only the base level is sampled, even if the texture has more levels
+            lod_max_clamp: if desc.mipmap.is_some() { 32.0 } else { 0.0 },
+            anisotropy_clamp,
             ..Default::default()
         })
+    }
+
+    ///
+    /// Copies a rectangle of a texture with the given size of a texel into memory, without padding.
+    ///
+    fn read_texture(
+        &self,
+        state: &mut State,
+        source: &Slice,
+        rect: ScissorBox,
+        texel_size: usize,
+    ) -> Vec<u8> {
+        let unpadded = rect.width as usize * texel_size;
+        let padded = unpadded.next_multiple_of(w::COPY_BYTES_PER_ROW_ALIGNMENT as usize);
+        let buffer = self.device.create_buffer(&w::BufferDescriptor {
+            label: None,
+            size: (padded * rect.height as usize) as u64,
+            usage: w::BufferUsages::COPY_DST | w::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        self.encoder(state).copy_texture_to_buffer(
+            w::TexelCopyTextureInfo {
+                texture: &source.texture,
+                mip_level: source.mip_level,
+                origin: w::Origin3d {
+                    x: rect.x as u32,
+                    y: rect.y as u32,
+                    z: source.layer,
+                },
+                aspect: w::TextureAspect::All,
+            },
+            w::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: w::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded as u32),
+                    rows_per_image: Some(rect.height),
+                },
+            },
+            w::Extent3d {
+                width: rect.width,
+                height: rect.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.flush(state);
+        let slice = buffer.slice(..);
+        slice.map_async(w::MapMode::Read, |result| {
+            result.expect("failed to map the buffer for reading pixels")
+        });
+        // Blocks until the buffer is mapped
+        self.device
+            .poll(w::PollType::wait_indefinitely())
+            .expect("failed to wait for the GPU");
+        let data = slice.get_mapped_range();
+        let mut tight = Vec::with_capacity(unpadded * rect.height as usize);
+        for row in data.chunks_exact(padded) {
+            tight.extend_from_slice(&row[..unpadded]);
+        }
+        drop(data);
+        buffer.unmap();
+        tight
+    }
+
+    /// A texture with one sample that the builtin passes can render into and that can be read back.
+    fn temporary_texture(&self, format: w::TextureFormat, width: u32, height: u32) -> Slice {
+        Slice {
+            texture: self.device.create_texture(&w::TextureDescriptor {
+                label: None,
+                size: w::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: w::TextureDimension::D2,
+                format,
+                usage: w::TextureUsages::RENDER_ATTACHMENT | w::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            }),
+            mip_level: 0,
+            layer: 0,
+        }
+    }
+
+    /// Resolves a multisample color texture into a texture with one sample.
+    fn resolve_color(&self, state: &mut State, source: &Slice, destination: &Slice) {
+        let (source, destination) = (source.view(), destination.view());
+        self.encoder(state)
+            .begin_render_pass(&w::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(w::RenderPassColorAttachment {
+                    view: &source,
+                    depth_slice: None,
+                    resolve_target: Some(&destination),
+                    ops: w::Operations {
+                        load: w::LoadOp::Load,
+                        store: w::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+    }
+
+    /// Copies one layer of one mip level of a texture to another texture with the same format and number of samples.
+    fn copy_slice(&self, state: &mut State, source: &Slice, destination: &Slice) {
+        fn info(slice: &Slice) -> w::TexelCopyTextureInfo<'_> {
+            w::TexelCopyTextureInfo {
+                texture: &slice.texture,
+                mip_level: slice.mip_level,
+                origin: w::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: slice.layer,
+                },
+                aspect: w::TextureAspect::All,
+            }
+        }
+        let size = source.texture.size();
+        self.encoder(state).copy_texture_to_texture(
+            info(source),
+            info(destination),
+            w::Extent3d {
+                width: (size.width >> source.mip_level).max(1),
+                height: (size.height >> source.mip_level).max(1),
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+}
+
+impl Ring {
+    fn new(device: &w::Device, capacity: usize, generation: u64) -> Self {
+        Self {
+            buffer: device.create_buffer(&w::BufferDescriptor {
+                label: Some("three-d uniforms"),
+                size: capacity as u64,
+                usage: w::BufferUsages::UNIFORM | w::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            capacity,
+            staging: Vec::new(),
+            generation,
+        }
     }
 }
 
@@ -411,32 +799,182 @@ fn convert_channels(bytes: &[u8], primitive: PrimitiveType, from: usize, to: usi
     output
 }
 
+/// The primitive type and number of channels of the color formats this backend creates.
+fn texel_layout(format: w::TextureFormat) -> (PrimitiveType, usize) {
+    use w::TextureFormat as F;
+    match format {
+        F::R8Unorm => (PrimitiveType::U8, 1),
+        F::Rg8Unorm => (PrimitiveType::U8, 2),
+        F::Rgba8Unorm => (PrimitiveType::U8, 4),
+        F::R16Float => (PrimitiveType::F16, 1),
+        F::Rg16Float => (PrimitiveType::F16, 2),
+        F::Rgba16Float => (PrimitiveType::F16, 4),
+        F::R32Float => (PrimitiveType::F32, 1),
+        F::Rg32Float => (PrimitiveType::F32, 2),
+        F::Rgba32Float => (PrimitiveType::F32, 4),
+        _ => unsupported(&format!("reading from the format {format:?}")),
+    }
+}
+
+///
+/// The number of components that are stored for a vertex attribute.
+/// The size of a vertex must be a multiple of 4 bytes in wgpu, so small formats are stored with more components than they have.
+///
+fn stored_components(format: VertexFormat) -> u32 {
+    match (primitive_size(format.primitive), format.components) {
+        (1, _) => 4,
+        (2, 1) => 2,
+        (2, 3) => 4,
+        (_, components) => components,
+    }
+}
+
+/// Converts tightly packed vertices to the number of components that are stored, see [stored_components].
+fn widen_vertices(bytes: &[u8], format: VertexFormat) -> Vec<u8> {
+    let (from, to) = (
+        format.components as usize,
+        stored_components(format) as usize,
+    );
+    let size = primitive_size(format.primitive);
+    // A missing fourth component is one, as for a vertex attribute with less components than the shader expects
+    let one: Vec<u8> = match (format.primitive, format.normalized) {
+        (PrimitiveType::U8, true) => vec![255],
+        (PrimitiveType::I8, true) => vec![127],
+        (PrimitiveType::U16, true) => u16::MAX.to_le_bytes().to_vec(),
+        (PrimitiveType::I16, true) => i16::MAX.to_le_bytes().to_vec(),
+        (PrimitiveType::F16, _) => f16::from_f32(1.0).to_le_bytes().to_vec(),
+        (PrimitiveType::U8 | PrimitiveType::I8, false) => vec![1],
+        _ => 1u16.to_le_bytes().to_vec(),
+    };
+    let mut output = Vec::with_capacity(bytes.len() / from * to);
+    for vertex in bytes.chunks_exact(from * size) {
+        output.extend_from_slice(vertex);
+        for component in from..to {
+            if component == 3 {
+                output.extend_from_slice(&one);
+            } else {
+                output.extend(std::iter::repeat_n(0, size));
+            }
+        }
+    }
+    output
+}
+
+/// The format of a vertex attribute as it is stored, see [stored_components].
 fn vertex_format(format: VertexFormat) -> w::VertexFormat {
     use w::VertexFormat as F;
-    match (format.primitive, format.components, format.normalized) {
-        (PrimitiveType::F32, 1, _) => F::Float32,
-        (PrimitiveType::F32, 2, _) => F::Float32x2,
-        (PrimitiveType::F32, 3, _) => F::Float32x3,
-        (PrimitiveType::F32, 4, _) => F::Float32x4,
-        (PrimitiveType::F16, 1, _) => F::Float16,
-        (PrimitiveType::F16, 2, _) => F::Float16x2,
-        (PrimitiveType::F16, 4, _) => F::Float16x4,
-        (PrimitiveType::U8, 1, true) => F::Unorm8,
-        (PrimitiveType::U8, 2, true) => F::Unorm8x2,
-        (PrimitiveType::U8, 4, true) => F::Unorm8x4,
-        (PrimitiveType::U8, 1, false) => F::Uint8,
-        (PrimitiveType::U8, 2, false) => F::Uint8x2,
-        (PrimitiveType::U8, 4, false) => F::Uint8x4,
-        (PrimitiveType::U32, 1, _) => F::Uint32,
-        (PrimitiveType::U32, 2, _) => F::Uint32x2,
-        (PrimitiveType::U32, 3, _) => F::Uint32x3,
-        (PrimitiveType::U32, 4, _) => F::Uint32x4,
-        (PrimitiveType::I32, 1, _) => F::Sint32,
-        (PrimitiveType::I32, 2, _) => F::Sint32x2,
-        (PrimitiveType::I32, 3, _) => F::Sint32x3,
-        (PrimitiveType::I32, 4, _) => F::Sint32x4,
+    use PrimitiveType as P;
+    match (
+        format.primitive,
+        stored_components(format),
+        format.normalized,
+    ) {
+        (P::F32, 1, _) => F::Float32,
+        (P::F32, 2, _) => F::Float32x2,
+        (P::F32, 3, _) => F::Float32x3,
+        (P::F32, 4, _) => F::Float32x4,
+        (P::F16, 2, _) => F::Float16x2,
+        (P::F16, 4, _) => F::Float16x4,
+        (P::U8, 4, true) => F::Unorm8x4,
+        (P::U8, 4, false) => F::Uint8x4,
+        (P::I8, 4, true) => F::Snorm8x4,
+        (P::I8, 4, false) => F::Sint8x4,
+        (P::U16, 2, true) => F::Unorm16x2,
+        (P::U16, 4, true) => F::Unorm16x4,
+        (P::U16, 2, false) => F::Uint16x2,
+        (P::U16, 4, false) => F::Uint16x4,
+        (P::I16, 2, true) => F::Snorm16x2,
+        (P::I16, 4, true) => F::Snorm16x4,
+        (P::I16, 2, false) => F::Sint16x2,
+        (P::I16, 4, false) => F::Sint16x4,
+        (P::U32, 1, _) => F::Uint32,
+        (P::U32, 2, _) => F::Uint32x2,
+        (P::U32, 3, _) => F::Uint32x3,
+        (P::U32, 4, _) => F::Uint32x4,
+        (P::I32, 1, _) => F::Sint32,
+        (P::I32, 2, _) => F::Sint32x2,
+        (P::I32, 3, _) => F::Sint32x3,
+        (P::I32, 4, _) => F::Sint32x4,
         _ => unsupported(&format!("the vertex format {format:?}")),
     }
+}
+
+/// The part of a rectangle that is inside the target.
+fn clamp_to_target(target: &PassTarget, rectangle: ScissorBox) -> (u32, u32, u32, u32) {
+    let x0 = rectangle.x.clamp(0, target.width as i32);
+    let y0 = rectangle.y.clamp(0, target.height as i32);
+    let x1 = (rectangle.x + rectangle.width as i32).clamp(x0, target.width as i32);
+    let y1 = (rectangle.y + rectangle.height as i32).clamp(y0, target.height as i32);
+    (x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32)
+}
+
+fn compare_function(depth_test: DepthTest) -> w::CompareFunction {
+    match depth_test {
+        DepthTest::Never => w::CompareFunction::Never,
+        DepthTest::Less => w::CompareFunction::Less,
+        DepthTest::Equal => w::CompareFunction::Equal,
+        DepthTest::LessOrEqual => w::CompareFunction::LessEqual,
+        DepthTest::Greater => w::CompareFunction::Greater,
+        DepthTest::NotEqual => w::CompareFunction::NotEqual,
+        DepthTest::GreaterOrEqual => w::CompareFunction::GreaterEqual,
+        DepthTest::Always => w::CompareFunction::Always,
+    }
+}
+
+fn blend_state(blend: Blend) -> Option<w::BlendState> {
+    match blend {
+        Blend::Disabled => None,
+        Blend::Enabled {
+            source_rgb_multiplier,
+            source_alpha_multiplier,
+            destination_rgb_multiplier,
+            destination_alpha_multiplier,
+            rgb_equation,
+            alpha_equation,
+        } => Some(w::BlendState {
+            color: blend_component(
+                source_rgb_multiplier,
+                destination_rgb_multiplier,
+                rgb_equation,
+            ),
+            alpha: blend_component(
+                source_alpha_multiplier,
+                destination_alpha_multiplier,
+                alpha_equation,
+            ),
+        }),
+    }
+}
+
+/// The blend state as plain numbers, for the key of a pipeline.
+fn blend_key(blend: Blend) -> Option<[u8; 6]> {
+    match blend {
+        Blend::Disabled => None,
+        Blend::Enabled {
+            source_rgb_multiplier,
+            source_alpha_multiplier,
+            destination_rgb_multiplier,
+            destination_alpha_multiplier,
+            rgb_equation,
+            alpha_equation,
+        } => Some([
+            source_rgb_multiplier as u8,
+            source_alpha_multiplier as u8,
+            destination_rgb_multiplier as u8,
+            destination_alpha_multiplier as u8,
+            rgb_equation as u8,
+            alpha_equation as u8,
+        ]),
+    }
+}
+
+fn color_writes(write_mask: WriteMask) -> w::ColorWrites {
+    let mut color_writes = w::ColorWrites::empty();
+    color_writes.set(w::ColorWrites::RED, write_mask.red);
+    color_writes.set(w::ColorWrites::GREEN, write_mask.green);
+    color_writes.set(w::ColorWrites::BLUE, write_mask.blue);
+    color_writes.set(w::ColorWrites::ALPHA, write_mask.alpha);
+    color_writes
 }
 
 fn blend_factor(multiplier: BlendMultiplierType) -> w::BlendFactor {
@@ -599,10 +1137,20 @@ impl BackendApi for WgpuBackend {
     fn set_depth_test(&self, _depth_test: DepthTest) {}
     fn set_blend(&self, _blend: Blend) {}
     fn set_render_states(&self, _render_states: RenderStates) {}
+
     fn error_check(&self) -> Result<(), CoreError> {
-        // wgpu reports validation errors through its error handler, which panics with the message by default
-        Ok(())
+        // Without the list, the device was created by the user of the crate and reports errors to the handler set there (by default it panics)
+        let Some(errors) = &self.errors else {
+            return Ok(());
+        };
+        let errors = std::mem::take(&mut *errors.lock().unwrap_or_else(|e| e.into_inner()));
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(CoreError::ContextError(errors.join("\n")))
+        }
     }
+
     fn max_samples(&self) -> u32 {
         4
     }
@@ -610,44 +1158,80 @@ impl BackendApi for WgpuBackend {
     fn create_buffer(&self) -> BufferId {
         let mut state = self.lock();
         let id = Self::id(&mut state);
-        state.buffers.insert(id, None);
+        state.buffers.insert(
+            id,
+            BufferEntry {
+                buffer: None,
+                usage: w::BufferUsages::empty(),
+                bytes: None,
+                wide_indices: None,
+                widened: None,
+            },
+        );
         BufferId::Wgpu(id)
     }
 
     fn delete_buffer(&self, buffer: BufferId) {
-        let mut state = self.lock();
-        state.buffers.remove(&buffer.wgpu());
-        state.element_bytes.remove(&buffer.wgpu());
+        self.lock().buffers.remove(&buffer.wgpu());
     }
 
     fn write_buffer(&self, buffer: BufferId, kind: BufferKind, bytes: &[u8], _usage: BufferUsage) {
-        let usage = match kind {
-            BufferKind::Vertex => w::BufferUsages::VERTEX,
-            BufferKind::Element => w::BufferUsages::INDEX,
-            BufferKind::Uniform => w::BufferUsages::UNIFORM,
+        // The buffer is replaced, so commands that are already recorded keep using the old content
+        let mut entry = BufferEntry {
+            buffer: None,
+            usage: w::BufferUsages::UNIFORM,
+            bytes: None,
+            wide_indices: None,
+            widened: None,
         };
-        let new_buffer = self.new_buffer(bytes, usage);
-        let mut state = self.lock();
-        state.buffers.insert(buffer.wgpu(), Some(new_buffer));
-        if kind == BufferKind::Element {
-            state.element_bytes.insert(buffer.wgpu(), bytes.to_vec());
+        match kind {
+            BufferKind::Vertex(format) => {
+                entry.usage = w::BufferUsages::VERTEX;
+                if stored_components(format) != format.components {
+                    entry.widened = Some(format);
+                    entry.bytes = Some(bytes.to_vec());
+                }
+            }
+            BufferKind::Element => {
+                entry.usage = w::BufferUsages::INDEX;
+                entry.bytes = Some(bytes.to_vec());
+            }
+            BufferKind::Uniform => {}
         }
+        entry.buffer = Some(match entry.widened {
+            Some(format) => self.new_buffer(&widen_vertices(bytes, format), entry.usage),
+            None => self.new_buffer(bytes, entry.usage),
+        });
+        self.lock().buffers.insert(buffer.wgpu(), entry);
     }
 
     fn write_buffer_subset(&self, buffer: BufferId, _kind: BufferKind, offset: u32, bytes: &[u8]) {
-        let mut state = self.lock();
-        if let Some(content) = state.element_bytes.get_mut(&buffer.wgpu()) {
-            if let Some(part) = content.get_mut(offset as usize..offset as usize + bytes.len()) {
-                part.copy_from_slice(bytes);
+        let state = &mut *self.lock();
+        let entry = state.buffers.get_mut(&buffer.wgpu()).unwrap();
+        if let Some(content) = &mut entry.bytes {
+            // The buffer is not stored as it was written or the write may not be aligned to 4 bytes, so the buffer is replaced
+            let end = offset as usize + bytes.len();
+            if content.len() < end {
+                content.resize(end, 0);
             }
+            content[offset as usize..end].copy_from_slice(bytes);
+            entry.buffer = Some(match entry.widened {
+                Some(format) => self.new_buffer(&widen_vertices(content, format), entry.usage),
+                None => self.new_buffer(content, entry.usage),
+            });
+            entry.wide_indices = None;
+        } else {
+            let buffer = entry
+                .buffer
+                .clone()
+                .expect("a subset of a buffer is written before the buffer is filled");
+            if !bytes.len().is_multiple_of(4) || !offset.is_multiple_of(4) {
+                unsupported("writing a part of a buffer that is not aligned to 4 bytes");
+            }
+            // Recorded commands must see the old content
+            self.flush(state);
+            self.queue.write_buffer(&buffer, offset as u64, bytes);
         }
-        let buffer = state.buffers[&buffer.wgpu()]
-            .as_ref()
-            .expect("a subset of a buffer is written before the buffer is filled");
-        if !bytes.len().is_multiple_of(4) || !offset.is_multiple_of(4) {
-            unsupported("writing a part of a buffer that is not aligned to 4 bytes");
-        }
-        self.queue.write_buffer(buffer, offset as u64, bytes);
     }
 
     fn create_texture(&self, desc: &TextureDesc) -> TextureId {
@@ -661,12 +1245,6 @@ impl BackendApi for WgpuBackend {
             TextureKind::D3 => (w::TextureDimension::D3, storage.depth),
             TextureKind::CubeMap => (w::TextureDimension::D2, 6),
         };
-        let mut usage = w::TextureUsages::TEXTURE_BINDING
-            | w::TextureUsages::COPY_DST
-            | w::TextureUsages::COPY_SRC;
-        if dimension == w::TextureDimension::D2 {
-            usage |= w::TextureUsages::RENDER_ATTACHMENT;
-        }
         let texture = self.device.create_texture(&w::TextureDescriptor {
             label: None,
             size: w::Extent3d {
@@ -674,20 +1252,22 @@ impl BackendApi for WgpuBackend {
                 height: storage.height,
                 depth_or_array_layers: layers,
             },
-            // Mipmaps are generated in a later stage of the backend, until then only the base level exists
-            mip_level_count: 1,
+            mip_level_count: storage.mip_levels.max(1),
             sample_count: 1,
             dimension,
             format,
-            usage,
+            usage: w::TextureUsages::TEXTURE_BINDING
+                | w::TextureUsages::COPY_DST
+                | w::TextureUsages::COPY_SRC
+                | w::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
         let entry = TextureEntry {
             texture,
             format: storage.format,
-            kind: desc.kind,
             sampler: self.sampler(&desc.sampler, false),
             nearest_sampler: self.sampler(&desc.sampler, true),
+            views: HashMap::new(),
         };
         let mut state = self.lock();
         let id = Self::id(&mut state);
@@ -696,7 +1276,12 @@ impl BackendApi for WgpuBackend {
     }
 
     fn delete_texture(&self, texture: TextureId) {
-        self.lock().textures.remove(&texture.wgpu());
+        let state = &mut *self.lock();
+        let id = texture.wgpu();
+        state.textures.remove(&id);
+        state
+            .texture_groups
+            .retain(|(_, textures), _| !textures.contains(&id));
     }
 
     fn write_texture(
@@ -710,7 +1295,9 @@ impl BackendApi for WgpuBackend {
         format: ColorFormat,
         bytes: &[u8],
     ) {
-        let state = self.lock();
+        let state = &mut *self.lock();
+        // Recorded commands must see the old content
+        self.flush(state);
         let entry = &state.textures[&texture.wgpu()];
         let TextureFormat::Color(stored) = entry.format else {
             unsupported("writing to a depth texture")
@@ -757,21 +1344,79 @@ impl BackendApi for WgpuBackend {
         );
     }
 
-    fn generate_mipmaps(&self, _texture: TextureId, _kind: TextureKind) {
-        // Textures only have the base level for now, see create_texture
+    fn generate_mipmaps(&self, texture: TextureId, _kind: TextureKind) {
+        let state = &mut *self.lock();
+        let texture = state.textures[&texture.wgpu()].texture.clone();
+        let format = texture.format();
+        for level in 1..texture.mip_level_count() {
+            if texture.dimension() == w::TextureDimension::D3 {
+                let view = |level: u32| {
+                    texture.create_view(&w::TextureViewDescriptor {
+                        base_mip_level: level,
+                        mip_level_count: Some(1),
+                        ..Default::default()
+                    })
+                };
+                let (source, destination) = (view(level - 1), view(level));
+                for slice in 0..(texture.depth_or_array_layers() >> level).max(1) {
+                    self.builtin_pass(
+                        state,
+                        builtin::Kind::Mip3D,
+                        &source,
+                        &destination,
+                        format,
+                        Some(slice),
+                    );
+                }
+            } else {
+                for layer in 0..texture.depth_or_array_layers() {
+                    self.builtin_pass(
+                        state,
+                        builtin::Kind::Mip2D,
+                        &attachment_view(&texture, level - 1, layer),
+                        &attachment_view(&texture, level, layer),
+                        format,
+                        None,
+                    );
+                }
+            }
+        }
     }
 
     fn create_renderbuffer(
         &self,
-        _format: TextureFormat,
-        _width: u32,
-        _height: u32,
-        _number_of_samples: u32,
+        format: TextureFormat,
+        width: u32,
+        height: u32,
+        number_of_samples: u32,
     ) -> RenderbufferId {
-        unsupported("a multisample render target")
+        let (format, _) = texture_format(format);
+        let texture = self.device.create_texture(&w::TextureDescriptor {
+            label: None,
+            size: w::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            // WebGPU only knows 1 and 4 samples
+            sample_count: if number_of_samples > 1 { 4 } else { 1 },
+            dimension: w::TextureDimension::D2,
+            format,
+            usage: w::TextureUsages::TEXTURE_BINDING
+                | w::TextureUsages::COPY_SRC
+                | w::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let mut state = self.lock();
+        let id = Self::id(&mut state);
+        state.renderbuffers.insert(id, texture);
+        RenderbufferId::Wgpu(id)
     }
 
-    fn delete_renderbuffer(&self, _renderbuffer: RenderbufferId) {}
+    fn delete_renderbuffer(&self, renderbuffer: RenderbufferId) {
+        self.lock().renderbuffers.remove(&renderbuffer.wgpu());
+    }
 
     fn create_framebuffer(&self) -> FramebufferId {
         // A render target is fully described by its attachments, the id only tells it apart from the screen
@@ -788,101 +1433,125 @@ impl BackendApi for WgpuBackend {
     }
 
     fn end_pass(&self) {
-        self.lock().passes.pop();
+        let state = &mut *self.lock();
+        state.passes.pop();
+        if state.passes.is_empty() {
+            self.flush(state);
+        }
     }
 
     fn clear(&self, target: &PassTarget, scissor_box: ScissorBox, clear_state: ClearState) {
-        if scissor_box.x > 0
-            || scissor_box.y > 0
-            || scissor_box.x + (scissor_box.width as i32) < target.width as i32
-            || scissor_box.y + (scissor_box.height as i32) < target.height as i32
-        {
-            unsupported("clearing a part of a render target");
+        let state = &mut *self.lock();
+        let rectangle = clamp_to_target(target, scissor_box);
+        if rectangle.2 == 0 || rectangle.3 == 0 {
+            return;
         }
-        let state = self.lock();
-        self.run_pass(&state, target, Some(clear_state), |_, _, _| {});
+        let channels = [
+            clear_state.red,
+            clear_state.green,
+            clear_state.blue,
+            clear_state.alpha,
+        ];
+        let all = channels.iter().all(Option::is_some);
+        let none = channels.iter().all(Option::is_none);
+        if none && clear_state.depth.is_none() {
+            return;
+        }
+        if rectangle == (0, 0, target.width, target.height) && (all || none) {
+            // The clear is the load operation of a new pass
+            self.pass(state, target, Some(clear_state));
+        } else {
+            self.clear_partially(state, target, rectangle, clear_state);
+        }
     }
 
-    fn copy_target(&self, _source: &PassTarget, _destination: &PassTarget, _mask: CopyMask) {
-        unsupported("copying between render targets")
+    fn copy_target(&self, source: &PassTarget, destination: &PassTarget, mask: CopyMask) {
+        if source.framebuffer.is_none() || destination.framebuffer.is_none() {
+            unsupported("copying from or to the screen");
+        }
+        let state = &mut *self.lock();
+        if mask.color {
+            let from = self.color_slices(state, source).into_iter().next();
+            let to = self.color_slices(state, destination).into_iter().next();
+            if let (Some(from), Some(to)) = (from, to) {
+                if from.texture.sample_count() > to.texture.sample_count() {
+                    self.resolve_color(state, &from, &to);
+                } else {
+                    self.copy_slice(state, &from, &to);
+                }
+            }
+        }
+        if mask.depth {
+            let from = self.depth_slice(state, source);
+            let to = self.depth_slice(state, destination);
+            if let (Some(from), Some(to)) = (from, to) {
+                if from.texture.sample_count() > to.texture.sample_count() {
+                    // Like OpenGL, the depth of a pixel is the depth of one of its samples
+                    self.builtin_pass(
+                        state,
+                        builtin::Kind::DepthToDepth { multisampled: true },
+                        &from.view(),
+                        &to.view(),
+                        to.texture.format(),
+                        None,
+                    );
+                } else {
+                    self.copy_slice(state, &from, &to);
+                }
+            }
+        }
     }
 
     fn read_pixels(&self, source: &PassTarget, rect: ScissorBox, format: ReadFormat) -> Vec<u8> {
         if cfg!(target_arch = "wasm32") {
-            // A browser cannot block until the pixels are there, it needs the asynchronous read functions which follow in a later stage
+            // A browser cannot block until the pixels are there, it needs asynchronous read functions which follow in a later stage
             unsupported("reading pixels synchronously in the browser");
         }
-        let ReadFormat::Color(format) = format else {
-            unsupported("reading depth")
-        };
-        let Some(ColorAttachment::Texture2D { texture, mip_level }) = &source.color else {
-            unsupported("reading from anything but a 2D color texture")
-        };
-        let state = self.lock();
-        let entry = &state.textures[&texture.wgpu()];
-        let TextureFormat::Color(stored) = entry.format else {
-            unreachable!()
-        };
-        if stored.primitive != format.primitive {
-            unsupported("reading pixels as another type than the texture has");
+        if source.framebuffer.is_none() {
+            unsupported("reading from the screen");
         }
-        let (_, texel_size) = texture_format(entry.format);
-        let unpadded = rect.width as usize * texel_size;
-        let padded = unpadded.next_multiple_of(w::COPY_BYTES_PER_ROW_ALIGNMENT as usize);
-        let buffer = self.device.create_buffer(&w::BufferDescriptor {
-            label: None,
-            size: (padded * rect.height as usize) as u64,
-            usage: w::BufferUsages::COPY_DST | w::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        encoder.copy_texture_to_buffer(
-            w::TexelCopyTextureInfo {
-                texture: &entry.texture,
-                mip_level: *mip_level,
-                origin: w::Origin3d {
-                    x: rect.x as u32,
-                    y: rect.y as u32,
-                    z: 0,
-                },
-                aspect: w::TextureAspect::All,
-            },
-            w::TexelCopyBufferInfo {
-                buffer: &buffer,
-                layout: w::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded as u32),
-                    rows_per_image: Some(rect.height),
-                },
-            },
-            w::Extent3d {
-                width: rect.width,
-                height: rect.height,
-                depth_or_array_layers: 1,
-            },
-        );
-        self.queue.submit([encoder.finish()]);
-        let slice = buffer.slice(..);
-        slice.map_async(w::MapMode::Read, |result| {
-            result.expect("failed to map the buffer for reading pixels")
-        });
-        // Blocks until the buffer is mapped
-        self.device
-            .poll(w::PollType::wait_indefinitely())
-            .expect("failed to wait for the GPU");
-        let data = slice.get_mapped_range();
-        let mut tight = Vec::with_capacity(unpadded * rect.height as usize);
-        for row in data.chunks_exact(padded) {
-            tight.extend_from_slice(&row[..unpadded]);
+        let state = &mut *self.lock();
+        match format {
+            ReadFormat::Color(format) => {
+                let mut slice = self
+                    .color_slices(state, source)
+                    .into_iter()
+                    .next()
+                    .expect("the target that is read from has no color");
+                if slice.texture.sample_count() > 1 {
+                    let resolved =
+                        self.temporary_texture(slice.texture.format(), source.width, source.height);
+                    self.resolve_color(state, &slice, &resolved);
+                    slice = resolved;
+                }
+                let (primitive, channels) = texel_layout(slice.texture.format());
+                if primitive != format.primitive {
+                    unsupported("reading pixels as another type than the texture has");
+                }
+                let tight =
+                    self.read_texture(state, &slice, rect, channels * primitive_size(primitive));
+                convert_channels(&tight, primitive, channels, format.channels as usize)
+            }
+            ReadFormat::Depth => {
+                let slice = self
+                    .depth_slice(state, source)
+                    .expect("the target that is read from has no depth");
+                // Not every depth format can be copied into a buffer, so the depth is drawn into a color texture first
+                let color =
+                    self.temporary_texture(w::TextureFormat::R32Float, source.width, source.height);
+                self.builtin_pass(
+                    state,
+                    builtin::Kind::DepthToColor {
+                        multisampled: slice.texture.sample_count() > 1,
+                    },
+                    &slice.view(),
+                    &color.view(),
+                    w::TextureFormat::R32Float,
+                    None,
+                );
+                self.read_texture(state, &color, rect, 4)
+            }
         }
-        drop(data);
-        buffer.unmap();
-        convert_channels(
-            &tight,
-            format.primitive,
-            texel_size / primitive_size(stored.primitive),
-            format.channels as usize,
-        )
     }
 
     fn create_program(
@@ -949,22 +1618,24 @@ impl BackendApi for WgpuBackend {
         }
         reflection.attributes = translation.attributes.iter().cloned().collect();
 
-        let block_entry = |binding: u32, visibility: w::ShaderStages| w::BindGroupLayoutEntry {
-            binding,
-            visibility,
-            ty: w::BindingType::Buffer {
-                ty: w::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
+        // The blocks with the loose uniforms live in the ring buffer, at an offset that changes with every draw call
+        let block_entry =
+            |binding: u32, visibility: w::ShaderStages, size: usize| w::BindGroupLayoutEntry {
+                binding,
+                visibility,
+                ty: w::BindingType::Buffer {
+                    ty: w::BufferBindingType::Uniform,
+                    has_dynamic_offset: true,
+                    min_binding_size: NonZeroU64::new(size as u64),
+                },
+                count: None,
+            };
         let mut entries = Vec::new();
         if vertex_size > 0 {
-            entries.push(block_entry(0, w::ShaderStages::VERTEX));
+            entries.push(block_entry(0, w::ShaderStages::VERTEX, vertex_size));
         }
         if fragment_size > 0 {
-            entries.push(block_entry(1, w::ShaderStages::FRAGMENT));
+            entries.push(block_entry(1, w::ShaderStages::FRAGMENT, fragment_size));
         }
         let uniform_layout = self
             .device
@@ -972,6 +1643,25 @@ impl BackendApi for WgpuBackend {
                 label: None,
                 entries: &entries,
             });
+        // The uniform blocks declared in the shaders are whole buffers
+        let user_block_entries: Vec<_> = (0..translation.uniform_blocks.len())
+            .map(|binding| w::BindGroupLayoutEntry {
+                binding: binding as u32,
+                visibility: w::ShaderStages::VERTEX_FRAGMENT,
+                ty: w::BindingType::Buffer {
+                    ty: w::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            })
+            .collect();
+        let user_block_layout =
+            self.device
+                .create_bind_group_layout(&w::BindGroupLayoutDescriptor {
+                    label: None,
+                    entries: &user_block_entries,
+                });
 
         let module = |module: naga::Module| {
             self.device.create_shader_module(w::ShaderModuleDescriptor {
@@ -983,11 +1673,25 @@ impl BackendApi for WgpuBackend {
             vertex: module(vertex_module),
             fragment: module(fragment_module),
             blocks: [vec![0; vertex_size], vec![0; fragment_size]],
+            uploaded: None,
             uniforms,
             samplers: translation.samplers.into_iter().map(|s| (s, 0)).collect(),
             attributes: HashMap::new(),
-            attribute_locations: translation.attributes.iter().map(|(_, l)| *l).collect(),
+            attribute_locations: {
+                let mut locations: Vec<u32> =
+                    translation.attributes.iter().map(|(_, l)| *l).collect();
+                locations.sort();
+                locations
+            },
             uniform_layout,
+            uniform_group: None,
+            texture_layouts: HashMap::new(),
+            user_blocks: translation
+                .uniform_blocks
+                .into_iter()
+                .map(|name| (name, None))
+                .collect(),
+            user_block_layout,
             number_of_outputs,
         };
         let mut state = self.lock();
@@ -997,10 +1701,13 @@ impl BackendApi for WgpuBackend {
     }
 
     fn delete_program(&self, program: ProgramId) {
-        let mut state = self.lock();
-        state.programs.remove(&program.wgpu());
-        let prefix = format!("{}|", program.wgpu());
-        state.pipelines.retain(|key, _| !key.starts_with(&prefix));
+        let state = &mut *self.lock();
+        let id = program.wgpu();
+        state.programs.remove(&id);
+        state.pipelines.retain(|key, _| key.program != id);
+        state
+            .texture_groups
+            .retain(|(program, _), _| *program != id);
     }
 
     fn set_uniform(&self, program: ProgramId, location: &UniformLocation, value: &UniformValue) {
@@ -1029,7 +1736,7 @@ impl BackendApi for WgpuBackend {
                 let (rows, columns) = uniform_shape(ty);
                 let column_size = rows * 4;
                 let element_size = column_size * columns;
-                for member in members.clone() {
+                for member in members {
                     let block = &mut program.blocks[member.block];
                     for (element, data) in bytes.chunks_exact(element_size).enumerate() {
                         for (column, data) in data.chunks_exact(column_size).enumerate() {
@@ -1042,6 +1749,7 @@ impl BackendApi for WgpuBackend {
                         }
                     }
                 }
+                program.uploaded = None;
             }
         }
     }
@@ -1050,18 +1758,28 @@ impl BackendApi for WgpuBackend {
         self.lock().units.insert(unit, texture.wgpu());
     }
 
-    fn uniform_block_index(&self, _program: ProgramId, _name: &str) -> Option<u32> {
-        unsupported("a uniform block")
+    fn uniform_block_index(&self, program: ProgramId, name: &str) -> Option<u32> {
+        self.lock().programs[&program.wgpu()]
+            .user_blocks
+            .iter()
+            .position(|(block, _)| block == name)
+            .map(|index| index as u32)
     }
 
     fn bind_uniform_block(
         &self,
-        _program: ProgramId,
-        _block_index: u32,
+        program: ProgramId,
+        block_index: u32,
         _binding: u32,
-        _buffer: BufferId,
+        buffer: BufferId,
     ) {
-        unsupported("a uniform block")
+        // There are no global binding points, the buffer is bound to the block of the program directly
+        self.lock()
+            .programs
+            .get_mut(&program.wgpu())
+            .unwrap()
+            .user_blocks[block_index as usize]
+            .1 = Some(buffer.wgpu());
     }
 
     fn bind_vertex_attribute(
@@ -1087,185 +1805,258 @@ impl BackendApi for WgpuBackend {
             // Only triangles are drawn, so nothing is visible
             return;
         }
-        let mut state = self.lock();
+        let state = &mut *self.lock();
         let (target, scissor_box) = state
             .passes
             .last()
             .cloned()
             .expect("a draw call must be made inside the write method of a render target");
+        let scissor = clamp_to_target(&target, scissor_box);
+        if scissor.2 == 0 || scissor.3 == 0 || call.viewport.width == 0 || call.viewport.height == 0
+        {
+            return;
+        }
         let program_id = call.program.wgpu();
-        let program = &state.programs[&program_id];
 
         // Vertex buffers, one per attribute
-        let mut locations = program.attribute_locations.clone();
-        locations.sort();
+        let program = &state.programs[&program_id];
         let mut vertex_buffers = Vec::new();
-        let mut vertex_attributes = Vec::new();
-        for location in &locations {
+        let mut attributes = Vec::new();
+        for location in &program.attribute_locations {
             let (buffer, format, divisor) = program.attributes.get(location).unwrap_or_else(|| {
                 panic!("no buffer is bound to the vertex attribute at location {location}")
             });
-            let buffer = state.buffers[buffer]
-                .clone()
-                .expect("a vertex buffer is used before it is filled");
-            let format = vertex_format(*format);
-            vertex_buffers.push((buffer, format.size(), *divisor));
-            vertex_attributes.push([w::VertexAttribute {
-                format,
-                offset: 0,
-                shader_location: *location,
-            }]);
+            vertex_buffers.push(
+                state.buffers[buffer]
+                    .buffer
+                    .clone()
+                    .expect("a vertex buffer is used before it is filled"),
+            );
+            attributes.push((*location, vertex_format(*format), *divisor != 0));
         }
-        let vertex_layouts: Vec<_> = vertex_buffers
-            .iter()
-            .zip(&vertex_attributes)
-            .map(|((_, stride, divisor), attributes)| w::VertexBufferLayout {
-                array_stride: *stride,
-                step_mode: if *divisor == 0 {
-                    w::VertexStepMode::Vertex
-                } else {
-                    w::VertexStepMode::Instance
-                },
-                attributes,
-            })
-            .collect();
 
         // Textures and samplers
-        let float32_filterable = self
-            .device
-            .features()
-            .contains(w::Features::FLOAT32_FILTERABLE);
-        let mut texture_layout_entries = Vec::new();
-        let mut texture_views = Vec::new();
-        for (index, (sampler, unit)) in program.samplers.iter().enumerate() {
-            let entry = state
+        let mut sample_kinds = Vec::new();
+        let mut textures = Vec::new();
+        for (sampler, unit) in &program.samplers {
+            let texture = state
                 .units
                 .get(unit)
-                .and_then(|texture| state.textures.get(texture))
+                .filter(|texture| state.textures.contains_key(texture))
                 .unwrap_or_else(|| panic!("no texture is bound for the uniform {}", sampler.name));
-            let (sample_type, filtering) = match entry.format {
-                TextureFormat::Depth(_) => (w::TextureSampleType::Depth, false),
+            sample_kinds.push(match state.textures[texture].format {
+                TextureFormat::Depth(_) => SampleKind::Unfilterable,
                 TextureFormat::Color(ColorFormat {
                     primitive: PrimitiveType::F32,
                     ..
-                }) if !float32_filterable => {
-                    (w::TextureSampleType::Float { filterable: false }, false)
-                }
-                _ => (w::TextureSampleType::Float { filterable: true }, true),
-            };
-            let mut visibility = w::ShaderStages::empty();
-            if sampler.in_vertex {
-                visibility |= w::ShaderStages::VERTEX;
-            }
-            if sampler.in_fragment {
-                visibility |= w::ShaderStages::FRAGMENT;
-            }
-            let view_dimension = texture_view_dimension(&sampler.glsl_type);
-            texture_layout_entries.push(w::BindGroupLayoutEntry {
-                binding: 2 * index as u32,
-                visibility,
-                ty: w::BindingType::Texture {
-                    sample_type,
-                    view_dimension,
-                    multisampled: false,
-                },
-                count: None,
+                }) if !self.float32_filterable => SampleKind::Unfilterable,
+                _ => SampleKind::Filterable,
             });
-            texture_layout_entries.push(w::BindGroupLayoutEntry {
-                binding: 2 * index as u32 + 1,
-                visibility,
-                ty: w::BindingType::Sampler(if filtering {
-                    w::SamplerBindingType::Filtering
-                } else {
-                    w::SamplerBindingType::NonFiltering
-                }),
-                count: None,
-            });
-            let view = entry.texture.create_view(&w::TextureViewDescriptor {
-                dimension: Some(view_dimension),
-                ..Default::default()
-            });
-            let _ = entry.kind;
-            texture_views.push((
-                view,
-                if filtering {
+            textures.push(*texture);
+        }
+        let texture_key = (program_id, textures);
+        if !state.texture_groups.contains_key(&texture_key) {
+            let program = state.programs.get_mut(&program_id).unwrap();
+            let samplers = &program.samplers;
+            let layout = program
+                .texture_layouts
+                .entry(sample_kinds.clone())
+                .or_insert_with(|| {
+                    let entries: Vec<_> = samplers
+                        .iter()
+                        .zip(&sample_kinds)
+                        .enumerate()
+                        .flat_map(|(index, ((sampler, _), kind))| {
+                            let mut visibility = w::ShaderStages::empty();
+                            if sampler.in_vertex {
+                                visibility |= w::ShaderStages::VERTEX;
+                            }
+                            if sampler.in_fragment {
+                                visibility |= w::ShaderStages::FRAGMENT;
+                            }
+                            [
+                                w::BindGroupLayoutEntry {
+                                    binding: 2 * index as u32,
+                                    visibility,
+                                    ty: w::BindingType::Texture {
+                                        sample_type: match kind {
+                                            SampleKind::Filterable => {
+                                                w::TextureSampleType::Float { filterable: true }
+                                            }
+                                            SampleKind::Unfilterable => {
+                                                w::TextureSampleType::Float { filterable: false }
+                                            }
+                                        },
+                                        view_dimension: texture_view_dimension(&sampler.glsl_type),
+                                        multisampled: false,
+                                    },
+                                    count: None,
+                                },
+                                w::BindGroupLayoutEntry {
+                                    binding: 2 * index as u32 + 1,
+                                    visibility,
+                                    ty: w::BindingType::Sampler(
+                                        if *kind == SampleKind::Filterable {
+                                            w::SamplerBindingType::Filtering
+                                        } else {
+                                            w::SamplerBindingType::NonFiltering
+                                        },
+                                    ),
+                                    count: None,
+                                },
+                            ]
+                        })
+                        .collect();
+                    self.device
+                        .create_bind_group_layout(&w::BindGroupLayoutDescriptor {
+                            label: None,
+                            entries: &entries,
+                        })
+                });
+            let mut resources = Vec::new();
+            for (((sampler, _), kind), texture) in
+                samplers.iter().zip(&sample_kinds).zip(&texture_key.1)
+            {
+                let entry = state.textures.get_mut(texture).unwrap();
+                let dimension = texture_view_dimension(&sampler.glsl_type);
+                let view = entry
+                    .views
+                    .entry(dimension)
+                    .or_insert_with(|| {
+                        entry.texture.create_view(&w::TextureViewDescriptor {
+                            dimension: Some(dimension),
+                            ..Default::default()
+                        })
+                    })
+                    .clone();
+                let sampler = if *kind == SampleKind::Filterable {
                     entry.sampler.clone()
                 } else {
                     entry.nearest_sampler.clone()
-                },
-            ));
-        }
-        let texture_layout = self
-            .device
-            .create_bind_group_layout(&w::BindGroupLayoutDescriptor {
+                };
+                resources.push((view, sampler));
+            }
+            let entries: Vec<_> = resources
+                .iter()
+                .enumerate()
+                .flat_map(|(index, (view, sampler))| {
+                    [
+                        w::BindGroupEntry {
+                            binding: 2 * index as u32,
+                            resource: w::BindingResource::TextureView(view),
+                        },
+                        w::BindGroupEntry {
+                            binding: 2 * index as u32 + 1,
+                            resource: w::BindingResource::Sampler(sampler),
+                        },
+                    ]
+                })
+                .collect();
+            let group = self.device.create_bind_group(&w::BindGroupDescriptor {
                 label: None,
-                entries: &texture_layout_entries,
+                layout,
+                entries: &entries,
             });
-        let texture_entries: Vec<_> = texture_views
-            .iter()
-            .enumerate()
-            .flat_map(|(index, (view, sampler))| {
-                [
-                    w::BindGroupEntry {
-                        binding: 2 * index as u32,
-                        resource: w::BindingResource::TextureView(view),
-                    },
-                    w::BindGroupEntry {
-                        binding: 2 * index as u32 + 1,
-                        resource: w::BindingResource::Sampler(sampler),
-                    },
-                ]
-            })
-            .collect();
-        let texture_group = self.device.create_bind_group(&w::BindGroupDescriptor {
-            label: None,
-            layout: &texture_layout,
-            entries: &texture_entries,
-        });
+            state.texture_groups.insert(texture_key.clone(), group);
+        }
+        let texture_group = state.texture_groups[&texture_key].clone();
 
-        // Uniforms
-        let uniform_buffers: Vec<_> = program
-            .blocks
-            .iter()
-            .enumerate()
-            .filter(|(_, bytes)| !bytes.is_empty())
-            .map(|(binding, bytes)| {
-                (
-                    binding as u32,
-                    self.new_buffer(bytes, w::BufferUsages::UNIFORM),
-                )
-            })
+        // Uniforms: the blocks are only uploaded again if they changed since the last draw call with this program
+        let offsets = match state.programs[&program_id].uploaded {
+            Some((epoch, offsets)) if epoch == state.epoch => offsets,
+            _ => {
+                let blocks =
+                    std::mem::take(&mut state.programs.get_mut(&program_id).unwrap().blocks);
+                // Both blocks in one piece, so that the first one cannot be submitted away while the second one is added
+                let second = blocks[0].len().next_multiple_of(self.uniform_alignment);
+                let mut bytes = blocks[0].clone();
+                bytes.resize(second, 0);
+                bytes.extend_from_slice(&blocks[1]);
+                let first = self.upload_uniforms(state, &bytes);
+                let offsets = [first, first + second as u32];
+                let program = state.programs.get_mut(&program_id).unwrap();
+                program.blocks = blocks;
+                program.uploaded = Some((state.epoch, offsets));
+                offsets
+            }
+        };
+        let generation = state.ring.generation;
+        let program = state.programs.get_mut(&program_id).unwrap();
+        if !matches!(&program.uniform_group, Some((g, _)) if *g == generation) {
+            let entries: Vec<_> = program
+                .blocks
+                .iter()
+                .enumerate()
+                .filter(|(_, bytes)| !bytes.is_empty())
+                .map(|(binding, bytes)| w::BindGroupEntry {
+                    binding: binding as u32,
+                    resource: w::BindingResource::Buffer(w::BufferBinding {
+                        buffer: &state.ring.buffer,
+                        offset: 0,
+                        size: NonZeroU64::new(bytes.len() as u64),
+                    }),
+                })
+                .collect();
+            let group = self.device.create_bind_group(&w::BindGroupDescriptor {
+                label: None,
+                layout: &program.uniform_layout,
+                entries: &entries,
+            });
+            program.uniform_group = Some((generation, group));
+        }
+        let uniform_group = program.uniform_group.as_ref().unwrap().1.clone();
+        let dynamic_offsets: Vec<u32> = (0..2)
+            .filter(|block| !program.blocks[*block].is_empty())
+            .map(|block| offsets[block])
             .collect();
-        let uniform_entries: Vec<_> = uniform_buffers
-            .iter()
-            .map(|(binding, buffer)| w::BindGroupEntry {
-                binding: *binding,
-                resource: buffer.as_entire_binding(),
+
+        // The uniform blocks declared in the shaders
+        let user_block_group = (!program.user_blocks.is_empty()).then(|| {
+            let buffers: Vec<_> = program
+                .user_blocks
+                .iter()
+                .map(|(name, buffer)| {
+                    buffer
+                        .and_then(|buffer| state.buffers.get(&buffer))
+                        .and_then(|entry| entry.buffer.clone())
+                        .unwrap_or_else(|| panic!("no buffer is bound to the uniform block {name}"))
+                })
+                .collect();
+            let entries: Vec<_> = buffers
+                .iter()
+                .enumerate()
+                .map(|(binding, buffer)| w::BindGroupEntry {
+                    binding: binding as u32,
+                    resource: buffer.as_entire_binding(),
+                })
+                .collect();
+            self.device.create_bind_group(&w::BindGroupDescriptor {
+                label: None,
+                layout: &program.user_block_layout,
+                entries: &entries,
             })
-            .collect();
-        let uniform_group = self.device.create_bind_group(&w::BindGroupDescriptor {
-            label: None,
-            layout: &program.uniform_layout,
-            entries: &uniform_entries,
         });
 
         let index_buffer = call.indices.map(|indices| {
-            let id = indices.buffer.wgpu();
+            let entry = state.buffers.get_mut(&indices.buffer.wgpu()).unwrap();
             match indices.index_type {
                 PrimitiveType::U8 => {
                     // 8 bit indices do not exist in wgpu
-                    let wide: Vec<u8> = state.element_bytes[&id]
-                        .iter()
-                        .flat_map(|index| (*index as u16).to_le_bytes())
-                        .collect();
-                    (
-                        self.new_buffer(&wide, w::BufferUsages::INDEX),
-                        w::IndexFormat::Uint16,
-                        indices.first,
-                    )
+                    if entry.wide_indices.is_none() {
+                        let wide: Vec<u8> = entry
+                            .bytes
+                            .as_ref()
+                            .expect("an element buffer is used before it is filled")
+                            .iter()
+                            .flat_map(|index| (*index as u16).to_le_bytes())
+                            .collect();
+                        entry.wide_indices = Some(self.new_buffer(&wide, w::BufferUsages::INDEX));
+                    }
+                    (entry.wide_indices.clone().unwrap(), w::IndexFormat::Uint16)
                 }
                 index_type => (
-                    state.buffers[&id]
+                    entry
+                        .buffer
                         .clone()
                         .expect("an element buffer is used before it is filled"),
                     if index_type == PrimitiveType::U16 {
@@ -1273,69 +2064,77 @@ impl BackendApi for WgpuBackend {
                     } else {
                         w::IndexFormat::Uint32
                     },
-                    indices.first,
                 ),
             }
         });
 
-        let color_formats: Vec<_> = self
-            .color_views(&state, &target)
-            .into_iter()
-            .map(|(_, format)| format)
-            .collect();
-        let depth_format = self.depth_view(&state, &target).map(|(_, format)| format);
-        // The debug representation of everything that goes into the pipeline is used as key, a proper key follows with the pipeline cache
-        let key = format!(
-            "{program_id}|{:?}|{color_formats:?}|{depth_format:?}|{vertex_layouts:?}|{texture_layout_entries:?}",
-            call.render_states
-        );
+        let formats = self.pass(state, &target, None).formats.clone();
+        let write_mask = call.render_states.write_mask;
+        let key = PipelineKey {
+            program: program_id,
+            cull: call.render_states.cull as u8,
+            depth_test: call.render_states.depth_test as u8,
+            write_mask: color_writes(write_mask).bits() as u8 | (u8::from(write_mask.depth) << 4),
+            blend: blend_key(call.render_states.blend),
+            formats,
+            attributes,
+            textures: sample_kinds,
+        };
         if !state.pipelines.contains_key(&key) {
             let program = &state.programs[&program_id];
+            let mut bind_group_layouts = vec![
+                Some(&program.uniform_layout),
+                Some(&program.texture_layouts[&key.textures]),
+            ];
+            if !program.user_blocks.is_empty() {
+                bind_group_layouts.push(Some(&program.user_block_layout));
+            }
             let layout = self
                 .device
                 .create_pipeline_layout(&w::PipelineLayoutDescriptor {
                     label: None,
-                    bind_group_layouts: &[Some(&program.uniform_layout), Some(&texture_layout)],
+                    bind_group_layouts: &bind_group_layouts,
                     immediate_size: 0,
                 });
-            let write_mask = call.render_states.write_mask;
-            let mut color_writes = w::ColorWrites::empty();
-            color_writes.set(w::ColorWrites::RED, write_mask.red);
-            color_writes.set(w::ColorWrites::GREEN, write_mask.green);
-            color_writes.set(w::ColorWrites::BLUE, write_mask.blue);
-            color_writes.set(w::ColorWrites::ALPHA, write_mask.alpha);
-            let blend = match call.render_states.blend {
-                Blend::Disabled => None,
-                Blend::Enabled {
-                    source_rgb_multiplier,
-                    source_alpha_multiplier,
-                    destination_rgb_multiplier,
-                    destination_alpha_multiplier,
-                    rgb_equation,
-                    alpha_equation,
-                } => Some(w::BlendState {
-                    color: blend_component(
-                        source_rgb_multiplier,
-                        destination_rgb_multiplier,
-                        rgb_equation,
-                    ),
-                    alpha: blend_component(
-                        source_alpha_multiplier,
-                        destination_alpha_multiplier,
-                        alpha_equation,
-                    ),
-                }),
-            };
-            let targets: Vec<_> = color_formats
+            let vertex_attributes: Vec<_> = key
+                .attributes
+                .iter()
+                .map(|(location, format, _)| {
+                    [w::VertexAttribute {
+                        format: *format,
+                        offset: 0,
+                        shader_location: *location,
+                    }]
+                })
+                .collect();
+            let vertex_layouts: Vec<_> = key
+                .attributes
+                .iter()
+                .zip(&vertex_attributes)
+                .map(
+                    |((_, format, instanced), attributes)| w::VertexBufferLayout {
+                        array_stride: format.size(),
+                        step_mode: if *instanced {
+                            w::VertexStepMode::Instance
+                        } else {
+                            w::VertexStepMode::Vertex
+                        },
+                        attributes,
+                    },
+                )
+                .collect();
+            let targets: Vec<_> = key
+                .formats
+                .colors
                 .iter()
                 .enumerate()
                 .map(|(index, format)| {
                     Some(w::ColorTargetState {
                         format: *format,
-                        blend,
+                        blend: blend_state(call.render_states.blend),
                         // A target the fragment shader does not write to keeps its content
                         write_mask: if index < program.number_of_outputs {
-                            color_writes
+                            color_writes(write_mask)
                         } else {
                             w::ColorWrites::empty()
                         },
@@ -1363,23 +2162,17 @@ impl BackendApi for WgpuBackend {
                         },
                         ..Default::default()
                     },
-                    depth_stencil: depth_format.map(|format| w::DepthStencilState {
+                    depth_stencil: key.formats.depth.map(|format| w::DepthStencilState {
                         format,
                         depth_write_enabled: Some(write_mask.depth),
-                        depth_compare: Some(match call.render_states.depth_test {
-                            DepthTest::Never => w::CompareFunction::Never,
-                            DepthTest::Less => w::CompareFunction::Less,
-                            DepthTest::Equal => w::CompareFunction::Equal,
-                            DepthTest::LessOrEqual => w::CompareFunction::LessEqual,
-                            DepthTest::Greater => w::CompareFunction::Greater,
-                            DepthTest::NotEqual => w::CompareFunction::NotEqual,
-                            DepthTest::GreaterOrEqual => w::CompareFunction::GreaterEqual,
-                            DepthTest::Always => w::CompareFunction::Always,
-                        }),
+                        depth_compare: Some(compare_function(call.render_states.depth_test)),
                         stencil: Default::default(),
                         bias: Default::default(),
                     }),
-                    multisample: Default::default(),
+                    multisample: w::MultisampleState {
+                        count: key.formats.samples,
+                        ..Default::default()
+                    },
                     fragment: Some(w::FragmentState {
                         module: &program.fragment,
                         entry_point: Some("main"),
@@ -1393,361 +2186,32 @@ impl BackendApi for WgpuBackend {
         }
         let pipeline = &state.pipelines[&key];
 
-        // The part of the viewport and the scissor box that is inside the target
-        let clamp = |x: i32, y: i32, width: u32, height: u32| {
-            let x0 = x.clamp(0, target.width as i32);
-            let y0 = y.clamp(0, target.height as i32);
-            let x1 = (x + width as i32).clamp(x0, target.width as i32);
-            let y1 = (y + height as i32).clamp(y0, target.height as i32);
-            (x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32)
-        };
-        let scissor = clamp(
-            scissor_box.x,
-            scissor_box.y,
-            scissor_box.width,
-            scissor_box.height,
-        );
-        if scissor.2 == 0 || scissor.3 == 0 || call.viewport.width == 0 || call.viewport.height == 0
-        {
-            return;
+        let pass = &mut state.frame.pass.as_mut().unwrap().pass;
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &uniform_group, &dynamic_offsets);
+        pass.set_bind_group(1, &texture_group, &[]);
+        if let Some(group) = &user_block_group {
+            pass.set_bind_group(2, group, &[]);
         }
-        self.run_pass(&state, &target, None, |pass, _, _| {
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &uniform_group, &[]);
-            pass.set_bind_group(1, &texture_group, &[]);
-            pass.set_viewport(
-                call.viewport.x as f32,
-                call.viewport.y as f32,
-                call.viewport.width as f32,
-                call.viewport.height as f32,
-                0.0,
-                1.0,
-            );
-            pass.set_scissor_rect(scissor.0, scissor.1, scissor.2, scissor.3);
-            for (slot, (buffer, _, _)) in vertex_buffers.iter().enumerate() {
-                pass.set_vertex_buffer(slot as u32, buffer.slice(..));
-            }
-            let instances = 0..call.instances.unwrap_or(1);
-            match &index_buffer {
-                Some((buffer, format, first)) => {
-                    pass.set_index_buffer(buffer.slice(..), *format);
-                    pass.draw_indexed(*first..*first + call.count, 0, instances);
-                }
-                None => pass.draw(0..call.count, instances),
-            }
-        });
-    }
-}
-
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod tests {
-    use crate::core::*;
-
-    ///
-    /// A context on whatever adapter wgpu finds, a software renderer like lavapipe is enough.
-    /// Without any adapter the test is skipped, unless the environment variable `THREE_D_REQUIRE_WGPU` is set (as in CI).
-    ///
-    fn context() -> Option<Context> {
-        match Context::new_headless_wgpu() {
-            Ok(context) => Some(context),
-            Err(error) if std::env::var("THREE_D_REQUIRE_WGPU").is_ok() => {
-                panic!("no wgpu adapter: {error}")
-            }
-            Err(error) => {
-                eprintln!("skipped, no wgpu adapter: {error}");
-                None
-            }
+        pass.set_viewport(
+            call.viewport.x as f32,
+            call.viewport.y as f32,
+            call.viewport.width as f32,
+            call.viewport.height as f32,
+            0.0,
+            1.0,
+        );
+        pass.set_scissor_rect(scissor.0, scissor.1, scissor.2, scissor.3);
+        for (slot, buffer) in vertex_buffers.iter().enumerate() {
+            pass.set_vertex_buffer(slot as u32, buffer.slice(..));
         }
-    }
-
-    fn target_texture(context: &Context, width: u32, height: u32) -> Texture2D {
-        Texture2D::new_empty::<[u8; 4]>(
-            context,
-            width,
-            height,
-            Interpolation::Nearest,
-            Interpolation::Nearest,
-            None,
-            Wrapping::ClampToEdge,
-            Wrapping::ClampToEdge,
-        )
-    }
-
-    const VERTEX: &str = "
-        uniform mat4 transformation;
-        in vec3 position;
-        in vec4 color;
-        out vec4 col;
-        void main() { col = color; gl_Position = transformation * vec4(position, 1.0); }
-    ";
-    const FRAGMENT: &str = "
-        uniform vec3 tint;
-        in vec4 col;
-        layout (location = 0) out vec4 outColor;
-        void main() { outColor = col * vec4(tint, 1.0); }
-    ";
-
-    #[test]
-    fn context_is_wgpu() {
-        let Some(context) = context() else { return };
-        assert!(context.as_wgpu().is_some());
-        assert!(context.as_gl().is_none());
-    }
-
-    ///
-    /// The triangle of the `triangle_core` example: the result must have the orientation it has on OpenGL.
-    ///
-    #[test]
-    fn triangle() {
-        let Some(context) = context() else { return };
-        let positions = VertexBuffer::new_with_data(
-            &context,
-            &[
-                vec3(-0.5, -0.5, 0.0), // bottom left
-                vec3(0.5, -0.5, 0.0),  // bottom right
-                vec3(0.0, 0.5, 0.0),   // top
-            ],
-        );
-        let colors = VertexBuffer::new_with_data(
-            &context,
-            &[
-                vec4(0.0, 1.0, 0.0, 1.0f32),
-                vec4(1.0, 0.0, 0.0, 1.0),
-                vec4(0.0, 0.0, 1.0, 1.0),
-            ],
-        );
-        let program = Program::from_source(&context, VERTEX, FRAGMENT).unwrap();
-        assert!(program.requires_uniform("tint"));
-        assert!(!program.requires_uniform("unknown"));
-
-        let draw = |cull: Cull| -> Vec<[u8; 4]> {
-            let texture = target_texture(&context, 64, 64);
-            let target = texture.as_color_target(None);
-            target
-                .clear(ClearState::color(0.0, 0.0, 0.0, 1.0))
-                .write::<CoreError>(|| {
-                    program.use_uniform("transformation", Mat4::identity());
-                    program.use_uniform("tint", vec3(1.0, 1.0, 0.5));
-                    program.use_vertex_attribute("position", &positions);
-                    program.use_vertex_attribute("color", &colors);
-                    program.draw_arrays(
-                        RenderStates {
-                            cull,
-                            ..Default::default()
-                        },
-                        Viewport::new_at_origo(64, 64),
-                        3,
-                    );
-                    Ok(())
-                })
-                .unwrap();
-            target.read()
-        };
-
-        // read() returns the top row first
-        let pixels = draw(Cull::None);
-        let pixel = |x: usize, y_from_top: usize| pixels[y_from_top * 64 + x];
-        assert_eq!(pixel(1, 1), [0, 0, 0, 255], "background");
-        assert_eq!(pixel(32, 60), [0, 0, 0, 255], "below the triangle");
-        let top = pixel(32, 18);
-        assert!(
-            top[2] > 100 && top[0] < 60 && top[1] < 60,
-            "top is blue (times tint): {top:?}"
-        );
-        let right = pixel(46, 47);
-        assert!(
-            right[0] > 200 && right[1] < 60,
-            "bottom right is red: {right:?}"
-        );
-        let left = pixel(17, 47);
-        assert!(
-            left[1] > 200 && left[0] < 60,
-            "bottom left is green: {left:?}"
-        );
-
-        // The triangle is counter clockwise seen from the front, as on OpenGL
-        assert!(draw(Cull::Back) == pixels);
-        assert!(draw(Cull::Front).iter().all(|p| *p == [0, 0, 0, 255]));
-    }
-
-    ///
-    /// Depth range, depth test and an element buffer: a near quad in front of a far quad, drawn first.
-    ///
-    #[test]
-    fn depth_test_and_elements() {
-        let Some(context) = context() else { return };
-        let color = target_texture(&context, 16, 16);
-        let depth = DepthTexture2D::new::<f32>(
-            &context,
-            16,
-            16,
-            Wrapping::ClampToEdge,
-            Wrapping::ClampToEdge,
-        );
-        let quad = |z: f32, size: f32| {
-            VertexBuffer::new_with_data(
-                &context,
-                &[
-                    vec3(-size, -size, z),
-                    vec3(size, -size, z),
-                    vec3(size, size, z),
-                    vec3(-size, size, z),
-                ],
-            )
-        };
-        let elements = ElementBuffer::new_with_data(&context, &[0u16, 1, 2, 2, 3, 0]);
-        // 8 bit indices do not exist in wgpu and are widened by the backend
-        let elements_u8 = ElementBuffer::new_with_data(&context, &[0u8, 1, 2, 2, 3, 0]);
-        let (near, far) = (quad(-0.5, 0.5), quad(0.9, 1.0));
-        let white = VertexBuffer::new_with_data(&context, &[vec4(1.0, 1.0, 1.0, 1.0f32); 4]);
-        let program = Program::from_source(&context, VERTEX, FRAGMENT).unwrap();
-        let pixels: Vec<[u8; 4]> =
-            RenderTarget::new(color.as_color_target(None), depth.as_depth_target())
-                .clear(ClearState::color_and_depth(0.0, 0.0, 0.0, 1.0, 1.0))
-                .write::<CoreError>(|| {
-                    program.use_uniform("transformation", Mat4::identity());
-                    program.use_vertex_attribute("color", &white);
-                    // Near (z = -0.5 in normalized device coordinates of OpenGL) and small, red
-                    program.use_uniform("tint", vec3(1.0, 0.0, 0.0));
-                    program.use_vertex_attribute("position", &near);
-                    program.draw_elements(
-                        RenderStates::default(),
-                        Viewport::new_at_origo(16, 16),
-                        &elements,
-                    );
-                    // Far and large, green
-                    program.use_uniform("tint", vec3(0.0, 1.0, 0.0));
-                    program.use_vertex_attribute("position", &far);
-                    program.draw_elements(
-                        RenderStates::default(),
-                        Viewport::new_at_origo(16, 16),
-                        &elements_u8,
-                    );
-                    Ok(())
-                })
-                .unwrap()
-                .read_color();
-        assert_eq!(pixels[8 * 16 + 8], [255, 0, 0, 255], "the near quad wins");
-        assert_eq!(
-            pixels[0],
-            [0, 255, 0, 255],
-            "the far quad is visible around it"
-        );
-    }
-
-    ///
-    /// A texture is sampled with the same orientation as on OpenGL: the first row of the data is the top row and has v = 1.
-    ///
-    #[test]
-    fn texture_sampling() {
-        let Some(context) = context() else { return };
-        let source = Texture2D::new(
-            &context,
-            &CpuTexture {
-                data: TextureData::RgbU8(vec![
-                    [255, 0, 0],
-                    [0, 255, 0],
-                    [0, 0, 255],
-                    [255, 255, 0],
-                ]),
-                width: 2,
-                height: 2,
-                min_filter: Interpolation::Nearest,
-                mag_filter: Interpolation::Nearest,
-                mipmap: None,
-                wrap_s: Wrapping::ClampToEdge,
-                wrap_t: Wrapping::ClampToEdge,
-                ..Default::default()
-            },
-        );
-        let program = Program::from_source(
-            &context,
-            full_screen_vertex_shader_source(),
-            "
-                uniform sampler2D tex;
-                in vec2 uvs;
-                layout (location = 0) out vec4 outColor;
-                void main() { outColor = texture(tex, uvs); }
-            ",
-        )
-        .unwrap();
-        let texture = target_texture(&context, 2, 2);
-        let pixels: Vec<[u8; 4]> = texture
-            .as_color_target(None)
-            .write::<CoreError>(|| {
-                program.use_texture("tex", &source);
-                full_screen_draw(
-                    &context,
-                    &program,
-                    RenderStates::default(),
-                    Viewport::new_at_origo(2, 2),
-                );
-                Ok(())
-            })
-            .unwrap()
-            .read();
-        assert_eq!(
-            pixels,
-            [
-                [255, 0, 0, 255],
-                [0, 255, 0, 255],
-                [0, 0, 255, 255],
-                [255, 255, 0, 255]
-            ]
-        );
-    }
-
-    ///
-    /// The renderer module on top: a lit sphere with a physical material.
-    ///
-    #[test]
-    fn renderer_draws_lit_mesh() {
-        use crate::renderer::*;
-        let Some(context) = context() else { return };
-        let camera = Camera::new_perspective(
-            Viewport::new_at_origo(32, 32),
-            vec3(0.0, 0.0, 4.0),
-            vec3(0.0, 0.0, 0.0),
-            vec3(0.0, 1.0, 0.0),
-            degrees(45.0),
-            0.1,
-            10.0,
-        );
-        let sphere = Gm::new(
-            Mesh::new(&context, &CpuMesh::sphere(16)),
-            PhysicalMaterial::new_opaque(
-                &context,
-                &CpuMaterial {
-                    albedo: Srgba::RED,
-                    ..Default::default()
-                },
-            ),
-        );
-        // The light shines from the top
-        let light = DirectionalLight::new(&context, 2.0, Srgba::WHITE, vec3(0.0, -1.0, 0.0));
-        let color = target_texture(&context, 32, 32);
-        let depth = DepthTexture2D::new::<f32>(
-            &context,
-            32,
-            32,
-            Wrapping::ClampToEdge,
-            Wrapping::ClampToEdge,
-        );
-        let pixels: Vec<[u8; 4]> =
-            RenderTarget::new(color.as_color_target(None), depth.as_depth_target())
-                .clear(ClearState::color_and_depth(0.0, 0.0, 0.0, 1.0, 1.0))
-                .render(&camera, &sphere, &[&light])
-                .read_color();
-        let pixel = |x: usize, y_from_top: usize| pixels[y_from_top * 32 + x];
-        assert_eq!(pixel(0, 0), [0, 0, 0, 255], "background");
-        let (top, bottom) = (pixel(16, 8), pixel(16, 24));
-        assert!(
-            top[0] > 100 && top[1] < 30 && top[2] < 30,
-            "the top is lit and red: {top:?}"
-        );
-        assert!(
-            bottom[0] < top[0] / 2,
-            "the bottom is in the dark: {bottom:?}"
-        );
+        let instances = 0..call.instances.unwrap_or(1);
+        match (&index_buffer, call.indices) {
+            (Some((buffer, format)), Some(indices)) => {
+                pass.set_index_buffer(buffer.slice(..), *format);
+                pass.draw_indexed(indices.first..indices.first + call.count, 0, instances);
+            }
+            _ => pass.draw(0..call.count, instances),
+        }
     }
 }
