@@ -52,9 +52,14 @@ fn compare(tolerance: f32, scenario: impl Fn(&Context) -> Vec<f32>) {
         }
         eprintln!("skipped, no {what}: {error}");
     };
-    let expected = match gl_context() {
-        Ok((context, _keep_alive)) => scenario(&context),
-        Err(error) => return skip("OpenGL context", error),
+    let expected = {
+        // All tests share one EGL display, which is initialized and terminated with the contexts, so only one test at a time uses OpenGL
+        static OPENGL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _one_at_a_time = OPENGL.lock().unwrap_or_else(|e| e.into_inner());
+        match gl_context() {
+            Ok((context, _keep_alive)) => scenario(&context),
+            Err(error) => return skip("OpenGL context", error),
+        }
     };
     let actual = match Context::new_headless_wgpu() {
         Ok(context) => {
