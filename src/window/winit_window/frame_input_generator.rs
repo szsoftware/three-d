@@ -75,7 +75,7 @@ impl FrameInputGenerator {
         self.last_time = now;
 
         let frame_input = FrameInput {
-            events: self.events.drain(..).collect(),
+            events: std::mem::take(&mut self.events),
             elapsed_time,
             accumulated_time: self.accumulated_time,
             viewport: self.viewport,
