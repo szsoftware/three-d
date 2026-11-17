@@ -152,7 +152,7 @@ pub fn lights_shader_source(lights: &[&dyn Light]) -> String {
                 return color;
             }}
             ",
-        &dir_fun
+        dir_fun
     ));
     shader_source
 }
