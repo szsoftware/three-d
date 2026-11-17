@@ -302,7 +302,14 @@ fn deferred_stage(context: &Context, lighting: Option<[bool; 4]>) -> Vec<f32> {
         geometry_depth.as_depth_target(),
     )
     .clear(ClearState::default())
-    .render(&camera, &objects, &[]);
+    // Not `render`, which would run the whole deferred pipeline into this target
+    .write::<RendererError>(|| {
+        for object in &objects {
+            object.render(&camera, &[]);
+        }
+        Ok(())
+    })
+    .unwrap();
     let Some(chosen) = lighting else {
         let mut values = Vec::new();
         for layer in 0..3 {
