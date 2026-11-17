@@ -1,5 +1,5 @@
 //!
-//! The wgpu backend (work in progress, only available with the `wgpu` feature).
+//! The wgpu backend (only available with the `wgpu` feature). See `docs/wgpu-backend.md` for what users of the crate need to know.
 //!
 //! It covers everything the [core](crate::core) module needs: buffers, all kinds of textures including mipmaps,
 //! multisample targets, programs translated from GLSL (see [glsl]), draw calls, copies between targets, reading back colors and depth
@@ -110,6 +110,72 @@ struct TargetFormats {
     colors: Vec<w::TextureFormat>,
     depth: Option<w::TextureFormat>,
     samples: u32,
+}
+
+/// Pixels that are on their way from the GPU into memory.
+struct PendingRead {
+    device: w::Device,
+    buffer: w::Buffer,
+    /// Whether the buffer is mapped, and who waits for that.
+    mapped: Arc<Mutex<(bool, Option<std::task::Waker>)>>,
+    /// The size of a row in the buffer and without padding.
+    padded: usize,
+    unpadded: usize,
+    /// The type, the number of channels of the texels and the number of channels that are asked for.
+    convert: Option<(PrimitiveType, usize, usize)>,
+}
+
+impl PendingRead {
+    /// The pixels without padding. The buffer must be mapped.
+    fn finish(&self) -> Vec<u8> {
+        let data = self.buffer.slice(..).get_mapped_range();
+        let mut tight = Vec::with_capacity(self.unpadded * (data.len() / self.padded));
+        for row in data.chunks_exact(self.padded) {
+            tight.extend_from_slice(&row[..self.unpadded]);
+        }
+        drop(data);
+        self.buffer.unmap();
+        match self.convert {
+            Some((primitive, channels, wanted)) => {
+                convert_channels(&tight, primitive, channels, wanted)
+            }
+            None => tight,
+        }
+    }
+
+    /// Blocks until the pixels are there, which is not possible in a browser.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    fn wait(self) -> Vec<u8> {
+        self.device
+            .poll(w::PollType::wait_indefinitely())
+            .expect("failed to wait for the GPU");
+        self.finish()
+    }
+}
+
+impl std::future::Future for PendingRead {
+    type Output = Vec<u8>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Vec<u8>> {
+        // A browser maps the buffer by itself and then calls the waker, everywhere else the device has to be asked to do it
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.mapped.lock().unwrap_or_else(|e| e.into_inner()).0 {
+            self.device
+                .poll(w::PollType::wait_indefinitely())
+                .expect("failed to wait for the GPU");
+        }
+        let mut mapped = self.mapped.lock().unwrap_or_else(|e| e.into_inner());
+        if mapped.0 {
+            drop(mapped);
+            std::task::Poll::Ready(self.finish())
+        } else {
+            mapped.1 = Some(context.waker().clone());
+            std::task::Poll::Pending
+        }
+    }
 }
 
 /// One mip level of one layer of a texture.
@@ -627,15 +693,15 @@ impl WgpuBackend {
     }
 
     ///
-    /// Copies a rectangle of a texture with the given size of a texel into memory, without padding.
+    /// Starts to copy a rectangle of a texture with the given size of a texel into memory.
     ///
-    fn read_texture(
+    fn start_read(
         &self,
         state: &mut State,
         source: &Slice,
         rect: ScissorBox,
         texel_size: usize,
-    ) -> Vec<u8> {
+    ) -> PendingRead {
         let unpadded = rect.width as usize * texel_size;
         let padded = unpadded.next_multiple_of(w::COPY_BYTES_PER_ROW_ALIGNMENT as usize);
         let buffer = self.device.create_buffer(&w::BufferDescriptor {
@@ -670,22 +736,38 @@ impl WgpuBackend {
             },
         );
         self.flush(state);
-        let slice = buffer.slice(..);
-        slice.map_async(w::MapMode::Read, |result| {
-            result.expect("failed to map the buffer for reading pixels")
+        let mapped = Arc::new(Mutex::new((false, None::<std::task::Waker>)));
+        let shared = mapped.clone();
+        buffer.slice(..).map_async(w::MapMode::Read, move |result| {
+            result.expect("failed to map the buffer for reading pixels");
+            let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
+            shared.0 = true;
+            if let Some(waker) = shared.1.take() {
+                waker.wake();
+            }
         });
-        // Blocks until the buffer is mapped
-        self.device
-            .poll(w::PollType::wait_indefinitely())
-            .expect("failed to wait for the GPU");
-        let data = slice.get_mapped_range();
-        let mut tight = Vec::with_capacity(unpadded * rect.height as usize);
-        for row in data.chunks_exact(padded) {
-            tight.extend_from_slice(&row[..unpadded]);
+        PendingRead {
+            device: self.device.clone(),
+            buffer,
+            mapped,
+            padded,
+            unpadded,
+            convert: None,
         }
-        drop(data);
-        buffer.unmap();
-        tight
+    }
+
+    ///
+    /// Copies a rectangle of a texture with the given size of a texel into memory, without padding.
+    ///
+    #[cfg(test)]
+    fn read_texture(
+        &self,
+        state: &mut State,
+        source: &Slice,
+        rect: ScissorBox,
+        texel_size: usize,
+    ) -> Vec<u8> {
+        self.start_read(state, source, rect, texel_size).wait()
     }
 
     /// A texture with one sample that the builtin passes can render into and that can be read back.
@@ -1196,7 +1278,12 @@ fn texture_view_dimension(glsl_type: &str) -> w::TextureViewDimension {
 impl BackendApi for WgpuBackend {
     // The render states are part of every draw call, the global state of OpenGL does not exist here.
     fn set_viewport(&self, _viewport: Viewport) {}
-    fn set_scissor(&self, _scissor_box: ScissorBox) {}
+    fn set_scissor(&self, scissor_box: ScissorBox) {
+        // As on OpenGL, this replaces the scissor box of the render target that is written to
+        if let Some((_, scissor)) = self.lock().passes.last_mut() {
+            *scissor = scissor_box;
+        }
+    }
     fn set_cull(&self, _cull: Cull) {}
     fn set_write_mask(&self, _write_mask: WriteMask) {}
     fn set_depth_test(&self, _depth_test: DepthTest) {}
@@ -1582,51 +1669,19 @@ impl BackendApi for WgpuBackend {
 
     fn read_pixels(&self, source: &PassTarget, rect: ScissorBox, format: ReadFormat) -> Vec<u8> {
         if cfg!(target_arch = "wasm32") {
-            // A browser cannot block until the pixels are there, it needs asynchronous read functions which follow in a later stage
-            unsupported("reading pixels synchronously in the browser");
+            // A browser cannot block until the pixels are there
+            unsupported("reading pixels synchronously in the browser, use the asynchronous functions like RenderTarget::read_color_async or pick_async instead");
         }
-        let state = &mut *self.lock();
-        match format {
-            ReadFormat::Color(format) => {
-                let mut slice = self
-                    .color_slices(state, source)
-                    .into_iter()
-                    .next()
-                    .expect("the target that is read from has no color");
-                if slice.texture.sample_count() > 1 {
-                    let resolved =
-                        self.temporary_texture(slice.texture.format(), source.width, source.height);
-                    self.resolve_color(state, &slice, &resolved);
-                    slice = resolved;
-                }
-                let (primitive, channels) = texel_layout(slice.texture.format());
-                if primitive != format.primitive {
-                    unsupported("reading pixels as another type than the texture has");
-                }
-                let tight =
-                    self.read_texture(state, &slice, rect, channels * primitive_size(primitive));
-                convert_channels(&tight, primitive, channels, format.channels as usize)
-            }
-            ReadFormat::Depth => {
-                let slice = self
-                    .depth_slice(state, source)
-                    .expect("the target that is read from has no depth");
-                // Not every depth format can be copied into a buffer, so the depth is drawn into a color texture first
-                let color =
-                    self.temporary_texture(w::TextureFormat::R32Float, source.width, source.height);
-                self.builtin_pass(
-                    state,
-                    builtin::Kind::DepthToColor {
-                        multisampled: slice.texture.sample_count() > 1,
-                    },
-                    &slice.view(),
-                    &color.view(),
-                    w::TextureFormat::R32Float,
-                    None,
-                );
-                self.read_texture(state, &color, rect, 4)
-            }
-        }
+        self.start_read_pixels(source, rect, format).wait()
+    }
+
+    fn read_pixels_async(
+        &self,
+        source: &PassTarget,
+        rect: ScissorBox,
+        format: ReadFormat,
+    ) -> PixelsFuture {
+        Box::pin(self.start_read_pixels(source, rect, format))
     }
 
     fn create_program(
@@ -2352,6 +2407,60 @@ impl BackendApi for WgpuBackend {
                 pass.draw_indexed(indices.first..indices.first + call.count, 0, instances);
             }
             _ => pass.draw(0..call.count, instances),
+        }
+    }
+}
+
+impl WgpuBackend {
+    /// Records the commands that copy the pixels and submits them.
+    fn start_read_pixels(
+        &self,
+        source: &PassTarget,
+        rect: ScissorBox,
+        format: ReadFormat,
+    ) -> PendingRead {
+        let state = &mut *self.lock();
+        match format {
+            ReadFormat::Color(format) => {
+                let mut slice = self
+                    .color_slices(state, source)
+                    .into_iter()
+                    .next()
+                    .expect("the target that is read from has no color");
+                if slice.texture.sample_count() > 1 {
+                    let resolved =
+                        self.temporary_texture(slice.texture.format(), source.width, source.height);
+                    self.resolve_color(state, &slice, &resolved);
+                    slice = resolved;
+                }
+                let (primitive, channels) = texel_layout(slice.texture.format());
+                if primitive != format.primitive {
+                    unsupported("reading pixels as another type than the texture has");
+                }
+                let mut read =
+                    self.start_read(state, &slice, rect, channels * primitive_size(primitive));
+                read.convert = Some((primitive, channels, format.channels as usize));
+                read
+            }
+            ReadFormat::Depth => {
+                let slice = self
+                    .depth_slice(state, source)
+                    .expect("the target that is read from has no depth");
+                // Not every depth format can be copied into a buffer, so the depth is drawn into a color texture first
+                let color =
+                    self.temporary_texture(w::TextureFormat::R32Float, source.width, source.height);
+                self.builtin_pass(
+                    state,
+                    builtin::Kind::DepthToColor {
+                        multisampled: slice.texture.sample_count() > 1,
+                    },
+                    &slice.view(),
+                    &color.view(),
+                    w::TextureFormat::R32Float,
+                    None,
+                );
+                self.start_read(state, &color, rect, 4)
+            }
         }
     }
 }

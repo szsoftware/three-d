@@ -627,6 +627,76 @@ pub fn ray_intersect(
     geometries: impl IntoIterator<Item = impl Geometry>,
     culling: Cull,
 ) -> Result<Option<IntersectionResult>, RendererError> {
+    let texture =
+        ray_intersect_texture(context, position, direction, max_depth, geometries, culling)?;
+    let result = texture.as_color_target(None).read::<[f32; 4]>()[0];
+    Ok(intersection_result(result, position, direction, max_depth))
+}
+
+///
+/// Finds the closest intersection like [ray_intersect], but returns the result as a future.
+/// This is the only way to do it with the wgpu backend in a browser, see [pick_async].
+///
+pub fn ray_intersect_async(
+    context: &Context,
+    position: Vec3,
+    direction: Vec3,
+    max_depth: f32,
+    geometries: impl IntoIterator<Item = impl Geometry>,
+    culling: Cull,
+) -> impl std::future::Future<Output = Result<Option<IntersectionResult>, RendererError>> + 'static
+{
+    let pixels =
+        ray_intersect_texture(context, position, direction, max_depth, geometries, culling)
+            .map(|texture| texture.as_color_target(None).read_async::<[f32; 4]>());
+    async move {
+        Ok(intersection_result(
+            pixels?.await[0],
+            position,
+            direction,
+            max_depth,
+        ))
+    }
+}
+
+///
+/// Finds the closest intersection between a ray from the given camera in the given pixel coordinate and the given geometries
+/// like [pick], but returns the result as a future.
+///
+/// This is the only way to pick with the wgpu backend in a browser (WebGPU), which cannot wait for the GPU.
+/// It works with every backend and on every platform. Where the result can be waited for, the future is ready at once.
+/// The geometries are rendered when this function is called, so the future does not borrow them
+/// and can be handed to something like `wasm_bindgen_futures::spawn_local`.
+///
+pub fn pick_async(
+    context: &Context,
+    camera: &three_d_asset::Camera,
+    pixel: impl Into<PhysicalPoint> + Copy,
+    geometries: impl IntoIterator<Item = impl Geometry>,
+    culling: Cull,
+) -> impl std::future::Future<Output = Result<Option<IntersectionResult>, RendererError>> + 'static
+{
+    let pos = camera.position_at_pixel(pixel);
+    let dir = camera.view_direction_at_pixel(pixel);
+    ray_intersect_async(
+        context,
+        pos + dir * camera.z_near(),
+        dir,
+        camera.z_far() - camera.z_near(),
+        geometries,
+        culling,
+    )
+}
+
+/// Renders the depth and the ids of what the ray hits first into a texture with one pixel.
+fn ray_intersect_texture(
+    context: &Context,
+    position: Vec3,
+    direction: Vec3,
+    max_depth: f32,
+    geometries: impl IntoIterator<Item = impl Geometry>,
+    culling: Cull,
+) -> Result<Texture2D, RendererError> {
     use crate::core::*;
     let viewport = Viewport::new_at_origo(1, 1);
     let up = if direction.dot(vec3(1.0, 0.0, 0.0)).abs() > 0.99 {
@@ -664,7 +734,7 @@ pub fn ray_intersect(
         ..Default::default()
     };
     material.render_states.cull = culling;
-    let result = RenderTarget::new(
+    RenderTarget::new(
         texture.as_color_target(None),
         depth_texture.as_depth_target(),
     )
@@ -675,17 +745,26 @@ pub fn ray_intersect(
             render_with_material(context, &camera, &geometry, &material, &[])?;
         }
         Ok(())
-    })?
-    .read_color::<[f32; 4]>()[0];
+    })?;
+    Ok(texture)
+}
+
+/// The meaning of the pixel rendered by [ray_intersect_texture].
+fn intersection_result(
+    result: [f32; 4],
+    position: Vec3,
+    direction: Vec3,
+    max_depth: f32,
+) -> Option<IntersectionResult> {
     let depth = result[0];
     if depth < 1.0 {
-        Ok(Some(IntersectionResult {
+        Some(IntersectionResult {
             position: position + direction * depth * max_depth,
             geometry_id: result[1].to_bits(),
             instance_id: result[2].to_bits(),
-        }))
+        })
     } else {
-        Ok(None)
+        None
     }
 }
 

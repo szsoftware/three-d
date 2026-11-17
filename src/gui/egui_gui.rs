@@ -10,20 +10,45 @@ pub use egui;
 /// Integration of [egui](https://crates.io/crates/egui), an immediate mode GUI.
 ///
 pub struct GUI {
-    painter: RefCell<Painter>,
+    painter: GuiPainter,
     egui_context: egui::Context,
     output: RefCell<Option<egui::FullOutput>>,
     viewport: Viewport,
     modifiers: Modifiers,
 }
 
+/// What draws the GUI.
+enum GuiPainter {
+    /// The painter of `egui_glow` for the OpenGL/WebGL backend.
+    Glow(RefCell<Painter>),
+    /// The painter for all other backends.
+    Core(RefCell<super::core_painter::CorePainter>),
+}
+
 impl GUI {
     ///
     /// Creates a new GUI from a mid-level [Context].
+    /// The GUI works with every backend of the context. With another backend than OpenGL/WebGL,
+    /// paint callbacks of [egui] are not supported, since they draw with the API of a specific backend.
     ///
     pub fn new(context: &Context) -> Self {
-        use std::ops::Deref;
-        Self::from_gl_context(context.deref().clone())
+        match context.as_gl() {
+            Some(gl) => Self::from_gl_context(gl.clone()),
+            None => Self::new_with_core_painter(context),
+        }
+    }
+
+    /// Creates a new GUI which is drawn with the [core](crate::core) module instead of `egui_glow`.
+    pub(crate) fn new_with_core_painter(context: &Context) -> Self {
+        GUI {
+            egui_context: egui::Context::default(),
+            painter: GuiPainter::Core(RefCell::new(
+                super::core_painter::CorePainter::new(context).unwrap(),
+            )),
+            output: RefCell::new(None),
+            viewport: Viewport::new_at_origo(1, 1),
+            modifiers: Modifiers::default(),
+        }
     }
 
     ///
@@ -32,7 +57,7 @@ impl GUI {
     pub fn from_gl_context(context: std::sync::Arc<crate::context::Context>) -> Self {
         GUI {
             egui_context: egui::Context::default(),
-            painter: RefCell::new(Painter::new(context, "", None, true).unwrap()),
+            painter: GuiPainter::Glow(RefCell::new(Painter::new(context, "", None, true).unwrap())),
             output: RefCell::new(None),
             viewport: Viewport::new_at_origo(1, 1),
             modifiers: Modifiers::default(),
@@ -271,7 +296,19 @@ impl GUI {
             .expect("need to call GUI::update before GUI::render");
         let scale = self.egui_context.pixels_per_point();
         let clipped_meshes = self.egui_context.tessellate(output.shapes, scale);
-        self.painter.borrow_mut().paint_and_update_textures(
+        let painter = match &self.painter {
+            GuiPainter::Glow(painter) => painter,
+            GuiPainter::Core(painter) => {
+                painter.borrow_mut().paint_and_update_textures(
+                    self.viewport,
+                    scale,
+                    &clipped_meshes,
+                    &output.textures_delta,
+                );
+                return Ok(());
+            }
+        };
+        painter.borrow_mut().paint_and_update_textures(
             [self.viewport.width, self.viewport.height],
             scale,
             &clipped_meshes,
@@ -281,7 +318,7 @@ impl GUI {
         #[allow(unsafe_code)]
         unsafe {
             use glow::HasContext as _;
-            self.painter.borrow().gl().disable(glow::FRAMEBUFFER_SRGB);
+            painter.borrow().gl().disable(glow::FRAMEBUFFER_SRGB);
         }
         Ok(())
     }
@@ -289,7 +326,9 @@ impl GUI {
 
 impl Drop for GUI {
     fn drop(&mut self) {
-        self.painter.borrow_mut().destroy();
+        if let GuiPainter::Glow(painter) = &self.painter {
+            painter.borrow_mut().destroy();
+        }
     }
 }
 

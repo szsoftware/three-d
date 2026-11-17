@@ -11,7 +11,7 @@ use glutin::context::{ContextApi, ContextAttributesBuilder, Version};
 use glutin::prelude::*;
 
 /// An OpenGL context without a window and what keeps it alive.
-fn gl_context() -> Result<(Context, impl Sized), String> {
+pub(super) fn gl_context() -> Result<(Context, impl Sized), String> {
     let error = |e: glutin::error::Error| e.to_string();
     let devices: Vec<Device> = Device::query_devices()
         .map_err(|e| e.to_string())?

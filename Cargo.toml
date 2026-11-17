@@ -21,7 +21,7 @@ default = ["window"]
 window = ["glutin", "winit", "raw-window-handle", "wasm-bindgen", "serde", "serde-wasm-bindgen", "web-sys"] # Window module
 egui-gui = ["egui_glow", "egui"] # Additional GUI features 
 text = ["swash", "lyon"] # Text mesh generation features
-wgpu = ["dep:wgpu", "dep:naga", "dep:pollster"] # Additional wgpu backend (work in progress), OpenGL/WebGL stays the default
+wgpu = ["dep:wgpu", "dep:naga", "dep:pollster"] # Additional wgpu backend (see docs/wgpu-backend.md), OpenGL/WebGL stays the default
 
 [dependencies]
 glow = "0.17"

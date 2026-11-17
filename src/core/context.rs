@@ -53,8 +53,9 @@ impl Context {
     ///
     /// Creates a new context which uses the wgpu backend with the given device and queue, for example if another part of the application also uses wgpu.
     ///
-    /// **Note:** The wgpu backend is work in progress. It supports the functionality of the [core](crate::core) module except
-    /// reading pixels in the browser, which panics with a message. The OpenGL/WebGL backend is not affected.
+    /// The wgpu backend supports the functionality of the [core](crate::core) and [renderer](crate::renderer) modules.
+    /// In a browser, pixels can only be read with the asynchronous functions like [RenderTarget::read_color_async].
+    /// Functionality that hands out raw OpenGL objects panics with a message. The OpenGL/WebGL backend is not affected by any of this.
     /// A context created with this function has no screen, render into textures instead.
     /// Errors of a device that is given to this function are reported to the error handler of that device, not by [Context::error_check].
     ///
@@ -70,7 +71,7 @@ impl Context {
     /// Creates a new context which uses the wgpu backend without a window, for example for tests or for rendering on a server.
     /// Render into textures by using [Texture2D::as_color_target] and read the result with [RenderTarget::read_color].
     ///
-    /// **Note:** The wgpu backend is work in progress, see [Context::from_wgpu].
+    /// See [Context::from_wgpu] for what is different with the wgpu backend.
     ///
     #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
     #[cfg_attr(docsrs, doc(cfg(feature = "wgpu")))]

@@ -147,6 +147,28 @@ impl<'a> ColorTarget<'a> {
     }
 
     ///
+    /// Returns the colors of the pixels in this color target like [ColorTarget::read], but as a future.
+    /// This is the only way to read pixels with the wgpu backend in a browser, see [RenderTarget::read_color_async].
+    ///
+    pub fn read_async<T: TextureDataType>(
+        &self,
+    ) -> impl std::future::Future<Output = Vec<T>> + 'static {
+        self.read_partially_async(self.scissor_box())
+    }
+
+    ///
+    /// Returns the colors of the pixels in this color target inside the given scissor box like [ColorTarget::read_partially],
+    /// but as a future, see [RenderTarget::read_color_async].
+    ///
+    pub fn read_partially_async<T: TextureDataType>(
+        &self,
+        scissor_box: ScissorBox,
+    ) -> impl std::future::Future<Output = Vec<T>> + 'static {
+        self.as_render_target()
+            .read_color_partially_async(scissor_box)
+    }
+
+    ///
     /// Returns the width of the color target in texels.
     /// If using the zero mip level of the underlying texture, then this is simply the width of that texture, otherwise it is the width of the given mip level.
     ///
