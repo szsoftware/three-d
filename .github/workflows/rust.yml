@@ -67,6 +67,14 @@ jobs:
         shell: bash
         run: echo "THREE_D_EXPECT_BACKEND=dx12" >> $GITHUB_ENV
 
+      # The shader compiler Windows comes with (FXC) fails on shaders that sample a texture in a loop, so the tests use the new one (DXC) of the Windows SDK, which wgpu finds on the PATH
+      - if: startsWith(matrix.os, 'windows')
+        shell: bash
+        run: |
+          dxc=$(ls -d "/c/Program Files (x86)/Windows Kits/10/bin/"*/x64/dxcompiler.dll | sort -V | tail -1)
+          echo "Using $dxc"
+          cygpath -w "$(dirname "$dxc")" >> $GITHUB_PATH
+
       - name: Graphics adapter of the tests
         shell: bash
         run: echo "THREE_D_REQUIRE_WGPU=1" >> $GITHUB_ENV && THREE_D_REQUIRE_WGPU=1 cargo test --all-features --lib adapter_is_the_expected_one -- --nocapture

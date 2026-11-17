@@ -57,6 +57,7 @@ The images are the same as with OpenGL within a few steps of 255 per channel. Th
 - **Float textures** with 32 bits are filtered linearly only if the adapter supports it (`FLOAT32_FILTERABLE`), otherwise with the nearest texel.
 - **Errors.** For a context created by `three-d`, validation errors are collected and returned by `Context::error_check` (at most 64 between two checks). For `Context::from_wgpu` they go to the error handler of your device.
 - **Custom GLSL.** The translation handles what the shaders of `three-d` and its examples use. A construct it does not know gives a `CoreError::ShaderCompilation` that names it, when the program is created. Known limits: no arrays of samplers, no arrays as inputs or outputs of a shader stage, and a function with a sampler parameter can only be called with the name of a sampler. Shaders are written without a version line, as for OpenGL.
+- **DirectX 12 needs the DXC shader compiler for some shaders.** Windows comes with an old shader compiler (FXC), which fails on shaders that sample a texture inside a loop. Of `three-d` itself that are the volume materials (`IsosurfaceMaterial` and the ray marching of voxel grids) and `WaterMaterial`, the error is `unable to unroll loop`. With the new compiler (DXC) they work. Either put `dxcompiler.dll` (from the [DXC releases](https://github.com/microsoft/DirectXShaderCompiler/releases), version 1.8.2502 or newer) next to your program, it is found by itself, or add `wgpu` in the version `three-d` uses to your own `Cargo.toml` with its feature `static-dxc`, which builds DXC into your program (that build downloads a prebuilt library and is not available for Windows on ARM).
 - **Not there yet:** rendering into a texture view of another wgpu application.
 
 ## Shaders in WGSL
@@ -169,7 +170,7 @@ fn run(@builtin(global_invocation_id) id: vec3<u32>) {
 - Automatically on every pull request:
   - Linux: Vulkan (lavapipe) against OpenGL (llvmpipe), both software renderers. Every test scene is drawn with both backends and the images are compared.
   - macOS: Metal, on the virtual GPU of the build machine. The images are compared with what OpenGL returned on Linux (stored in `src/core/backend/wgpu/reference`).
-  - Windows: DirectX 12, on the software adapter of Windows (WARP), compared in the same way.
+  - Windows: DirectX 12 with the DXC shader compiler, on the software adapter of Windows (WARP), compared in the same way.
   - Build for the web, and API compatibility with upstream (`cargo semver-checks`).
 - By hand: a real window on Linux (X11), Chromium with WebGPU and the fallback to WebGL2.
 - Not tested yet: real GPUs, Safari, Android.

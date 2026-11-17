@@ -266,6 +266,116 @@ fn physical_material_and_lights() {
     });
 }
 
+/// The two stages of the deferred pipeline, for the tests below: what the geometry pass stores, or the lighting pass with the chosen lights.
+fn deferred_stage(context: &Context, lighting: Option<[bool; 4]>) -> Vec<f32> {
+    let camera = camera();
+    let (ambient, mut directional, point, mut spot) = lights(context);
+    let objects: Vec<_> = shapes(context)
+        .into_iter()
+        .map(|mesh| {
+            Gm::new(
+                mesh,
+                DeferredPhysicalMaterial::new(context, &textured_material()),
+            )
+        })
+        .collect();
+    directional
+        .generate_shadow_map(128, objects.iter().map(|o| &o.geometry))
+        .unwrap();
+    spot.generate_shadow_map(128, objects.iter().map(|o| &o.geometry))
+        .unwrap();
+    let geometry = Texture2DArray::new_empty::<[u8; 4]>(
+        context,
+        SIZE,
+        SIZE,
+        3,
+        Interpolation::Nearest,
+        Interpolation::Nearest,
+        None,
+        Wrapping::ClampToEdge,
+        Wrapping::ClampToEdge,
+    );
+    let geometry_depth = depth_texture::<f32>(context, SIZE, SIZE);
+    let layers = [0, 1, 2];
+    RenderTarget::new(
+        geometry.as_color_target(&layers, None),
+        geometry_depth.as_depth_target(),
+    )
+    .clear(ClearState::default())
+    .render(&camera, &objects, &[]);
+    let Some(chosen) = lighting else {
+        let mut values = Vec::new();
+        for layer in 0..3 {
+            values.extend(floats(geometry.as_color_target(&[layer], None).read()));
+        }
+        values.extend(
+            RenderTarget::new(
+                geometry.as_color_target(&[0], None),
+                geometry_depth.as_depth_target(),
+            )
+            .read_depth(),
+        );
+        return values;
+    };
+    let all: [&dyn Light; 4] = [&ambient, &directional, &point, &spot];
+    let lights: Vec<&dyn Light> = all
+        .into_iter()
+        .zip(chosen)
+        .filter(|(_, chosen)| *chosen)
+        .map(|(light, _)| light)
+        .collect();
+    render(context, |target| {
+        target
+            .write::<RendererError>(|| {
+                DeferredPhysicalMaterial::lighting_pass(
+                    context,
+                    &camera,
+                    ColorTexture::Array {
+                        texture: &geometry,
+                        layers: &layers,
+                    },
+                    DepthTexture::Single(&geometry_depth),
+                    &lights,
+                );
+                Ok(())
+            })
+            .unwrap();
+    })
+}
+
+#[test]
+fn deferred_geometry_pass() {
+    compare(4.0 * STEP, |context| deferred_stage(context, None));
+}
+
+#[test]
+fn deferred_lighting_with_ambient_light() {
+    compare(4.0 * STEP, |context| {
+        deferred_stage(context, Some([true, false, false, false]))
+    });
+}
+
+#[test]
+fn deferred_lighting_with_directional_light_and_shadow() {
+    compare(4.0 * STEP, |context| {
+        deferred_stage(context, Some([false, true, false, false]))
+    });
+}
+
+#[test]
+fn deferred_lighting_with_point_light() {
+    compare(4.0 * STEP, |context| {
+        deferred_stage(context, Some([false, false, true, false]))
+    });
+}
+
+#[test]
+fn deferred_lighting_with_spot_light_and_shadow() {
+    compare(4.0 * STEP, |context| {
+        deferred_stage(context, Some([false, false, false, true]))
+    });
+}
+
 /// Examples environment, pbr: a sky box and lighting from an environment map.
 #[test]
 fn environment_lighting_and_skybox() {
