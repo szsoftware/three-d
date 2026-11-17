@@ -157,6 +157,7 @@ fn reference_file() -> std::path::PathBuf {
 }
 
 /// Values that are a multiple of 1/255 are stored as one byte each (after a 0), everything else as `f32` (after a 1).
+#[cfg(target_os = "linux")]
 fn encode(values: &[f32]) -> Vec<u8> {
     let bytes: Vec<u8> = values.iter().map(|v| (v * 255.0).round() as u8).collect();
     if bytes
