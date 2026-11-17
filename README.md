@@ -75,6 +75,10 @@ The crate consist of three main modules for drawing, `context`, `core` and `rend
 
 In addition, the [three-d-asset](https://github.com/asny/three-d-asset) crate enables loading, deserializing, serializing and saving 3D assets, for example 3D models, textures etc. Please make sure to use the same version of [three-d-asset](https://github.com/asny/three-d-asset) as defined in the `Cargo.toml`.
 
+### wgpu backend (this fork)
+
+This fork can also render with [wgpu](https://wgpu.rs) (Vulkan, Metal, DirectX 12 and WebGPU) through the optional `wgpu` feature. OpenGL/WebGL stays the default and compatible with upstream. See [docs/wgpu-backend.md](docs/wgpu-backend.md).
+
 ### [Examples](https://github.com/asny/three-d/tree/master/examples)
 
 ![PBR example](https://asny.github.io/three-d/0.20/pbr.png)

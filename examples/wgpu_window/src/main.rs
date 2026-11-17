@@ -71,12 +71,49 @@ pub fn run(window: Window) {
     sphere.set_transformation(Mat4::from_translation(vec3(0.0, 1.6, 0.0)) * Mat4::from_scale(0.6));
     let axes = Axes::new(&context, 0.05, 2.5);
 
+    // A click on an object puts a marker on it. That needs reading pixels back from the GPU
+    let mut marker = Gm::new(
+        Mesh::new(&context, &CpuMesh::sphere(16)),
+        ColorMaterial {
+            color: Srgba::new(255, 255, 0, 255),
+            ..Default::default()
+        },
+    );
+    let picked = std::rc::Rc::new(std::cell::RefCell::new(None::<Vec3>));
+
     let ambient = AmbientLight::new(&context, 0.3, Srgba::WHITE);
     let mut directional =
         DirectionalLight::new(&context, 3.0, Srgba::WHITE, vec3(-1.0, -2.0, -1.5));
 
     window.render_loop(move |mut frame_input| {
         camera.set_viewport(frame_input.viewport);
+        for event in frame_input.events.iter() {
+            if let Event::MousePress {
+                button: MouseButton::Left,
+                position,
+                ..
+            } = event
+            {
+                let geometries = cube.into_iter().chain(&sphere);
+                // WebGPU cannot wait for the GPU, so a browser needs the asynchronous variant.
+                // It works with every backend on every platform, the blocking variant is just simpler to use.
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let hit = pick(&context, &camera, *position, geometries, Cull::Back).unwrap();
+                    *picked.borrow_mut() = hit.map(|hit| hit.position);
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let hit = pick_async(&context, &camera, *position, geometries, Cull::Back);
+                    let picked = picked.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let hit = hit.await.unwrap();
+                        log::info!("picked {:?}", hit.map(|hit| hit.position));
+                        *picked.borrow_mut() = hit.map(|hit| hit.position);
+                    });
+                }
+            }
+        }
         control.handle_events(&mut camera, &mut frame_input.events);
         cube.animate(frame_input.accumulated_time as f32);
         directional
@@ -91,6 +128,10 @@ pub fn run(window: Window) {
                 cube.into_iter().chain(&sphere).chain(&axes),
                 &[&ambient, &directional],
             );
+        if let Some(position) = *picked.borrow() {
+            marker.set_transformation(Mat4::from_translation(position) * Mat4::from_scale(0.08));
+            frame_input.screen().render(&camera, &marker, &[]);
+        }
 
         FrameOutput::default()
     });

@@ -189,6 +189,58 @@ impl<'a> RenderTarget<'a> {
     }
 
     ///
+    /// Returns the colors of the pixels in this render target like [RenderTarget::read_color], but as a future.
+    ///
+    /// This is the only way to read pixels with the wgpu backend in a browser (WebGPU), which cannot wait for the GPU.
+    /// It works with every backend and on every platform, so it can be used in code that should run everywhere.
+    /// Where the pixels can be waited for, the future is ready at once.
+    ///
+    /// The future contains the pixels of the render target at the time this function is called, even if the render target changes
+    /// or is dropped before the future is awaited. The notes of [RenderTarget::read_color] about the generic parameter `T` apply,
+    /// the limits on web only for the OpenGL/WebGL backend.
+    ///
+    pub fn read_color_async<T: TextureDataType>(
+        &self,
+    ) -> impl std::future::Future<Output = Vec<T>> + 'static {
+        self.read_color_partially_async(self.scissor_box())
+    }
+
+    ///
+    /// Returns the colors of the pixels in this render target inside the given scissor box like [RenderTarget::read_color_partially],
+    /// but as a future, see [RenderTarget::read_color_async].
+    ///
+    pub fn read_color_partially_async<T: TextureDataType>(
+        &self,
+        scissor_box: ScissorBox,
+    ) -> impl std::future::Future<Output = Vec<T>> + 'static {
+        if self.id.is_some() && self.color.is_none() {
+            panic!("Cannot read color from a render target without a color target");
+        }
+        #[cfg(target_arch = "wasm32")]
+        if self.context.as_gl().is_some()
+            && (T::size() != 4
+                || !(T::primitive_type() == backend::PrimitiveType::U8
+                    || T::primitive_type() == backend::PrimitiveType::F32))
+        {
+            panic!("Only the texture data types `Vec4<T>` and `[T; 4]` where `T` is either `u8` or `f32` are supported when reading color from a render target on web.");
+        }
+        let bytes = self.context.backend().read_pixels_async(
+            &self.pass_target(),
+            scissor_box,
+            backend::ReadFormat::Color(backend::ColorFormat::of::<T>()),
+        );
+        async move {
+            let mut pixels = from_byte_slice(&bytes.await).to_vec();
+            flip_y(
+                &mut pixels,
+                scissor_box.width as usize,
+                scissor_box.height as usize,
+            );
+            pixels
+        }
+    }
+
+    ///
     /// Returns the depth values in this render target.
     ///
     #[cfg(not(target_arch = "wasm32"))]

@@ -8,7 +8,7 @@
 //! so that other backends can be added later without changing the public API.
 //!
 //! The default backend is [gl], which contains the OpenGL/WebGL code that used to live directly in the public types.
-//! With the `wgpu` feature there is a second backend, `wgpu`, which is work in progress.
+//! With the `wgpu` feature there is a second backend, `wgpu`.
 //! In tests there is an additional recording backend without a GPU, see `null`.
 //!
 
@@ -392,6 +392,9 @@ pub(crate) struct CopyMask {
 }
 
 ///
+/// The pixels that are read by [BackendApi::read_pixels_async].
+pub(crate) type PixelsFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>>>>;
+
 /// The format of the data returned by [BackendApi::read_pixels].
 ///
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -505,6 +508,16 @@ pub(crate) trait BackendApi {
     fn copy_target(&self, source: &PassTarget, destination: &PassTarget, mask: CopyMask);
     /// Reads pixels inside the rectangle, bottom row first.
     fn read_pixels(&self, source: &PassTarget, rect: ScissorBox, format: ReadFormat) -> Vec<u8>;
+    /// The same as [BackendApi::read_pixels] for backends that cannot wait for the pixels on every platform.
+    /// What is read is the content of the source at the time of the call, not at the time the future is awaited.
+    fn read_pixels_async(
+        &self,
+        source: &PassTarget,
+        rect: ScissorBox,
+        format: ReadFormat,
+    ) -> PixelsFuture {
+        Box::pin(std::future::ready(self.read_pixels(source, rect, format)))
+    }
 
     // PROGRAMS
     fn create_program(
