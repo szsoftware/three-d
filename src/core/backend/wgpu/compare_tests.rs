@@ -122,6 +122,14 @@ pub(super) fn compare_with_outliers(
                 worst
             }
         });
+    // The software renderers for OpenGL and Vulkan on Linux share their rasterizer, so there every pixel is comparable.
+    // Another rasterizer decides differently for some pixels on the edge of a triangle, which then have the color of what is behind it.
+    // Those pixels are few, while a real mistake (a wrong color, a shifted or flipped image) changes far more of them.
+    let outliers = if cfg!(target_os = "linux") {
+        outliers
+    } else {
+        outliers + EDGE_PIXELS
+    };
     let beyond = expected
         .iter()
         .zip(&actual)
@@ -129,8 +137,10 @@ pub(super) fn compare_with_outliers(
         .count();
     assert!(
         beyond as f32 <= outliers * expected.len() as f32,
-        "{beyond} of {} values differ by more than {tolerance}, the worst is value {}: {} on OpenGL (on Linux) and {} on wgpu",
+        "{beyond} of {} values ({:.2} %, allowed are {:.2} %) differ by more than {tolerance}, the worst is value {}: {} on OpenGL (on Linux) and {} on wgpu",
         expected.len(),
+        100.0 * beyond as f32 / expected.len() as f32,
+        100.0 * outliers,
         worst.0,
         worst.2,
         worst.3
@@ -185,6 +195,9 @@ fn decode(bytes: &[u8]) -> Vec<f32> {
         _ => panic!("not a reference file"),
     }
 }
+
+/// The part of the values that may differ when the reference is from another rasterizer, see [compare_with_outliers].
+const EDGE_PIXELS: f32 = 0.02;
 
 /// One step of a `u8` color channel, plus rounding.
 pub(super) const STEP: f32 = 1.01 / 255.0;

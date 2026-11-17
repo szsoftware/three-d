@@ -19,6 +19,8 @@ jobs:
     name: Check Desktop
     runs-on: ${{ matrix.os }}
     strategy:
+      # Each system tests another graphics API, so one failing must not hide the result of the others
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
         rust: [stable]
