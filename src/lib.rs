@@ -11,6 +11,11 @@
 
 pub mod context;
 
+/// Re-export of the [wgpu](https://crates.io/crates/wgpu) crate in the version used by the wgpu backend.
+#[cfg(feature = "wgpu")]
+#[cfg_attr(docsrs, doc(cfg(feature = "wgpu")))]
+pub use wgpu;
+
 pub mod core;
 
 pub mod renderer;

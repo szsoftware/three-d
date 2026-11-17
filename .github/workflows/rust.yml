@@ -54,6 +54,45 @@ jobs:
         with:
           command: clippy
 
+      # Software Vulkan driver, so that the tests of the wgpu backend run without a GPU
+      - if: startsWith(matrix.os, 'ubuntu')
+        run: sudo apt-get install -y mesa-vulkan-drivers && echo "THREE_D_REQUIRE_WGPU=1" >> $GITHUB_ENV
+
+      - name: Test
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --all-features --lib
+
+  semver:
+    name: Check API compatibility with upstream
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust Toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
+
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+
+      # The public API must stay compatible with upstream, new backends may only add to it
+      - name: Compare with upstream master
+        run: |
+          git remote add upstream https://github.com/asny/three-d.git
+          git fetch upstream master
+          cargo semver-checks --baseline-rev upstream/master
+
   web:
     name: Check Web
     runs-on: ubuntu-latest
