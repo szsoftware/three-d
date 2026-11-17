@@ -53,8 +53,9 @@ impl Context {
     ///
     /// Creates a new context which uses the wgpu backend with the given device and queue, for example if another part of the application also uses wgpu.
     ///
-    /// **Note:** The wgpu backend is work in progress. It supports the functionality of the [core](crate::core) module except rendering to the screen
-    /// and reading pixels in the browser, which panic with a message. The OpenGL/WebGL backend is not affected.
+    /// **Note:** The wgpu backend is work in progress. It supports the functionality of the [core](crate::core) module except
+    /// reading pixels in the browser, which panics with a message. The OpenGL/WebGL backend is not affected.
+    /// A context created with this function has no screen, render into textures instead.
     /// Errors of a device that is given to this function are reported to the error handler of that device, not by [Context::error_check].
     ///
     #[cfg(feature = "wgpu")]
@@ -105,11 +106,12 @@ impl Context {
         }
     }
 
-    #[cfg(all(test, feature = "wgpu"))]
+    #[cfg(feature = "wgpu")]
+    #[allow(dead_code)]
     pub(crate) fn wgpu_backend(&self) -> &backend::wgpu::WgpuBackend {
         match &*self.backend {
             backend::Backend::Wgpu(wgpu) => wgpu,
-            _ => panic!("not the wgpu backend"),
+            _ => panic!("this functionality needs the wgpu backend"),
         }
     }
 

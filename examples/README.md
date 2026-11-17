@@ -26,6 +26,14 @@ This is the recommended starting point for a gentle introduction to `three-d`.
 
 ![Triangle example](https://asny.github.io/three-d/0.20/triangle.png)
 
+## wgpu window [[code](https://github.com/szsoftware/three-d/tree/master/examples/wgpu_window/src/main.rs)]
+
+A window that renders with wgpu (Vulkan, Metal, DirectX 12 or WebGPU) if the system supports it and with OpenGL/WebGL otherwise. Needs the `wgpu` feature:
+
+```console
+$ cargo run --release --features wgpu --example wgpu_window
+```
+
 ## Triangle core [[code](https://github.com/asny/three-d/tree/master/examples/triangle_core/src/main.rs)] [[demo](https://asny.github.io/three-d/0.20/triangle_core.html)]
 
 This is the same as the `Triangle` example, except it only uses the core module and not the renderer module.

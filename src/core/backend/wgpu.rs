@@ -1,8 +1,9 @@
 //!
 //! The wgpu backend (work in progress, only available with the `wgpu` feature).
 //!
-//! It covers everything the [core](crate::core) module needs except the screen: buffers, all kinds of textures including mipmaps,
-//! multisample targets, programs translated from GLSL (see [glsl]), draw calls, copies between targets and reading back colors and depth.
+//! It covers everything the [core](crate::core) module needs: buffers, all kinds of textures including mipmaps,
+//! multisample targets, programs translated from GLSL (see [glsl]), draw calls, copies between targets, reading back colors and depth
+//! and the screen of a window (see [screen]).
 //!
 //! Conventions: The backend keeps the conventions of OpenGL instead of changing them.
 //! The vertex shader epilogue added by the translation flips the y axis and converts the depth range,
@@ -22,6 +23,9 @@ use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 
 mod builtin;
+mod screen;
+#[cfg_attr(not(feature = "window"), allow(unused_imports))]
+pub(crate) use screen::{AdapterPreference, ScreenDesc};
 #[cfg(all(test, target_os = "linux"))]
 mod compare_tests;
 pub(crate) mod glsl;
@@ -34,6 +38,11 @@ mod tests;
 
 /// The size of the ring buffer for uniforms, it grows if a single program needs more.
 const RING_CAPACITY: usize = 1 << 20;
+
+/// The number of errors that are kept until the next error check.
+const MAX_ERRORS: usize = 64;
+
+const NO_SCREEN: &str = "the context has no screen, it was not created for a window";
 
 ///
 /// The wgpu backend, see the module documentation.
@@ -72,6 +81,8 @@ struct State {
     /// Instance buffers that are combined into one buffer, by the buffers they are made of. See [WgpuBackend::draw].
     merged_buffers: HashMap<Vec<u32>, w::Buffer>,
     builtin: builtin::Builtin,
+    /// The screen, if the backend has one.
+    screen: Option<screen::Screen>,
     ring: Ring,
     /// Increased with every submit, the uniforms uploaded before are gone after it.
     epoch: u64,
@@ -232,6 +243,7 @@ impl WgpuBackend {
                 texture_groups: HashMap::new(),
                 merged_buffers: HashMap::new(),
                 builtin: Default::default(),
+                screen: None,
                 ring,
                 epoch: 0,
                 frame: Default::default(),
@@ -250,30 +262,41 @@ impl WgpuBackend {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new_headless() -> Result<Self, CoreError> {
         let instance = w::Instance::new(w::InstanceDescriptor::new_without_display_handle());
-        let adapter = pollster::block_on(instance.request_adapter(&w::RequestAdapterOptions {
-            power_preference: w::PowerPreference::default(),
-            force_fallback_adapter: false,
-            compatible_surface: None,
-        }))
-        .map_err(|e| CoreError::ContextCreation(e.to_string()))?;
-        let (device, queue) = pollster::block_on(adapter.request_device(&w::DeviceDescriptor {
-            label: Some("three-d"),
-            // Optional features are used when the adapter has them
-            required_features: adapter.features() & w::Features::FLOAT32_FILTERABLE,
-            ..Default::default()
-        }))
-        .map_err(|e| CoreError::ContextCreation(e.to_string()))?;
-        // The device belongs to this backend, so errors can be collected for Context::error_check instead of the default, which is to panic
-        let errors = Arc::new(Mutex::new(Vec::new()));
-        let sink = errors.clone();
-        device.on_uncaptured_error(Arc::new(move |error: w::Error| {
-            sink.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(error.to_string());
-        }));
-        let mut backend = Self::new(device, queue);
-        backend.errors = Some(errors);
+        let (backend, _) =
+            pollster::block_on(Self::request(&instance, AdapterPreference::Any, None))?;
         Ok(backend)
+    }
+
+    ///
+    /// Creates a shader module from a translated shader.
+    ///
+    fn shader_module(&self, module: naga::Module) -> w::ShaderModule {
+        // WebGPU in a browser refuses shaders that sample a texture with automatic mip level inside a branch
+        // that depends on values which differ from pixel to pixel ("derivative uniformity").
+        // GLSL allows that and the shaders of three-d and its users do it, as do the other platforms of wgpu.
+        // The check can only be turned off in WGSL text, so on the web the shader is handed over as text.
+        #[cfg(target_arch = "wasm32")]
+        let source = {
+            let info = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|error| panic!("a translated shader is invalid: {error:?}"));
+            let text = naga::back::wgsl::write_string(
+                &module,
+                &info,
+                naga::back::wgsl::WriterFlags::empty(),
+            )
+            .unwrap_or_else(|error| panic!("a translated shader cannot be written: {error}"));
+            w::ShaderSource::Wgsl(format!("diagnostic(off, derivative_uniformity);\n{text}").into())
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let source = w::ShaderSource::Naga(std::borrow::Cow::Owned(module));
+        self.device.create_shader_module(w::ShaderModuleDescriptor {
+            label: None,
+            source,
+        })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -356,6 +379,13 @@ impl WgpuBackend {
             mip_level,
             layer,
         };
+        if target.framebuffer.is_none() {
+            return vec![Slice {
+                texture: state.screen.as_ref().expect(NO_SCREEN).color().clone(),
+                mip_level: 0,
+                layer: 0,
+            }];
+        }
         match &target.color {
             None => Vec::new(),
             Some(ColorAttachment::Texture2D { texture, mip_level }) => {
@@ -392,6 +422,14 @@ impl WgpuBackend {
             mip_level: 0,
             layer,
         };
+        if target.framebuffer.is_none() {
+            let depth = state.screen.as_ref().expect(NO_SCREEN).depth()?;
+            return Some(Slice {
+                texture: depth.clone(),
+                mip_level: 0,
+                layer: 0,
+            });
+        }
         match &target.depth {
             None => None,
             Some(DepthAttachment::Texture2D(texture)) => Some(slice(texture, 0)),
@@ -419,9 +457,6 @@ impl WgpuBackend {
         target: &PassTarget,
         clear: Option<ClearState>,
     ) -> &'a mut OpenPass {
-        if target.framebuffer.is_none() {
-            unsupported("rendering to the screen");
-        }
         let same_target = |open: &OpenPass| {
             open.target.color == target.color
                 && open.target.depth == target.depth
@@ -1491,9 +1526,6 @@ impl BackendApi for WgpuBackend {
     }
 
     fn copy_target(&self, source: &PassTarget, destination: &PassTarget, mask: CopyMask) {
-        if source.framebuffer.is_none() || destination.framebuffer.is_none() {
-            unsupported("copying from or to the screen");
-        }
         let state = &mut *self.lock();
         if mask.color {
             let from = self.color_slices(state, source).into_iter().next();
@@ -1531,9 +1563,6 @@ impl BackendApi for WgpuBackend {
         if cfg!(target_arch = "wasm32") {
             // A browser cannot block until the pixels are there, it needs asynchronous read functions which follow in a later stage
             unsupported("reading pixels synchronously in the browser");
-        }
-        if source.framebuffer.is_none() {
-            unsupported("reading from the screen");
         }
         let state = &mut *self.lock();
         match format {
@@ -1688,12 +1717,7 @@ impl BackendApi for WgpuBackend {
                     entries: &user_block_entries,
                 });
 
-        let module = |module: naga::Module| {
-            self.device.create_shader_module(w::ShaderModuleDescriptor {
-                label: None,
-                source: w::ShaderSource::Naga(std::borrow::Cow::Owned(module)),
-            })
-        };
+        let module = |module: naga::Module| self.shader_module(module);
         let entry = ProgramEntry {
             vertex: module(vertex_module),
             fragment: module(fragment_module),
