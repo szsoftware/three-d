@@ -56,6 +56,7 @@ context.resize_offscreen_screen(new_width, new_height)?;
 - The pixels are RGBA and the first row is the top row of the image, as for every `read_color` of `three-d` with both backends. (Positions inside a render target, such as a viewport or a scissor box, count from the bottom left.)
 - The last two arguments say whether the screen has a depth buffer and whether it is multisampled (four samples per pixel).
 - Reading hands the frame to the graphics card. For a frame that is not read, call `context.submit_offscreen_screen()` at its end instead.
+- Before you drop such a context while the application keeps running, empty its program cache with `context.programs.write().unwrap().clear()`. The cached programs hold the context, so otherwise it and its graphics device are never freed.
 - This is only for native targets, since reading has to wait for the graphics card. In a browser use a canvas.
 
 ## What works

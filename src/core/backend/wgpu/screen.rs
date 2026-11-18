@@ -417,6 +417,7 @@ mod tests {
         assert_eq!(screen.read_depth(), depth);
         assert!(color.contains(&[255, 0, 0, 255]) && color.contains(&[0, 255, 0, 255]));
         context.error_check().unwrap();
+        crate::core::backend::wgpu::compare_tests::release(&context);
     }
 
     #[test]
@@ -438,6 +439,7 @@ mod tests {
         assert_eq!(depth[0], 1.0);
         assert!(depth[(HEIGHT / 2 * WIDTH + WIDTH / 2) as usize] < 1.0);
         context.error_check().unwrap();
+        crate::core::backend::wgpu::compare_tests::release(&context);
     }
 
     #[test]
@@ -470,6 +472,7 @@ mod tests {
             // Without a surface, presenting only submits
             backend.present().unwrap();
             context.error_check().unwrap();
+            crate::core::backend::wgpu::compare_tests::release(&context);
         }
     }
 
@@ -489,6 +492,7 @@ mod tests {
         backend.resize_screen(0, 0);
         backend.present().unwrap();
         context.error_check().unwrap();
+        crate::core::backend::wgpu::compare_tests::release(&context);
     }
 
     #[test]
@@ -575,6 +579,7 @@ mod tests {
             assert!(color.contains(&[255, 0, 0, 255]));
             assert!(screen.read_depth().iter().any(|d| *d < 1.0));
             context.error_check().unwrap();
+            crate::core::backend::wgpu::compare_tests::release(&context);
         }
     }
 
@@ -585,6 +590,21 @@ mod tests {
         };
         assert!(context.resize_offscreen_screen(WIDTH, HEIGHT).is_err());
         assert!(context.submit_offscreen_screen().is_err());
+    }
+
+    #[test]
+    fn context_is_freed_without_cached_programs() {
+        let Ok(context) = Context::new_headless_wgpu_with_screen(WIDTH, HEIGHT, true, false) else {
+            return;
+        };
+        let screen = RenderTarget::screen(&context, WIDTH, HEIGHT);
+        render(&context, &screen, WIDTH, HEIGHT);
+        drop(screen);
+        // The programs in the cache hold the context, so it would never be freed
+        assert!(!context.programs.read().unwrap().is_empty());
+        assert!(context.backend_references() > 1);
+        context.programs.write().unwrap().clear();
+        assert_eq!(context.backend_references(), 1);
     }
 
     #[test]

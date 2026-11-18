@@ -89,7 +89,10 @@ impl Context {
     /// `RenderTarget::screen(&context, width, height).read_color()`, the first row that is returned is the top row of the image.
     /// The screen has the given size in pixels, a depth buffer if `depth` is set and four samples per pixel if `multisample` is set.
     ///
-    /// Use [Context::resize_offscreen_screen] when the size changes and call [Context::submit_offscreen_screen] at the end of each frame.
+    /// Use [Context::resize_offscreen_screen] when the size changes and call [Context::submit_offscreen_screen] at the end of a frame that is not read.
+    ///
+    /// **Note:** The programs in [Context::programs] keep the context and with it the graphics device alive. An application that
+    /// creates and drops contexts while it runs should empty that cache before it drops a context: `context.programs.write().unwrap().clear()`.
     ///
     #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
     #[cfg_attr(docsrs, doc(cfg(feature = "wgpu")))]
@@ -179,6 +182,13 @@ impl Context {
             backend::Backend::Wgpu(wgpu) => wgpu,
             _ => panic!("this functionality needs the wgpu backend"),
         }
+    }
+
+    /// The number of contexts, including the copies inside of textures, programs and so on, that keep the backend alive.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn backend_references(&self) -> usize {
+        Arc::strong_count(&self.backend)
     }
 
     #[cfg(test)]

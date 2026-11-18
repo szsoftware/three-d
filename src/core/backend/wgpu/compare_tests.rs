@@ -47,6 +47,14 @@ pub(super) fn gl_context() -> Result<(Context, impl Sized), String> {
 }
 
 ///
+/// Empties the program cache of a context at the end of a test. The programs in the cache hold the context, so without this
+/// the context and its graphics device stay alive until the test process ends, and the software adapter of Windows runs out of memory.
+///
+pub(crate) fn release(context: &Context) {
+    context.programs.write().unwrap().clear();
+}
+
+///
 /// Runs the scenario on both backends and checks that the values it returns differ by at most the tolerance.
 ///
 pub(super) fn compare(tolerance: f32, scenario: impl Fn(&Context) -> Vec<f32>) {
@@ -75,7 +83,11 @@ pub(super) fn compare_with_outliers(
     #[cfg(target_os = "linux")]
     let expected = {
         let expected = match gl_context() {
-            Ok((context, _keep_alive)) => scenario(&context),
+            Ok((context, _keep_alive)) => {
+                let expected = scenario(&context);
+                release(&context);
+                expected
+            }
             Err(error) => return skip("OpenGL context", error),
         };
         if std::env::var("THREE_D_WRITE_REFERENCE").is_ok() {
@@ -101,6 +113,7 @@ pub(super) fn compare_with_outliers(
         Ok(context) => {
             let actual = scenario(&context);
             context.error_check().unwrap();
+            release(&context);
             actual
         }
         Err(error) => return skip("wgpu adapter", error.to_string()),
