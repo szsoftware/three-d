@@ -31,6 +31,8 @@ mod display;
 mod error;
 #[cfg(feature = "wgpu")]
 mod gpu;
+#[cfg(feature = "three-d")]
+mod preview;
 mod render_image;
 mod sampling;
 mod scene;
@@ -46,6 +48,8 @@ pub use compute::*;
 pub use error::*;
 #[cfg(feature = "wgpu")]
 pub use gpu::*;
+#[cfg(feature = "three-d")]
+pub use preview::*;
 pub use render_image::*;
 pub use scene::*;
 pub use sky::*;

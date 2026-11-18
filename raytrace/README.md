@@ -47,6 +47,15 @@ a camera, about 15 for a sunny day and 7 for a lit room.
 | `three-d` | `RenderImage::to_three_d_texture` and `RenderImage::write_to_three_d_texture`: the render image as a three-d `Texture2D` (32 bit floats, upright), on any backend, to show it while samples are added |
 | `wgpu` | `RaytraceSupport::of(&context)`: `Cpu` (OpenGL, WebGL2), `Compute` (WebGPU, Vulkan, Metal, DirectX 12) or `HardwareRayQuery`; `GpuDevice::from_context` with the device and queue; `ComputeTracer` and `GpuRenderImage` |
 
+| `three-d` | `RaytracePreview`: a view that gets finer every frame while camera and scene stay the same, on the GPU where there are compute shaders and otherwise on the CPU at a lower resolution; `PreviewAvailability::of(&context)` says which and why |
+
+```rust
+let mut preview = RaytracePreview::new(&context, width, height);
+// Every frame; starts again by itself when the camera or the scene changed
+preview.update(&scene, &camera)?;
+preview.render(&target); // exposed, tone mapped and sRGB encoded
+```
+
 Textures are shared with wgpu through `Texture2D::as_wgpu` in three-d, which keeps the order of three-d's work and the
 tracer's on the queue.
 
