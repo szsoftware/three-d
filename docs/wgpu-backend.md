@@ -23,6 +23,7 @@ Without the feature, wgpu is not compiled and the dependencies are the same as u
 | Your own winit window | `WindowedContext::from_winit_window_with_backend` or `from_winit_window_async` |
 | Your own canvas (web) | `WindowedContext::from_canvas_async` |
 | No window (tests, server) | `Context::new_headless_wgpu()` |
+| No window, but a screen you show yourself | `Context::new_headless_wgpu_with_screen(width, height, depth, multisample)` |
 | Your own wgpu device | `Context::from_wgpu(device, queue)` |
 
 `BackendPreference::Auto` takes wgpu if there is a hardware adapter and OpenGL/WebGL otherwise.
@@ -37,6 +38,26 @@ let context = window.gl(); // the name is historic, the context can use wgpu
 ```
 
 See the example `wgpu_window` (`cargo run --release --features wgpu --example wgpu_window`), which also runs in the browser.
+
+## A screen without a window
+
+An application that shows the image itself, for example inside a user interface toolkit, can use a screen that is not shown anywhere. Everything that renders to `RenderTarget::screen` or `FrameInput::screen` works unchanged, and the image is read back each frame:
+
+```rust
+let context = Context::new_headless_wgpu_with_screen(width, height, true, false)?;
+// each frame
+let screen = RenderTarget::screen(&context, width, height);
+screen.clear(ClearState::default()).render(&camera, &objects, &lights);
+let pixels: Vec<[u8; 4]> = screen.read_color();
+// when the size changes
+context.resize_offscreen_screen(new_width, new_height)?;
+```
+
+- The pixels are RGBA and the first row is the top row of the image, as for every `read_color` of `three-d` with both backends. (Positions inside a render target, such as a viewport or a scissor box, count from the bottom left.)
+- The last two arguments say whether the screen has a depth buffer and whether it is multisampled (four samples per pixel).
+- Reading hands the frame to the graphics card. For a frame that is not read, call `context.submit_offscreen_screen()` at its end instead.
+- Before you drop such a context while the application keeps running, empty its program cache with `context.programs.write().unwrap().clear()`. The cached programs hold the context, so otherwise it and its graphics device are never freed.
+- This is only for native targets, since reading has to wait for the graphics card. In a browser use a canvas.
 
 ## What works
 
@@ -162,7 +183,7 @@ fn run(@builtin(global_invocation_id) id: vec3<u32>) {
 
 - All graphics calls of `core` go through one internal interface (`src/core/backend.rs`) with an implementation for OpenGL (`backend/gl.rs`, the upstream code) and one for wgpu (`backend/wgpu.rs`).
 - Shaders are translated from the GLSL dialect of `three-d` to GLSL 4.50 and then to a naga module (`backend/wgpu/glsl.rs`). In the browser the module is handed over as WGSL.
-- The wgpu backend keeps the conventions of OpenGL (y up, depth from -1 to 1 in clip space, first texture row at the bottom), so viewports, scissor boxes, `gl_FragCoord` and UV coordinates mean the same with both backends.
+- The wgpu backend keeps the conventions of OpenGL (y up, depth from -1 to 1 in clip space, texture coordinate (0, 0) at the bottom left), so viewports, scissor boxes, `gl_FragCoord` and UV coordinates mean the same with both backends.
 - Draw calls on the same render target are collected into one render pass and all passes of a frame into one command buffer.
 - The screen is a set of textures like every other render target. Presenting draws it to the surface of the window.
 

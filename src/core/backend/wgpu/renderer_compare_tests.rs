@@ -1155,6 +1155,7 @@ fn gui_core_painter_matches_egui_glow() {
         .filter(|(e, a)| (*e - *a).abs() > 2.0 * STEP)
         .count();
     assert_eq!(different, 0, "of {} values", expected.len());
+    super::compare_tests::release(&context);
 }
 
 /// Reading and picking with the asynchronous functions gives the same as with the blocking ones.

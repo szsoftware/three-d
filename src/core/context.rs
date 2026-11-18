@@ -82,6 +82,74 @@ impl Context {
     }
 
     ///
+    /// Creates a new context which uses the wgpu backend without a window, like [Context::new_headless_wgpu], but with a screen
+    /// that is not shown anywhere. This is for applications that show the pixels themselves, for example inside a user interface toolkit.
+    ///
+    /// Everything that renders to [RenderTarget::screen] works as it does with a window. Read the image with
+    /// `RenderTarget::screen(&context, width, height).read_color()`, the first row that is returned is the top row of the image.
+    /// The screen has the given size in pixels, a depth buffer if `depth` is set and four samples per pixel if `multisample` is set.
+    ///
+    /// Use [Context::resize_offscreen_screen] when the size changes and call [Context::submit_offscreen_screen] at the end of a frame that is not read.
+    ///
+    /// **Note:** The programs in [Context::programs] keep the context and with it the graphics device alive. An application that
+    /// creates and drops contexts while it runs should empty that cache before it drops a context: `context.programs.write().unwrap().clear()`.
+    ///
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "wgpu")))]
+    pub fn new_headless_wgpu_with_screen(
+        width: u32,
+        height: u32,
+        depth: bool,
+        multisample: bool,
+    ) -> Result<Self, CoreError> {
+        let context = Self::new_headless_wgpu()?;
+        context
+            .wgpu_backend()
+            .set_screen(backend::wgpu::ScreenDesc {
+                width,
+                height,
+                depth,
+                multisample,
+                vsync: false,
+            });
+        Ok(context)
+    }
+
+    ///
+    /// Changes the size of the screen of a context created with [Context::new_headless_wgpu_with_screen].
+    /// The content of the screen is lost. Returns an error for every other context, the screen of a window follows the window.
+    ///
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "wgpu")))]
+    pub fn resize_offscreen_screen(&self, width: u32, height: u32) -> Result<(), CoreError> {
+        self.offscreen_backend()?.resize_screen(width, height);
+        Ok(())
+    }
+
+    ///
+    /// Ends a frame of a context created with [Context::new_headless_wgpu_with_screen]: hands everything that was drawn since
+    /// the last call to the graphics card, like a window does when it shows a frame. Reading from the screen does the same,
+    /// so this is only necessary for frames that are not read. Returns an error for every other context.
+    ///
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "wgpu")))]
+    pub fn submit_offscreen_screen(&self) -> Result<(), CoreError> {
+        self.offscreen_backend()?.present()
+    }
+
+    /// The wgpu backend if it has a screen that is not the one of a window.
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    fn offscreen_backend(&self) -> Result<&backend::wgpu::WgpuBackend, CoreError> {
+        match &*self.backend {
+            backend::Backend::Wgpu(wgpu) if wgpu.has_offscreen_screen() => Ok(wgpu),
+            _ => Err(CoreError::ContextError(
+                "the context has no offscreen screen, create it with Context::new_headless_wgpu_with_screen"
+                    .to_string(),
+            )),
+        }
+    }
+
+    ///
     /// Returns the wgpu device and queue if this context uses the wgpu backend, otherwise `None`.
     ///
     #[cfg(feature = "wgpu")]
@@ -114,6 +182,13 @@ impl Context {
             backend::Backend::Wgpu(wgpu) => wgpu,
             _ => panic!("this functionality needs the wgpu backend"),
         }
+    }
+
+    /// The number of contexts, including the copies inside of textures, programs and so on, that keep the backend alive.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn backend_references(&self) -> usize {
+        Arc::strong_count(&self.backend)
     }
 
     #[cfg(test)]
