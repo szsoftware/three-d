@@ -59,6 +59,7 @@ fn previews(context: &Context, width: u32, height: u32) -> Vec<RaytracePreview> 
         RaytracePreview::new_on_cpu(context, width, height),
     ];
     for p in &mut previews {
+        p.wait_for_gpu();
         p.set_settings(PreviewSettings {
             cpu_in_background: false,
             gpu_frame_time: None,
@@ -114,10 +115,16 @@ fn preview_gets_finer_and_starts_again() {
     ));
     if RaytraceSupport::of(&context) >= RaytraceSupport::Compute {
         assert_eq!(PreviewAvailability::of(&context), PreviewAvailability::Gpu);
-        assert_eq!(
-            RaytracePreview::new(&context, 16, 8).kind(),
-            TracerKind::Compute
-        );
+        let mut preview = RaytracePreview::new(&context, 16, 8);
+        preview.wait_for_gpu();
+        assert!(!preview.is_compiling());
+        assert_eq!(preview.kind(), TracerKind::Compute);
+        // The same size again keeps the samples
+        preview
+            .update(&scene, &camera(16, 8, vec3(0.0, 0.0, 0.0)))
+            .unwrap();
+        preview.resize(16, 8);
+        assert_eq!(preview.sample_count(), 1);
     }
     finish(&context);
 }
@@ -267,6 +274,7 @@ fn the_cpu_traces_in_the_background() {
 fn a_slow_gpu_gets_a_lighter_preview() {
     let Some(context) = context() else { return };
     let mut preview = RaytracePreview::new(&context, 64, 32);
+    preview.wait_for_gpu();
     if preview.kind() != TracerKind::Compute {
         return;
     }
@@ -290,8 +298,39 @@ fn a_slow_gpu_gets_a_lighter_preview() {
     }
     finish(&context);
     assert_eq!(scales, [1, 2, 4]);
+    // The texture is smaller than the viewport, resizing to the viewport keeps the CPU
+    preview.resize(64, 32);
+    assert_eq!(preview.kind(), TracerKind::CpuReference);
     assert_eq!(preview.kind(), TracerKind::CpuReference);
     assert!(
         matches!(preview.availability(), PreviewAvailability::CpuOnly(why) if why.contains("quarter"))
     );
+}
+
+#[test]
+fn the_cpu_traces_while_the_gpu_compiles() {
+    let Some(context) = context() else { return };
+    let mut preview = RaytracePreview::new(&context, 16, 8);
+    if preview.availability() != &PreviewAvailability::Gpu {
+        return;
+    }
+    let scene = sky_only(1000.0);
+    let start = std::time::Instant::now();
+    while preview.is_compiling() {
+        assert_eq!(preview.kind(), TracerKind::CpuReference);
+        preview
+            .update(&scene, &camera(16, 8, vec3(0.0, 0.0, 0.0)))
+            .unwrap();
+        assert!(
+            start.elapsed().as_secs() < 120,
+            "the shaders never compiled"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    preview
+        .update(&scene, &camera(16, 8, vec3(0.0, 0.0, 0.0)))
+        .unwrap();
+    assert_eq!(preview.kind(), TracerKind::Compute);
+    assert!(preview.sample_count() >= 1);
+    finish(&context);
 }
