@@ -234,9 +234,11 @@ impl ComputeTracer {
             self.gpu.queue.write_buffer(extras, 0, &light_bytes);
         }
         if let Some(plan) = &caustics {
-            self.gpu
-                .queue
-                .write_buffer(extras, 4 * plan.sources as u64, &plan.emitter_bytes());
+            self.gpu.queue.write_buffer(
+                extras,
+                4 * plan.sources as u64,
+                &plan.emitter_bytes(&buffers.profiles),
+            );
         }
 
         let params = device.create_buffer_init(&w::util::BufferInitDescriptor {
@@ -975,8 +977,11 @@ struct SceneBuffers {
     vertices: w::Buffer,
     instances: w::Buffer,
     materials: w::Buffer,
-    /// Four vec4 per light, written into the buffer of lights and photons with every call
+    /// Four vec4 per light and the tables of their profiles, written into the buffer of lights and photons with every
+    /// call
     lights: Words,
+    /// The profiles of luminaires and the words where their tables start
+    profiles: Vec<(std::sync::Arc<crate::IesProfile>, u32)>,
     texels: w::Buffer,
 }
 
@@ -1113,6 +1118,20 @@ impl SceneBuffers {
             materials.u(NONE);
         }
 
+        // The lights, then the tables of their profiles, one per distinct profile
+        let mut profiles: Vec<(std::sync::Arc<crate::IesProfile>, u32)> = Vec::new();
+        let mut table_word = 16 * scene.lights().len() as u32;
+        for light in scene.lights() {
+            if let RtLight::Luminaire { profile, .. } = light {
+                if !profiles
+                    .iter()
+                    .any(|(p, _)| std::sync::Arc::ptr_eq(p, profile))
+                {
+                    profiles.push((profile.clone(), table_word));
+                    table_word += profile.table().0.len() as u32;
+                }
+            }
+        }
         let mut lights = Words::default();
         for light in scene.lights() {
             match light {
@@ -1135,6 +1154,21 @@ impl SceneBuffers {
                     lights.v3(*color * *intensity, 0.0);
                     lights.v3(Vec3::zero(), 0.0);
                     lights.v3(Vec3::zero(), 0.0);
+                }
+                RtLight::Luminaire {
+                    position,
+                    down,
+                    front,
+                    color,
+                    profile,
+                    scale,
+                } => {
+                    // A point light with the word of its table plus one and the rows of the table
+                    let (table, rows) = profile_table(&profiles, profile);
+                    lights.v3(*position, 1.0);
+                    lights.v3(*color * *scale, 0.0);
+                    lights.v3(*down, (table + 1) as f32);
+                    lights.v3(*front, rows as f32);
                 }
                 RtLight::Rect {
                     corner,
@@ -1162,6 +1196,9 @@ impl SceneBuffers {
                 }
             }
         }
+        for (profile, _) in &profiles {
+            profile.table().0.iter().for_each(|v| lights.f(*v));
+        }
 
         let storage = |label, words: &Words| {
             device.create_buffer_init(&w::util::BufferInitDescriptor {
@@ -1179,6 +1216,7 @@ impl SceneBuffers {
             instances: storage("ray tracing instances", &instances),
             materials: storage("ray tracing materials", &materials),
             lights,
+            profiles,
             texels: storage("ray tracing textures", &texels),
         }
     }
@@ -1227,7 +1265,7 @@ impl CausticPlan {
         let counter = light_words.next_multiple_of(4);
         let counts = counter + 4;
         let sources = counts + 3 * PHOTON_CELLS;
-        let spheres = sources + 8 * source_list.len() as u32;
+        let spheres = sources + 16 * source_list.len() as u32;
         let raw = spheres + 4 * sphere_list.len() as u32;
         // Shot and sorted photons, as many as the largest buffer the device binds takes
         let room = (max_binding / 4).saturating_sub(raw as u64) / (2 * PHOTON_WORDS as u64);
@@ -1254,22 +1292,40 @@ impl CausticPlan {
     }
 
     /// The sources and the glass spheres, written at `sources`.
-    fn emitter_bytes(&self) -> Vec<u8> {
+    fn emitter_bytes(&self, profiles: &[(std::sync::Arc<crate::IesProfile>, u32)]) -> Vec<u8> {
         use crate::photons::CausticSource;
         let mut words = Words::default();
         for source in &self.source_list {
-            match *source {
+            // Four vec4 each: kind and position or direction, light, the profile's down and front as for lights
+            match source {
                 CausticSource::Parallel {
                     direction,
                     light,
                     cos_radius,
                 } => {
-                    words.v3(direction, 0.0);
-                    words.v3(light, cos_radius);
+                    words.v3(*direction, 0.0);
+                    words.v3(*light, *cos_radius);
+                    words.v3(Vec3::zero(), 0.0);
+                    words.v3(Vec3::zero(), 0.0);
                 }
-                CausticSource::Point { position, light } => {
-                    words.v3(position, 1.0);
-                    words.v3(light, 1.0);
+                CausticSource::Point {
+                    position,
+                    light,
+                    profile,
+                } => {
+                    words.v3(*position, 1.0);
+                    words.v3(*light, 1.0);
+                    match profile {
+                        Some((profile, down, front)) => {
+                            let (table, rows) = profile_table(profiles, profile);
+                            words.v3(*down, (table + 1) as f32);
+                            words.v3(*front, rows as f32);
+                        }
+                        None => {
+                            words.v3(Vec3::zero(), 0.0);
+                            words.v3(Vec3::zero(), 0.0);
+                        }
+                    }
                 }
             }
         }
@@ -1278,6 +1334,18 @@ impl CausticPlan {
         }
         words.bytes()
     }
+}
+
+/// Word of a profile's table in the buffer of lights and the number of its rows.
+fn profile_table(
+    profiles: &[(std::sync::Arc<crate::IesProfile>, u32)],
+    profile: &std::sync::Arc<crate::IesProfile>,
+) -> (u32, u32) {
+    let word = profiles
+        .iter()
+        .find(|(p, _)| std::sync::Arc::ptr_eq(p, profile))
+        .map_or(0, |(_, w)| *w);
+    (word, profile.table().1 as u32)
 }
 
 /// Texture id meaning no texture, as in trace.wgsl.

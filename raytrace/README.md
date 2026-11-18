@@ -150,6 +150,11 @@ binds (128 MB guaranteed by WebGPU), the largest ones are halved in size until t
   sample on the GPU and 20 000 on the CPU (`PreviewSettings::gpu_caustic_photons`, `cpu_caustic_photons`). A glass
   face lying exactly on another surface sends its light below it; leave a millimetre between them.
 - Not included: caustics of mirrors and of the light of area lights and the sky.
+- Luminaires with measured light distributions: `IesProfile::parse` reads IES files (LM-63, type C photometry,
+  `TILT=NONE`, all symmetries of the C-planes) into a table of 1° vertically and 5° horizontally.
+  `RtLight::luminaire(position, down, front, Arc<IesProfile>)` places one like a point light with hard shadows,
+  `luminaire_with_flux` scales it to a lumen value, `IesProfile::flux` integrates what it sends out. On CPU and GPU,
+  also for caustic photons; the tables share the buffer of the lights on the GPU.
 - Depth of field with `TraceSettings::depth_of_field` (also `PreviewSettings::depth_of_field`), on CPU and GPU:
   `DepthOfField { f_number, focus_distance }` behaves like a photo camera with the same field of view on a full frame
   sensor (24 mm high), so f/2.8 at 45° is a 29 mm lens with an aperture of 10 mm. Scenes have to be in meters.
@@ -165,7 +170,8 @@ from physics: a white sphere disappears in a uniform environment (white furnace)
 reflects E/π, a point light falls off with the square of the distance, and a pane of glass lets 96 % of the light
 through. `tests/caustics.rs` checks on CPU and GPU that photons through a glass slab light the floor as brightly as the straight
 shadow rays and that a glass ball gathers the light of its shadow into a bright focus without making light.
-`tests/depth_of_field.rs` checks on CPU and GPU that an edge in the focus plane stays sharp and an edge behind it is
+`tests/ies.rs` checks on CPU and GPU that the floor under a luminaire gets the profile's intensity in the front
+and side planes within 1 %. `tests/depth_of_field.rs` checks on CPU and GPU that an edge in the focus plane stays sharp and an edge behind it is
 blurred by the thin lens's circle of confusion, without losing light. A reference image of the garden scene is compared in blocks of 4 × 4 pixels, write it again with
 `THREE_D_WRITE_REFERENCE=1 cargo test --release -p three-d-raytrace`.
 

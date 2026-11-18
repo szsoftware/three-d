@@ -32,6 +32,7 @@ mod display;
 mod error;
 #[cfg(feature = "wgpu")]
 mod gpu;
+mod ies;
 mod lens;
 mod light;
 mod photons;
@@ -55,6 +56,7 @@ pub use denoise::*;
 pub use error::*;
 #[cfg(feature = "wgpu")]
 pub use gpu::*;
+pub use ies::IesProfile;
 pub use lens::DepthOfField;
 #[cfg(feature = "three-d")]
 pub use preview::*;
