@@ -168,7 +168,7 @@ mod tests {
 
     fn check(context: Context, multisample: bool) {
         // The same into a texture is what the screen has to show
-        let mut texture = Texture2D::new_empty::<[u8; 4]>(
+        let texture = Texture2D::new_empty::<[u8; 4]>(
             &context,
             WIDTH,
             HEIGHT,
@@ -178,7 +178,7 @@ mod tests {
             Wrapping::ClampToEdge,
             Wrapping::ClampToEdge,
         );
-        let mut depth_texture = DepthTexture2D::new::<f32>(
+        let depth_texture = DepthTexture2D::new::<f32>(
             &context,
             WIDTH,
             HEIGHT,
