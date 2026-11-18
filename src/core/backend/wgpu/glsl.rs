@@ -145,6 +145,8 @@ fn translate_stage(
     let mut structs = String::new();
     let mut members = String::new();
     let mut uniform_names = Vec::new();
+    // Uniform arrays with elements made wider (see [widened_element]) and the components that hold the value
+    let mut widened: Vec<(String, &str)> = Vec::new();
     let mut body = String::new();
     let mut leading_directives = String::new();
     let mut in_leading_directives = true;
@@ -266,9 +268,16 @@ fn translate_stage(
                     }
                 } else {
                     for declarator in &declaration.declarators {
+                        let mut ty = declaration.ty.as_str();
+                        if declarator.array.is_some() {
+                            if let Some((wide, components)) = widened_element(ty) {
+                                ty = wide;
+                                widened.push((declarator.name.clone(), components));
+                            }
+                        }
                         members.push_str(&format!(
                             "    {} {}{};\n",
-                            declaration.ty,
+                            ty,
                             declarator.name,
                             declarator
                                 .array
@@ -350,6 +359,9 @@ fn translate_stage(
         output.push_str(&format!(
             "layout(set = {UNIFORM_GROUP}, binding = {binding}) uniform {name} {{\n{members}}};\n"
         ));
+    }
+    for (name, components) in &widened {
+        body = select_components(&body, name, components)?;
     }
     if contains_word(&body, "inverse") {
         output.push_str(INVERSE);
@@ -705,6 +717,72 @@ impl Declaration {
     }
 }
 
+///
+/// The elements of an array in a uniform block are 16 bytes apart. Metal and WGSL place the elements of an array of
+/// scalars or vectors with two components closer together, so such an array becomes an array of vectors with four
+/// components. Returns that type and the components which hold the value.
+///
+fn widened_element(ty: &str) -> Option<(&'static str, &'static str)> {
+    Some(match ty {
+        "float" => ("vec4", ".x"),
+        "int" => ("ivec4", ".x"),
+        "uint" => ("uvec4", ".x"),
+        "vec2" => ("vec4", ".xy"),
+        "ivec2" => ("ivec4", ".xy"),
+        "uvec2" => ("uvec4", ".xy"),
+        _ => return None,
+    })
+}
+
+/// Appends the components to each `name[index]` in the source, for an array of [widened_element].
+fn select_components(source: &str, name: &str, components: &str) -> Result<String, String> {
+    let bytes = source.as_bytes();
+    // The positions behind the closing brackets, uses can be nested
+    let mut positions = Vec::new();
+    let mut search = 0;
+    while let Some(found) = source[search..].find(name) {
+        let start = search + found;
+        let mut end = start + name.len();
+        search = end;
+        if (start > 0 && (is_identifier(bytes[start - 1]) || bytes[start - 1] == b'.'))
+            || (end < source.len() && is_identifier(bytes[end]))
+        {
+            continue;
+        }
+        while end < source.len() && bytes[end].is_ascii_whitespace() {
+            end += 1;
+        }
+        if bytes.get(end) != Some(&b'[') {
+            return Err(format!(
+                "the uniform array {name} is used without an index, which is not supported by the wgpu backend"
+            ));
+        }
+        let mut depth = 0;
+        while end < source.len() {
+            match bytes[end] {
+                b'[' => depth += 1,
+                b']' => depth -= 1,
+                _ => {}
+            }
+            end += 1;
+            if depth == 0 {
+                break;
+            }
+        }
+        positions.push(end);
+    }
+    positions.sort_unstable();
+    let mut output = String::with_capacity(source.len() + positions.len() * components.len());
+    let mut copied = 0;
+    for position in positions {
+        output.push_str(&source[copied..position]);
+        output.push_str(components);
+        copied = position;
+    }
+    output.push_str(&source[copied..]);
+    Ok(output)
+}
+
 // TEXT HANDLING
 
 fn is_identifier(c: u8) -> bool {
@@ -1054,6 +1132,30 @@ mod tests {
             .collect();
         assert_eq!(words, ["x", "w"]);
         assert_eq!(output.lines().count(), source.lines().count());
+    }
+
+    #[test]
+    fn uniform_arrays_of_small_elements_are_widened() {
+        // Metal would place the layers 4 bytes apart and all following uniforms at other offsets than the data has
+        let translation = translate(
+            "uniform vec2 directions[4];\nin vec3 position;\nvoid main() { gl_Position = vec4(position.xy + directions [gl_VertexID % 4], 0.0, 1.0); }",
+            "uniform int layers[4];\nuniform vec3 colors[2];\nlayout (location = 0) out vec4 outColor;\nvoid main() { outColor = vec4(colors[layers[layers[1]]], 1.0); }",
+        )
+        .unwrap();
+        assert!(translation.vertex.contains("vec4 directions[4];"));
+        assert!(translation
+            .vertex
+            .contains("directions [int(gl_VertexIndex) % 4].xy"));
+        assert!(translation.fragment.contains("ivec4 layers[4];"));
+        assert!(translation.fragment.contains("vec3 colors[2];"));
+        assert!(translation
+            .fragment
+            .contains("colors[layers[layers[1].x].x]"));
+        assert!(translate(
+            "in vec3 position;\nvoid main() { gl_Position = vec4(position, 1.0); }",
+            "uniform float weights[4];\nfloat sum(float w[4]) { return w[0] + w[1]; }\nlayout (location = 0) out vec4 outColor;\nvoid main() { outColor = vec4(sum(weights)); }",
+        )
+        .is_err());
     }
 
     #[test]
