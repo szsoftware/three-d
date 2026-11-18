@@ -16,6 +16,8 @@ use crate::core::*;
 use std::collections::HashMap;
 
 pub(crate) mod gl;
+#[cfg(all(feature = "headless-gl", target_os = "linux"))]
+pub(crate) mod gl_headless;
 #[cfg(test)]
 pub(crate) mod null;
 #[cfg(feature = "wgpu")]

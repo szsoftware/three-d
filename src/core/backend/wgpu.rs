@@ -365,11 +365,15 @@ impl WgpuBackend {
     ///
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new_headless() -> Result<Self, CoreError> {
+        Self::new_headless_with(AdapterPreference::Any)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn new_headless_with(preference: AdapterPreference) -> Result<Self, CoreError> {
         #[cfg(test)]
         one_gpu_test_at_a_time();
         let instance = w::Instance::new(w::InstanceDescriptor::new_without_display_handle());
-        let (backend, _) =
-            pollster::block_on(Self::request(&instance, AdapterPreference::Any, None))?;
+        let (backend, _) = pollster::block_on(Self::request(&instance, preference, None))?;
         Ok(backend)
     }
 

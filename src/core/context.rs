@@ -102,7 +102,63 @@ impl Context {
         depth: bool,
         multisample: bool,
     ) -> Result<Self, CoreError> {
-        let context = Self::new_headless_wgpu()?;
+        Self::headless_wgpu_with_screen(
+            width,
+            height,
+            depth,
+            multisample,
+            backend::wgpu::AdapterPreference::Any,
+        )
+    }
+
+    ///
+    /// Creates a new context which uses the OpenGL backend without a window, with a screen that is not shown anywhere.
+    /// This is the same as [Context::new_headless_wgpu_with_screen] with OpenGL, for graphics cards that have a good OpenGL driver
+    /// but no Vulkan driver wgpu can use. It works on Linux, where EGL can create a context without a window.
+    ///
+    /// The context is current on the thread that calls this function, and all rendering has to happen on that thread.
+    /// A graphics device that renders in hardware is preferred.
+    ///
+    /// Everything that renders to [RenderTarget::screen] works as it does with a window. Read the image with
+    /// `RenderTarget::screen(&context, width, height).read_color()`, the first row that is returned is the top row of the image.
+    /// The screen has the given size in pixels, a depth buffer if `depth` is set and four samples per pixel if `multisample` is set.
+    /// Use [Context::resize_offscreen_screen] when the size changes.
+    ///
+    #[cfg(all(feature = "headless-gl", target_os = "linux"))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "headless-gl")))]
+    pub fn new_headless_gl_with_screen(
+        width: u32,
+        height: u32,
+        depth: bool,
+        multisample: bool,
+    ) -> Result<Self, CoreError> {
+        Self::headless_gl_with_screen(width, height, depth, multisample, false)
+    }
+
+    #[cfg(all(feature = "headless-gl", target_os = "linux"))]
+    fn headless_gl_with_screen(
+        width: u32,
+        height: u32,
+        depth: bool,
+        multisample: bool,
+        hardware_only: bool,
+    ) -> Result<Self, CoreError> {
+        let (backend, _) = backend::gl_headless::new(hardware_only)?;
+        backend.set_offscreen_screen(width, height, depth, multisample)?;
+        Ok(Self::from_backend(backend::Backend::Gl(backend)))
+    }
+
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    fn headless_wgpu_with_screen(
+        width: u32,
+        height: u32,
+        depth: bool,
+        multisample: bool,
+        preference: backend::wgpu::AdapterPreference,
+    ) -> Result<Self, CoreError> {
+        let context = Self::from_backend(backend::Backend::Wgpu(Box::new(
+            backend::wgpu::WgpuBackend::new_headless_with(preference)?,
+        )));
         context
             .wgpu_backend()
             .set_screen(backend::wgpu::ScreenDesc {
@@ -116,37 +172,111 @@ impl Context {
     }
 
     ///
-    /// Changes the size of the screen of a context created with [Context::new_headless_wgpu_with_screen].
+    /// Creates a new context without a window, with a screen that is not shown anywhere, and chooses the backend by what the system has:
+    /// 1. wgpu with a hardware adapter (with the `wgpu` feature),
+    /// 2. OpenGL with a hardware device (with the `headless-gl` feature, on Linux),
+    /// 3. wgpu with a software adapter,
+    /// 4. OpenGL with a software device.
+    ///
+    /// See [Context::new_headless_wgpu_with_screen] and [Context::new_headless_gl_with_screen] for how to use it,
+    /// [Context::as_wgpu] and [Context::as_gl] tell which backend was chosen.
+    ///
+    #[cfg(any(
+        all(feature = "wgpu", not(target_arch = "wasm32")),
+        all(feature = "headless-gl", target_os = "linux")
+    ))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "wgpu", feature = "headless-gl"))))]
+    pub fn new_headless_with_screen(
+        width: u32,
+        height: u32,
+        depth: bool,
+        multisample: bool,
+    ) -> Result<Self, CoreError> {
+        let mut result = Err(CoreError::ContextCreation(
+            "no backend without a window is compiled in".to_string(),
+        ));
+        for hardware in [true, false] {
+            #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+            {
+                use backend::wgpu::AdapterPreference;
+                let preference = if hardware {
+                    AdapterPreference::Hardware
+                } else {
+                    AdapterPreference::Any
+                };
+                result =
+                    Self::headless_wgpu_with_screen(width, height, depth, multisample, preference);
+                if result.is_ok() {
+                    return result;
+                }
+            }
+            #[cfg(all(feature = "headless-gl", target_os = "linux"))]
+            {
+                result = Self::headless_gl_with_screen(width, height, depth, multisample, hardware);
+                if result.is_ok() {
+                    return result;
+                }
+            }
+        }
+        result
+    }
+
+    ///
+    /// Changes the size of the screen of a context created with [Context::new_headless_wgpu_with_screen],
+    /// [Context::new_headless_gl_with_screen] or [Context::new_headless_with_screen].
     /// The content of the screen is lost. Returns an error for every other context, the screen of a window follows the window.
     ///
-    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
-    #[cfg_attr(docsrs, doc(cfg(feature = "wgpu")))]
+    #[cfg(any(
+        all(feature = "wgpu", not(target_arch = "wasm32")),
+        all(feature = "headless-gl", target_os = "linux")
+    ))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "wgpu", feature = "headless-gl"))))]
     pub fn resize_offscreen_screen(&self, width: u32, height: u32) -> Result<(), CoreError> {
-        self.offscreen_backend()?.resize_screen(width, height);
-        Ok(())
+        match &*self.backend {
+            #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+            backend::Backend::Wgpu(wgpu) if wgpu.has_offscreen_screen() => {
+                wgpu.resize_screen(width, height);
+                Ok(())
+            }
+            #[cfg(all(feature = "headless-gl", target_os = "linux"))]
+            backend::Backend::Gl(gl) if gl.resize_offscreen_screen(width, height)? => Ok(()),
+            _ => Err(Self::no_offscreen_screen()),
+        }
     }
 
     ///
-    /// Ends a frame of a context created with [Context::new_headless_wgpu_with_screen]: hands everything that was drawn since
-    /// the last call to the graphics card, like a window does when it shows a frame. Reading from the screen does the same,
+    /// Ends a frame of a context with an offscreen screen (see [Context::resize_offscreen_screen]): hands everything that was drawn
+    /// since the last call to the graphics card, like a window does when it shows a frame. Reading from the screen does the same,
     /// so this is only necessary for frames that are not read. Returns an error for every other context.
     ///
-    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
-    #[cfg_attr(docsrs, doc(cfg(feature = "wgpu")))]
+    #[cfg(any(
+        all(feature = "wgpu", not(target_arch = "wasm32")),
+        all(feature = "headless-gl", target_os = "linux")
+    ))]
+    #[cfg_attr(docsrs, doc(cfg(any(feature = "wgpu", feature = "headless-gl"))))]
     pub fn submit_offscreen_screen(&self) -> Result<(), CoreError> {
-        self.offscreen_backend()?.present()
+        match &*self.backend {
+            #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+            backend::Backend::Wgpu(wgpu) if wgpu.has_offscreen_screen() => wgpu.present(),
+            #[cfg(all(feature = "headless-gl", target_os = "linux"))]
+            backend::Backend::Gl(gl) if gl.has_offscreen_screen() => {
+                use crate::context::HasContext;
+                unsafe { gl.context.flush() };
+                Ok(())
+            }
+            _ => Err(Self::no_offscreen_screen()),
+        }
     }
 
-    /// The wgpu backend if it has a screen that is not the one of a window.
-    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
-    fn offscreen_backend(&self) -> Result<&backend::wgpu::WgpuBackend, CoreError> {
-        match &*self.backend {
-            backend::Backend::Wgpu(wgpu) if wgpu.has_offscreen_screen() => Ok(wgpu),
-            _ => Err(CoreError::ContextError(
-                "the context has no offscreen screen, create it with Context::new_headless_wgpu_with_screen"
-                    .to_string(),
-            )),
-        }
+    #[cfg(any(
+        all(feature = "wgpu", not(target_arch = "wasm32")),
+        all(feature = "headless-gl", target_os = "linux")
+    ))]
+    fn no_offscreen_screen() -> CoreError {
+        CoreError::ContextError(
+            "the context has no offscreen screen, create it with Context::new_headless_with_screen"
+                .to_string(),
+        )
     }
 
     ///

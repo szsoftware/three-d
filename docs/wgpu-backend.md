@@ -25,6 +25,7 @@ Without the feature, wgpu is not compiled and the dependencies are the same as u
 | No window (tests, server) | `Context::new_headless_wgpu()` |
 | No window, but a screen you show yourself | `Context::new_headless_wgpu_with_screen(width, height, depth, multisample)` |
 | Your own wgpu device | `Context::from_wgpu(device, queue)` |
+| No window, a screen you show yourself, with the best backend the system has | `Context::new_headless_with_screen(width, height, depth, multisample)` |
 
 `BackendPreference::Auto` takes wgpu if there is a hardware adapter and OpenGL/WebGL otherwise.
 A browser cannot wait for WebGPU, so only `Window::new_async` can give you WebGPU there. `Window::new_with_backend` with `Auto` means WebGL2 in a browser.
@@ -56,6 +57,7 @@ context.resize_offscreen_screen(new_width, new_height)?;
 - The pixels are RGBA and the first row is the top row of the image, as for every `read_color` of `three-d` with both backends. (Positions inside a render target, such as a viewport or a scissor box, count from the bottom left.)
 - The last two arguments say whether the screen has a depth buffer and whether it is multisampled (four samples per pixel).
 - Reading hands the frame to the graphics card. For a frame that is not read, call `context.submit_offscreen_screen()` at its end instead.
+- **Graphics cards without a usable Vulkan driver** (for example older integrated ones on Linux): wgpu only finds a software adapter there, which is slow. With the feature `headless-gl`, `Context::new_headless_gl_with_screen` creates the same kind of context with the OpenGL backend (Linux only, through EGL), and it is used in exactly the same way. `Context::new_headless_with_screen` chooses for you: wgpu on hardware, then OpenGL on hardware, then wgpu in software, then OpenGL in software. `context.as_wgpu()` and `context.as_gl()` tell what it chose. An OpenGL context has to be used on the thread that created it.
 - Before you drop such a context while the application keeps running, empty its program cache with `context.programs.write().unwrap().clear()`. The cached programs hold the context, so otherwise it and its graphics device are never freed.
 - This is only for native targets, since reading has to wait for the graphics card. In a browser use a canvas.
 
