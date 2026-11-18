@@ -33,6 +33,7 @@ mod error;
 #[cfg(feature = "wgpu")]
 mod gpu;
 mod light;
+mod photons;
 #[cfg(feature = "three-d")]
 mod preview;
 #[cfg(all(feature = "three-d", not(target_arch = "wasm32")))]

@@ -19,6 +19,7 @@ pub(crate) struct Job {
     /// The camera with the viewport of the reduced resolution.
     pub camera: Camera,
     pub max_bounces: u32,
+    pub caustic_photons: u32,
     pub max_samples: u32,
     pub denoiser: Option<AtrousDenoiser>,
 }
@@ -145,6 +146,7 @@ fn run(shared: Arc<(Mutex<State>, Condvar)>, width: u32, height: u32) {
         }
         let settings = TraceSettings {
             max_bounces: job.max_bounces,
+            caustic_photons: job.caustic_photons,
             ..Default::default()
         };
         // Samples are added until the time for a hand over has come, so the threads trace instead of waiting for the

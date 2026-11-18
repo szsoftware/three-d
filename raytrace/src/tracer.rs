@@ -3,6 +3,7 @@
 //!
 
 use crate::light::*;
+use crate::photons::*;
 use crate::render_image::FEATURE_WORDS;
 use crate::sampling::*;
 use crate::{
@@ -40,6 +41,18 @@ pub struct TraceSettings {
     /// Brightest value a single sample may add after the first bounce, in cd/m². Removes the rare very bright
     /// pixels (fireflies) at the cost of a little energy. `None` keeps every sample as it is.
     pub indirect_clamp: Option<f32>,
+    ///
+    /// Photons shot per call from the sun, directional and point lights at solid glass (transmissive and not thin
+    /// walled), for caustics: the light such glass bends onto surfaces. 0 leaves caustics out and lets shadow rays
+    /// pass solid glass straight, which is faster but shows neither the focused light nor the true shadow.
+    /// Only the [CpuReferenceTracer] shoots photons so far, the `ComputeTracer` ignores this.
+    ///
+    pub caustic_photons: u32,
+    ///
+    /// Radius in scene units within which photons light a point, for the first call. It shrinks with every call
+    /// (progressive photon mapping), so caustics get sharp and the image converges to the right result.
+    ///
+    pub caustic_radius: f32,
 }
 
 impl Default for TraceSettings {
@@ -49,6 +62,8 @@ impl Default for TraceSettings {
             max_bounces: 8,
             seed: 0,
             indirect_clamp: None,
+            caustic_photons: 0,
+            caustic_radius: 0.02,
         }
     }
 }
@@ -85,8 +100,9 @@ pub trait Tracer {
 ///
 /// It is the reference for the GPU tracers: unbiased apart from what is listed here, deterministic for a seed, and
 /// written for clarity over speed. Paths sample the sun, directional and point lights at every diffuse or glossy
-/// bounce and the sky by the material. Not included: caustics (light focused by glass or mirrors onto a surface) and
-/// light through solid glass, which is approximated by letting shadow rays through transmissive surfaces.
+/// bounce and the sky by the material. Caustics through solid glass come from photons when
+/// [TraceSettings::caustic_photons] is set, which makes the result consistent rather than unbiased; without them,
+/// light through solid glass is approximated by letting shadow rays through. Not included: caustics of mirrors.
 ///
 #[derive(Debug, Default)]
 pub struct CpuReferenceTracer {
@@ -158,7 +174,14 @@ impl Tracer for CpuReferenceTracer {
             width: render_image.width(),
             height: render_image.height(),
             first_sample: render_image.sample_count(),
+            caustics: None,
         };
+        let mut context = context;
+        if settings.caustic_photons > 0 {
+            let map = context.shoot_photons(render_image.sample_count());
+            context.caustics = (!map.is_empty()).then_some(map);
+        }
+        let context = context;
         let width = render_image.width() as usize;
         let threads = self
             .thread_count()
@@ -291,6 +314,8 @@ struct PathContext<'a> {
     width: u32,
     height: u32,
     first_sample: u32,
+    /// Photons through glass of this call, if caustics are on and photons landed.
+    caustics: Option<PhotonMap>,
 }
 
 /// The surface at a hit, in world space.
@@ -359,6 +384,14 @@ impl PathContext<'_> {
         let mut last_was_delta = true;
         // Density of the last direction drawn from a material, for weighting area lights hit by chance
         let mut last_pdf = 0.0;
+        // What happened since the last diffuse or glossy bounce, to count light only once: either the light sampled
+        // there directly (straight through thin glass, and through solid glass without caustics) or the photons
+        // through glass, or the light the path hits now
+        let mut diffuse_seen = false;
+        let mut diffuse_origin = origin;
+        let mut glass_reflected = false;
+        let mut glass_bent = false;
+        let caustics = self.settings.caustic_photons > 0;
         let mut bounce = 0;
         loop {
             let light_hit = self.nearest_area_light(origin, direction);
@@ -371,20 +404,42 @@ impl PathContext<'_> {
             else {
                 if let Some((light, light_hit)) = light_hit {
                     // Area lights end the path; their light was also sampled directly, so both share it
-                    let weight = if last_was_delta {
-                        1.0
-                    } else {
+                    let weight = if !last_was_delta {
                         power_heuristic(
                             last_pdf,
                             area_light_pdf(light, origin, direction, light_hit.distance),
                         )
+                    } else if !diffuse_seen || glass_reflected {
+                        // Seen in glass from the camera, or by a way the light was not sampled
+                        1.0
+                    } else if !glass_bent {
+                        // Straight through thin glass, the direction drawn at the last diffuse bounce
+                        let at = origin + direction * light_hit.distance;
+                        power_heuristic(
+                            last_pdf,
+                            area_light_pdf(
+                                light,
+                                diffuse_origin,
+                                direction,
+                                (at - diffuse_origin).magnitude(),
+                            ),
+                        )
+                    } else {
+                        // Through solid glass the light was sampled straight already
+                        0.0
                     };
                     result += self.add(bounce, mul(throughput, light_hit.radiance) * weight);
                     break;
                 }
                 result += self.add(
                     bounce,
-                    mul(throughput, self.environment(direction, last_was_delta)),
+                    mul(
+                        throughput,
+                        self.environment(
+                            direction,
+                            last_was_delta && (!diffuse_seen || (glass_reflected && !caustics)),
+                        ),
+                    ),
                 );
                 break;
             };
@@ -415,10 +470,13 @@ impl PathContext<'_> {
                 if rng.next_f32() < fresnel_dielectric(cos_i, eta) {
                     direction = reflect(v, n);
                     origin = offset(surface.position, ng);
+                    glass_reflected = true;
+                    glass_bent = true;
                 } else {
                     throughput = mul(throughput, m.base_color);
                     if !m.thin_walled {
                         direction = refract(v, n, 1.0 / eta).unwrap_or_else(|| reflect(v, n));
+                        glass_bent = true;
                     }
                     origin = offset(surface.position, -ng);
                 }
@@ -430,6 +488,14 @@ impl PathContext<'_> {
                     bounce,
                     mul(throughput, self.direct_light(p, v, n, ng, m, rng)),
                 );
+                if let Some(map) = &self.caustics {
+                    let mut gathered = vec3(0.0, 0.0, 0.0);
+                    map.gather(surface.position, ng, |photon| {
+                        gathered +=
+                            mul(evaluate_material(m, v, -photon.direction, n), photon.power);
+                    });
+                    result += self.add(bounce, mul(throughput, gathered / map.area()));
+                }
 
                 let Some((l, weight, pdf)) = sample_material(m, v, n, rng) else {
                     break;
@@ -442,6 +508,10 @@ impl PathContext<'_> {
                 direction = l;
                 origin = p;
                 last_was_delta = false;
+                diffuse_seen = true;
+                diffuse_origin = p;
+                glass_reflected = false;
+                glass_bent = false;
             }
 
             bounce += 1;
@@ -459,6 +529,110 @@ impl PathContext<'_> {
             }
         }
         result
+    }
+
+    ///
+    /// The photons of one call, the `pass`th: from the lights that cast caustics through solid glass to the first
+    /// surface behind it that is not glass. Light that only passed thin glass is left out, shadow rays find it.
+    ///
+    fn shoot_photons(&self, pass: u32) -> PhotonMap {
+        let radius = self.settings.caustic_radius * ((pass + 1) as f32).powf(-1.0 / 6.0);
+        let spheres = glass_spheres(self.scene);
+        let sources = caustic_sources(self.scene);
+        let root = self.accel.instance_hierarchy().nodes.first();
+        if spheres.is_empty() || sources.is_empty() || root.is_none() {
+            return PhotonMap::new(Vec::new(), radius);
+        }
+        let root = root.expect("a root");
+        let (min, max) = (Vec3::from(root.min), Vec3::from(root.max));
+        let center = (min + max) * 0.5;
+        let extent = (max - min).magnitude();
+        let per_source = (self.settings.caustic_photons / sources.len() as u32).max(1);
+        let mut photons = Vec::new();
+        for (s, source) in sources.iter().enumerate() {
+            let mut rng = Rng::new(
+                self.settings.seed ^ pass.wrapping_mul(0x9e37_79b9),
+                0x5eed_0000_0000 ^ ((s as u64) << 32) ^ pass as u64,
+            );
+            for _ in 0..per_source {
+                let Some(emission) = source.emit(&spheres, per_source, &mut rng) else {
+                    break;
+                };
+                // Parallel light starts outside the scene
+                let origin = if matches!(source, CausticSource::Parallel { .. }) {
+                    let point = emission.origin;
+                    point - emission.direction * ((point - center).magnitude() + extent)
+                } else {
+                    emission.origin
+                };
+                self.trace_photon(
+                    origin,
+                    emission.direction,
+                    emission.power,
+                    &mut rng,
+                    &mut photons,
+                );
+            }
+        }
+        PhotonMap::new(photons, radius)
+    }
+
+    /// Follows a photon through glass and keeps it where it lands, if the glass bent it.
+    fn trace_photon(
+        &self,
+        mut origin: Vec3,
+        mut direction: Vec3,
+        mut power: Vec3,
+        rng: &mut Rng,
+        photons: &mut Vec<Photon>,
+    ) {
+        let mut bent = false;
+        for _ in 0..self.settings.max_bounces.max(1) + 8 {
+            let Some(hit) = self
+                .accel
+                .intersect(self.scene, origin, direction, f32::INFINITY)
+            else {
+                return;
+            };
+            let surface = self.surface(&hit, direction);
+            let m = &surface.material;
+            let v = -direction;
+            let ng = surface.geometric_normal;
+            let mut n = surface.shading_normal;
+            if n.dot(v) <= 0.0 {
+                n = ng;
+            }
+            if m.transmission > 0.0 && rng.next_f32() < m.transmission {
+                // The same choices as the paths from the camera
+                let eta = if m.thin_walled || surface.front_face {
+                    m.index_of_refraction
+                } else {
+                    1.0 / m.index_of_refraction
+                };
+                let cos_i = n.dot(v).clamp(0.0, 1.0);
+                if rng.next_f32() < fresnel_dielectric(cos_i, eta) {
+                    direction = reflect(v, n);
+                    origin = offset(surface.position, ng);
+                    bent = true;
+                } else {
+                    power = mul(power, m.base_color);
+                    if !m.thin_walled {
+                        direction = refract(v, n, 1.0 / eta).unwrap_or_else(|| reflect(v, n));
+                        bent = true;
+                    }
+                    origin = offset(surface.position, -ng);
+                }
+            } else {
+                if bent {
+                    photons.push(Photon {
+                        position: surface.position,
+                        direction,
+                        power,
+                    });
+                }
+                return;
+            }
+        }
     }
 
     /// Contribution clamped after the first bounce if asked for.
@@ -565,6 +739,7 @@ impl PathContext<'_> {
         rng: &mut Rng,
     ) -> Vec3 {
         let mut result = vec3(0.0, 0.0, 0.0);
+        let photons = self.settings.caustic_photons > 0;
         if let RtEnvironment::Sky(sky) = self.scene.environment() {
             if sky.sun_illuminance() > 0.0 {
                 let (t, b) = orthonormal_basis(sky.sun_direction());
@@ -579,6 +754,7 @@ impl PathContext<'_> {
                     l,
                     f32::INFINITY,
                     sky.sun_color() * sky.sun_illuminance(),
+                    photons,
                 );
             }
         }
@@ -590,8 +766,17 @@ impl PathContext<'_> {
                     illuminance,
                 } => {
                     let l = -direction.normalize();
-                    result +=
-                        self.light_from(p, v, n, ng, m, l, f32::INFINITY, *color * *illuminance);
+                    result += self.light_from(
+                        p,
+                        v,
+                        n,
+                        ng,
+                        m,
+                        l,
+                        f32::INFINITY,
+                        *color * *illuminance,
+                        photons,
+                    );
                 }
                 RtLight::Point {
                     position,
@@ -612,6 +797,7 @@ impl PathContext<'_> {
                             l,
                             d * (1.0 - 1e-4),
                             *color * (*intensity / d2),
+                            photons,
                         );
                     }
                 }
@@ -630,6 +816,7 @@ impl PathContext<'_> {
                             s.direction,
                             s.distance * (1.0 - 1e-4),
                             s.radiance * weight,
+                            false,
                         );
                     }
                 }
@@ -662,6 +849,7 @@ impl PathContext<'_> {
         l: Vec3,
         distance: f32,
         e: Vec3,
+        photons: bool,
     ) -> Vec3 {
         let cos = n.dot(l);
         if cos <= 0.0 || ng.dot(l) <= 0.0 {
@@ -671,18 +859,21 @@ impl PathContext<'_> {
         if f == vec3(0.0, 0.0, 0.0) {
             return f;
         }
-        let transmittance = self.transmittance(p, l, distance);
+        let transmittance = self.transmittance(p, l, distance, photons);
         mul(mul(f, e), transmittance) * cos
     }
 
     /// How much light passes along a shadow ray: nothing through opaque surfaces, some through glass.
-    fn transmittance(&self, origin: Vec3, direction: Vec3, distance: f32) -> Vec3 {
+    ///
+    /// With `photons` the light comes as photons through solid glass, which then casts a full shadow.
+    ///
+    fn transmittance(&self, origin: Vec3, direction: Vec3, distance: f32, photons: bool) -> Vec3 {
         let mut t = vec3(1.0, 1.0, 1.0);
         self.accel
             .for_each_hit(self.scene, origin, direction, distance, |hit| {
                 let instance = &self.scene.instances()[hit.instance as usize];
                 let m = &self.scene.materials()[instance.material.0 as usize];
-                if m.transmission <= 0.0 {
+                if m.transmission <= 0.0 || (photons && bends_light(m)) {
                     t = vec3(0.0, 0.0, 0.0);
                     return true;
                 }

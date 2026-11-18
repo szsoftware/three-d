@@ -1064,6 +1064,12 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
     var last_was_delta = true;
     // Density of the last direction drawn from a material, for weighting area lights hit by chance
     var last_pdf = 0.0;
+    // What happened since the last diffuse or glossy bounce, to count light only once: either the light sampled
+    // there directly (straight through glass) or the light the path hits now
+    var diffuse_seen = false;
+    var diffuse_origin = origin;
+    var glass_reflected = false;
+    var glass_bent = false;
     var bounce = 0u;
     loop {
         // The nearest area light, ignoring the scene
@@ -1085,12 +1091,21 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
             var weight = 1.0;
             if !last_was_delta {
                 weight = power_heuristic(last_pdf, area_light_pdf(light, origin, direction, light_distance));
+            } else if diffuse_seen && !glass_reflected {
+                if glass_bent {
+                    // Through solid glass the light was sampled straight already
+                    weight = 0.0;
+                } else {
+                    // Straight through thin glass, the direction drawn at the last diffuse bounce
+                    let at = origin + direction * light_distance;
+                    weight = power_heuristic(last_pdf, area_light_pdf(light, diffuse_origin, direction, length(at - diffuse_origin)));
+                }
             }
             result += clamped(bounce, throughput * light.color.rgb * weight);
             break;
         }
         if hit.instance == NONE {
-            result += clamped(bounce, throughput * environment(direction, last_was_delta));
+            result += clamped(bounce, throughput * environment(direction, last_was_delta && (!diffuse_seen || glass_reflected)));
             break;
         }
         let s = surface_at(hit, direction);
@@ -1121,11 +1136,14 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
             if next_f32() < fresnel_dielectric(cos_i, eta) {
                 direction = reflect_about(v, n);
                 origin = offset_point(s.position, ng);
+                glass_reflected = true;
+                glass_bent = true;
             } else {
                 throughput = throughput * m.base_color.rgb;
                 if !thin_walled {
                     let r = refract_through(v, n, 1.0 / eta);
                     direction = select(reflect_about(v, n), r.xyz, r.w > 0.0);
+                    glass_bent = true;
                 }
                 origin = offset_point(s.position, -ng);
             }
@@ -1143,6 +1161,10 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
             direction = next.direction;
             origin = p;
             last_was_delta = false;
+            diffuse_seen = true;
+            diffuse_origin = p;
+            glass_reflected = false;
+            glass_bent = false;
         }
 
         bounce += 1u;

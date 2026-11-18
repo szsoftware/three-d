@@ -136,8 +136,19 @@ binds (128 MB guaranteed by WebGPU), the largest ones are halved in size until t
   from PCG. In the garden this lowers the noise at equal samples by about a quarter, so about 1.7 times fewer samples
   give the same image.
 - Shadow rays pass through transmissive surfaces with their transmission and Fresnel term, so sunlight falls through
-  windows into rooms.
-- Not included: caustics (light focused by glass or mirrors onto a surface) and refraction on the way to a light.
+  windows into rooms. Light that reaches a surface through glass is counted once: the sun disc and area lights seen
+  through glass after a diffuse bounce no longer add to what the shadow rays found (before, sunlight through a thin
+  window was counted twice by the paths that happened to hit the sun disc).
+- Caustics of solid glass (`thin_walled: false`) with `TraceSettings::caustic_photons`: every call shoots that many
+  photons from the sun, directional and point lights, aimed at the bounding spheres of the solid glass, follows them
+  through it like the camera paths and keeps them where they land. Points of the camera paths on diffuse or glossy
+  surfaces gather the photons within `caustic_radius`, which shrinks with every call (progressive photon mapping),
+  so focused light gets sharp and the image converges. Shadow rays of these lights then stop at solid glass, so the
+  shadow of a glass ball is dark around its bright focus. Area lights and the sky reach surfaces behind glass by the
+  paths themselves. `RaytracePreview` shoots 20 000 photons per sample on the CPU (`PreviewSettings::cpu_caustic_photons`);
+  the compute tracer has no caustics yet and lets the light pass straight. A glass face lying exactly on another
+  surface sends its light below it; leave a millimetre between them.
+- Not included: caustics of mirrors and of the light of area lights and the sky.
 - Deterministic: the same seed gives the same image with any number of threads.
 
 ## Tests
@@ -146,7 +157,8 @@ binds (128 MB guaranteed by WebGPU), the largest ones are halved in size until t
 noon at the solstices and equinox, the material model for energy conservation, and the tracer against values known
 from physics: a white sphere disappears in a uniform environment (white furnace), a white ground under the sky
 reflects E/π, a point light falls off with the square of the distance, and a pane of glass lets 96 % of the light
-through. A reference image of the garden scene is compared in blocks of 4 × 4 pixels, write it again with
+through. `tests/caustics.rs` checks that photons through a glass slab light the floor as brightly as the straight
+shadow rays and that a glass ball gathers the light of its shadow into a bright focus without making light. A reference image of the garden scene is compared in blocks of 4 × 4 pixels, write it again with
 `THREE_D_WRITE_REFERENCE=1 cargo test --release -p three-d-raytrace`.
 
 With the `wgpu` feature, `tests/gpu.rs` runs the same physical checks with the compute tracer and compares its garden
@@ -156,3 +168,6 @@ an adapter.
 The examples render the same scene: `cargo run --release -p three-d-raytrace --example garden -- 256 960 600` on the
 CPU and `cargo run --release -p three-d-raytrace --features wgpu --example garden_gpu -- 256 960 600` with the compute
 tracer.
+`cargo run --release -p three-d-raytrace --example caustics -- 64 640 400` renders a glass ball and a glass block on a
+terrace in the sun, without and with caustics (64 samples at 640 × 400 take 5 s and 23 s with 200 000 photons per
+sample on four cores).

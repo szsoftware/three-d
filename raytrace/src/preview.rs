@@ -70,6 +70,11 @@ pub struct PreviewSettings {
     pub max_samples: u32,
     /// Most bounces of a path.
     pub max_bounces: u32,
+    ///
+    /// Photons per sample for caustics of solid glass on the CPU, see [TraceSettings::caustic_photons]. They cost
+    /// time only in scenes with such glass; 0 lets light pass the glass straight. The GPU has no caustics yet.
+    ///
+    pub cpu_caustic_photons: u32,
     /// Exposure and curve of [RaytracePreview::render].
     pub tone_mapping: ToneMapping,
     /// Smooths the noise of the first samples with this filter, `None` to show the samples as they are.
@@ -84,6 +89,7 @@ impl Default for PreviewSettings {
             cpu_in_background: true,
             max_samples: 1024,
             max_bounces: 6,
+            cpu_caustic_photons: 20_000,
             tone_mapping: ToneMapping::default(),
             denoiser: Some(crate::AtrousDenoiser::default()),
         }
@@ -251,7 +257,8 @@ impl RaytracePreview {
         let rebuild = (settings.cpu_downscale != self.settings.cpu_downscale
             || settings.cpu_in_background != self.settings.cpu_in_background)
             && self.on_cpu();
-        let restart = settings.max_bounces != self.settings.max_bounces;
+        let restart = settings.max_bounces != self.settings.max_bounces
+            || settings.cpu_caustic_photons != self.settings.cpu_caustic_photons;
         self.settings = settings;
         if rebuild {
             self.resize(self.width, self.height);
@@ -328,6 +335,7 @@ impl RaytracePreview {
                     scene: handed.clone().expect("handed over"),
                     camera: small,
                     max_bounces: self.settings.max_bounces,
+                    caustic_photons: self.settings.cpu_caustic_photons,
                     max_samples: self.settings.max_samples,
                     denoiser: self.settings.denoiser,
                 });
@@ -359,6 +367,7 @@ impl RaytracePreview {
         }
         let settings = TraceSettings {
             max_bounces: self.settings.max_bounces,
+            caustic_photons: self.settings.cpu_caustic_photons,
             ..Default::default()
         };
         match &mut self.engine {
