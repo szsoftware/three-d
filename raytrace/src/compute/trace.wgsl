@@ -945,6 +945,16 @@ fn next_shadow_ray(first: u32, p: vec3<f32>, v: vec3<f32>, n: vec3<f32>, ng: vec
                     l = to_light / d;
                     distance = d * (1.0 - 1e-4);
                     e = light.color.rgb / d2;
+                    if light.a.w > 0.0 {
+                        // A luminaire: the intensity of its profile towards the point
+                        let at = profile_cell(-l, light.a.xyz, light.b.xyz, light.b.w);
+                        let w = u32(light.a.w) - 1u;
+                        e *= mix(
+                            mix(extra_float(w + at.first), extra_float(w + at.first + 1u), at.vertical),
+                            mix(extra_float(w + at.second), extra_float(w + at.second + 1u), at.vertical),
+                            at.horizontal,
+                        );
+                    }
                 }
             } else {
                 let u1 = next_f32();
@@ -968,6 +978,31 @@ fn next_shadow_ray(first: u32, p: vec3<f32>, v: vec3<f32>, n: vec3<f32>, ng: vec
         }
     }
     return ShadowRay(NONE, vec3<f32>(0.0), 0.0, vec3<f32>(0.0));
+}
+
+// Where a direction from a luminaire falls in the table of its profile (ies.rs): the words of the two rows' entries
+// before it, relative to the table, and the weights between them. Rows have 181 values (every degree from straight down
+// to straight up), one row or 73 (every 5° from C0 counterclockwise seen from above).
+struct ProfileCell {
+    first: u32,
+    second: u32,
+    vertical: f32,
+    horizontal: f32,
+}
+
+fn profile_cell(direction: vec3<f32>, down: vec3<f32>, front: vec3<f32>, rows: f32) -> ProfileCell {
+    let vertical = degrees(acos(clamp(dot(direction, down), -1.0, 1.0)));
+    let v0 = min(u32(vertical), 179u);
+    var cell = ProfileCell(v0, v0, vertical - f32(v0), 0.0);
+    if rows > 1.0 {
+        let left = cross(-down, front);
+        let h = (degrees(atan2(dot(direction, left), dot(direction, front))) + 360.0) % 360.0 / 5.0;
+        let h0 = min(u32(h), 71u);
+        cell.first = h0 * 181u + v0;
+        cell.second = (h0 + 1u) * 181u + v0;
+        cell.horizontal = h - f32(h0);
+    }
+    return cell;
 }
 
 // Area lights (light.rs)
@@ -1574,7 +1609,7 @@ fn shoot_photons(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_in
         return;
     }
     let per_source = params.caustic_counts.z;
-    let source_word = params.caustic_layout.z + 8u * (i / per_source);
+    let source_word = params.caustic_layout.z + 16u * (i / per_source);
     let a = photon_vec4(source_word);
     let light = photon_vec4(source_word + 4u);
     // Plain random numbers, independent per photon and pass
@@ -1650,7 +1685,19 @@ fn shoot_photons(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_in
         }
         origin = a.xyz;
     }
-    let power = light.rgb * (total / (f32(per_source) * f32(max(covering, 1u))));
+    var power = light.rgb * (total / (f32(per_source) * f32(max(covering, 1u))));
+    let down = photon_vec4(source_word + 8u);
+    if a.w == 1.0 && down.w > 0.0 {
+        // A luminaire
+        let front = photon_vec4(source_word + 12u);
+        let at = profile_cell(direction, down.xyz, front.xyz, front.w);
+        let w = u32(down.w) - 1u;
+        power *= mix(
+            mix(photon_float(w + at.first), photon_float(w + at.first + 1u), at.vertical),
+            mix(photon_float(w + at.second), photon_float(w + at.second + 1u), at.vertical),
+            at.horizontal,
+        );
+    }
     trace_photon(origin, direction, power);
 }
 

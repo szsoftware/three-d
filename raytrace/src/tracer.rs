@@ -2,6 +2,7 @@
 //! Tracers add samples of the scene to a render image. Every tracer uses the same scene, render image and material model.
 //!
 
+use crate::ies::luminaire_angles;
 use crate::lens::Lens;
 use crate::light::*;
 use crate::photons::*;
@@ -227,6 +228,17 @@ impl Tracer for CpuReferenceTracer {
         render_image.add_samples(settings.samples_per_call);
         Ok(())
     }
+}
+
+/// Intensity of a luminaire's profile towards `direction` (from the luminaire).
+pub(crate) fn profile_intensity(
+    profile: &crate::IesProfile,
+    down: Vec3,
+    front: Vec3,
+    direction: Vec3,
+) -> f32 {
+    let (vertical, horizontal) = luminaire_angles(direction, down, front);
+    profile.intensity(vertical, horizontal)
 }
 
 /// Primary rays of a camera.
@@ -805,6 +817,32 @@ impl PathContext<'_> {
                             l,
                             d * (1.0 - 1e-4),
                             *color * (*intensity / d2),
+                            photons,
+                        );
+                    }
+                }
+                RtLight::Luminaire {
+                    position,
+                    down,
+                    front,
+                    color,
+                    profile,
+                    scale,
+                } => {
+                    let to_light = *position - p;
+                    let d2 = to_light.magnitude2();
+                    if d2 > 0.0 {
+                        let d = d2.sqrt();
+                        let l = to_light / d;
+                        result += self.light_from(
+                            p,
+                            v,
+                            n,
+                            ng,
+                            m,
+                            l,
+                            d * (1.0 - 1e-4),
+                            *color * (*scale * profile_intensity(profile, *down, *front, -l) / d2),
                             photons,
                         );
                     }

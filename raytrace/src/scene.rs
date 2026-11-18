@@ -341,6 +341,24 @@ pub enum RtLight {
         intensity: f32,
     },
     ///
+    /// A luminaire with a measured light distribution from an IES file, small enough to be a point, with hard shadows.
+    /// See [RtLight::luminaire] and [RtLight::luminaire_with_flux].
+    ///
+    Luminaire {
+        /// Position in world coordinates.
+        position: Vec3,
+        /// The direction of the vertical angle 0° of the profile, straight down for a downlight.
+        down: Vec3,
+        /// The direction of the horizontal angle 0° (C0), perpendicular to `down`.
+        front: Vec3,
+        /// Linear color, scaled by the intensities of the profile and `scale`.
+        color: Vec3,
+        /// The light distribution, shared by luminaires of the same kind.
+        profile: std::sync::Arc<crate::IesProfile>,
+        /// Factor on the intensities of the profile, for example for dimming.
+        scale: f32,
+    },
+    ///
     /// A glowing parallelogram, for example a ceiling panel or a window seen as a light, with soft shadows. It shines
     /// from the side `edge_u × edge_v` points to, and from both sides if `two_sided`. Every point emits the same
     /// luminance in every direction, so a one sided light of area A sends out π·A·luminance lumen.
@@ -404,6 +422,57 @@ impl RtLight {
             color,
             luminance: flux / (std::f32::consts::PI * area.max(1e-12)),
             two_sided: false,
+        }
+    }
+
+    ///
+    /// A white luminaire with the intensities of the profile as they are, at `position`, its 0° pointing `down` and C0
+    /// towards `front` (made perpendicular to `down`).
+    ///
+    pub fn luminaire(
+        position: Vec3,
+        down: Vec3,
+        front: Vec3,
+        profile: std::sync::Arc<crate::IesProfile>,
+    ) -> Self {
+        let down = down.normalize();
+        let front = (front - down * front.dot(down)).normalize();
+        Self::Luminaire {
+            position,
+            down,
+            front,
+            color: vec3(1.0, 1.0, 1.0),
+            profile,
+            scale: 1.0,
+        }
+    }
+
+    /// Like [RtLight::luminaire], scaled so that it sends out `flux` lumen.
+    pub fn luminaire_with_flux(
+        position: Vec3,
+        down: Vec3,
+        front: Vec3,
+        profile: std::sync::Arc<crate::IesProfile>,
+        flux: f32,
+    ) -> Self {
+        let scale = flux / profile.flux().max(1e-12);
+        match Self::luminaire(position, down, front, profile) {
+            Self::Luminaire {
+                position,
+                down,
+                front,
+                color,
+                profile,
+                ..
+            } => Self::Luminaire {
+                position,
+                down,
+                front,
+                color,
+                profile,
+                scale,
+            },
+            _ => unreachable!(),
         }
     }
 

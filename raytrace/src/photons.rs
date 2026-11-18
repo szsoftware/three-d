@@ -147,6 +147,8 @@ pub(crate) enum CausticSource {
     Point {
         position: Vec3,
         light: Vec3,
+        /// A luminaire's distribution with its down and front directions, the intensity times `light`.
+        profile: Option<(std::sync::Arc<crate::IesProfile>, Vec3, Vec3)>,
     },
 }
 
@@ -180,6 +182,19 @@ pub(crate) fn caustic_sources(scene: &RtScene) -> Vec<CausticSource> {
             } => sources.push(CausticSource::Point {
                 position: *position,
                 light: *color * *intensity,
+                profile: None,
+            }),
+            RtLight::Luminaire {
+                position,
+                down,
+                front,
+                color,
+                profile,
+                scale,
+            } => sources.push(CausticSource::Point {
+                position: *position,
+                light: *color * *scale,
+                profile: Some((profile.clone(), *down, *front)),
             }),
             _ => {}
         }
@@ -206,8 +221,8 @@ impl CausticSource {
         count: u32,
         rng: &mut Rng,
     ) -> Option<Emission> {
-        match *self {
-            CausticSource::Parallel {
+        match self {
+            &CausticSource::Parallel {
                 direction,
                 light,
                 cos_radius,
@@ -240,7 +255,12 @@ impl CausticSource {
                     power: light * (total / (count as f32 * covering as f32)),
                 })
             }
-            CausticSource::Point { position, light } => {
+            CausticSource::Point {
+                position,
+                light,
+                profile,
+            } => {
+                let (position, mut light) = (*position, *light);
                 let cones: Vec<(Vec3, f32)> = spheres
                     .iter()
                     .map(|(c, r)| {
@@ -266,6 +286,9 @@ impl CausticSource {
                     .count()
                     .max(1);
                 let total: f32 = solid_angles.iter().sum();
+                if let Some((profile, down, front)) = profile {
+                    light *= crate::tracer::profile_intensity(profile, *down, *front, d);
+                }
                 Some(Emission {
                     origin: position,
                     direction: d,
@@ -333,6 +356,7 @@ mod tests {
         let source = CausticSource::Point {
             position: vec3(0.0, 4.0, 0.0),
             light: vec3(1.0, 1.0, 1.0),
+            profile: None,
         };
         let mut flux = 0.0;
         for _ in 0..n {

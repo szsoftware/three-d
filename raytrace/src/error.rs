@@ -19,6 +19,8 @@ pub enum RtError {
     Gpu(String),
     /// The render image has no features for the denoiser, see `RenderImage::with_features`.
     NoFeatures,
+    /// An IES file can not be read, the text says why.
+    Ies(String),
 }
 
 impl std::fmt::Display for RtError {
@@ -32,6 +34,7 @@ impl std::fmt::Display for RtError {
             RtError::Export(why) => write!(f, "export failed: {why}"),
             RtError::Gpu(why) => write!(f, "GPU: {why}"),
             RtError::NoFeatures => write!(f, "the render image collects no features for denoising"),
+            RtError::Ies(why) => write!(f, "IES file: {why}"),
         }
     }
 }
