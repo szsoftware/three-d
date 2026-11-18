@@ -1,0 +1,19 @@
+[package]
+name = "three-d-raytrace"
+version = "0.1.0"
+edition = "2021"
+description = "Path tracing for three-d scenes: a CPU reference tracer now, GPU tracers on the wgpu backend later"
+license = "MIT"
+publish = false
+
+[features]
+default = ["export"]
+# Writing the image as PNG (tone mapped) or OpenEXR (linear HDR)
+export = ["dep:image"]
+
+[dependencies]
+three-d-asset = "0.10"
+image = { version = "0.25", default-features = false, features = ["png", "exr"], optional = true }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
