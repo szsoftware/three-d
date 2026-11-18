@@ -3,15 +3,20 @@
 //! Both need no window: OpenGL through EGL, wgpu on whatever adapter it finds (software renderers are enough).
 //! Without EGL or a wgpu adapter the tests are skipped, unless the environment variable `THREE_D_REQUIRE_WGPU` is set (as in CI).
 //!
+//! OpenGL without a window is only set up for Linux. On the other platforms (Metal on macOS, DirectX 12 on Windows) the wgpu backend
+//! is compared with what OpenGL returned on Linux, which is stored in the directory `reference` next to this file.
+//! After a scenario changed, run the tests on Linux with the environment variable `THREE_D_WRITE_REFERENCE` set to update these files.
+//!
 
 use crate::core::*;
-use glutin::api::egl::{device::Device, display::Display};
-use glutin::config::{ConfigSurfaceTypes, ConfigTemplateBuilder};
-use glutin::context::{ContextApi, ContextAttributesBuilder, Version};
-use glutin::prelude::*;
 
 /// An OpenGL context without a window and what keeps it alive.
+#[cfg(target_os = "linux")]
 pub(super) fn gl_context() -> Result<(Context, impl Sized), String> {
+    use glutin::api::egl::{device::Device, display::Display};
+    use glutin::config::{ConfigSurfaceTypes, ConfigTemplateBuilder};
+    use glutin::context::{ContextApi, ContextAttributesBuilder, Version};
+    use glutin::prelude::*;
     let error = |e: glutin::error::Error| e.to_string();
     let devices: Vec<Device> = Device::query_devices()
         .map_err(|e| e.to_string())?
@@ -66,12 +71,32 @@ pub(super) fn compare_with_outliers(
     };
     // All tests share one EGL display, which is initialized and terminated with the contexts
     super::one_gpu_test_at_a_time();
+    let reference = reference_file();
+    #[cfg(target_os = "linux")]
     let expected = {
-        match gl_context() {
+        let expected = match gl_context() {
             Ok((context, _keep_alive)) => scenario(&context),
             Err(error) => return skip("OpenGL context", error),
+        };
+        if std::env::var("THREE_D_WRITE_REFERENCE").is_ok() {
+            std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
+            std::fs::write(&reference, encode(&expected)).unwrap();
         }
+        // The other platforms rely on the file
+        let stored = std::fs::read(&reference).map(|bytes| decode(&bytes).len());
+        assert_eq!(
+            stored.ok(),
+            Some(expected.len()),
+            "{} is missing or outdated, run the tests with THREE_D_WRITE_REFERENCE=1",
+            reference.display()
+        );
+        expected
     };
+    #[cfg(not(target_os = "linux"))]
+    let expected = decode(
+        &std::fs::read(&reference)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", reference.display())),
+    );
     let actual = match Context::new_headless_wgpu() {
         Ok(context) => {
             let actual = scenario(&context);
@@ -97,6 +122,14 @@ pub(super) fn compare_with_outliers(
                 worst
             }
         });
+    // The software renderers for OpenGL and Vulkan on Linux share their rasterizer, so there every pixel is comparable.
+    // Another rasterizer decides differently for some pixels on the edge of a triangle, which then have the color of what is behind it.
+    // Those pixels are few, while a real mistake (a wrong color, a shifted or flipped image) changes far more of them.
+    let outliers = if cfg!(target_os = "linux") {
+        outliers
+    } else {
+        outliers + EDGE_PIXELS
+    };
     let beyond = expected
         .iter()
         .zip(&actual)
@@ -104,13 +137,67 @@ pub(super) fn compare_with_outliers(
         .count();
     assert!(
         beyond as f32 <= outliers * expected.len() as f32,
-        "{beyond} of {} values differ by more than {tolerance}, the worst is value {}: {} on OpenGL and {} on wgpu",
+        "{beyond} of {} values ({:.2} %, allowed are {:.2} %) differ by more than {tolerance}, the worst is value {}: {} on OpenGL (on Linux) and {} on wgpu",
         expected.len(),
+        100.0 * beyond as f32 / expected.len() as f32,
+        100.0 * outliers,
         worst.0,
         worst.2,
         worst.3
     );
 }
+
+///
+/// The file with what OpenGL returns for the scenario of the current call of [compare] in the current test.
+///
+fn reference_file() -> std::path::PathBuf {
+    thread_local!(static CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) });
+    let call = CALLS.with(|calls| calls.replace(calls.get() + 1));
+    let thread = std::thread::current();
+    let test = thread
+        .name()
+        .expect("a test runs in a thread with its name")
+        .rsplit("::")
+        .next()
+        .unwrap()
+        .to_string();
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/core/backend/wgpu/reference")
+        .join(format!("{test}_{call}.bin"))
+}
+
+/// Values that are a multiple of 1/255 are stored as one byte each (after a 0), everything else as `f32` (after a 1).
+#[cfg(target_os = "linux")]
+fn encode(values: &[f32]) -> Vec<u8> {
+    let bytes: Vec<u8> = values.iter().map(|v| (v * 255.0).round() as u8).collect();
+    if bytes
+        .iter()
+        .zip(values)
+        .all(|(byte, value)| *byte as f32 / 255.0 == *value)
+    {
+        [vec![0], bytes].concat()
+    } else {
+        std::iter::once(1)
+            .chain(values.iter().flat_map(|v| v.to_le_bytes()))
+            .collect()
+    }
+}
+
+fn decode(bytes: &[u8]) -> Vec<f32> {
+    match bytes.split_first() {
+        Some((0, bytes)) => bytes.iter().map(|byte| *byte as f32 / 255.0).collect(),
+        Some((1, bytes)) => bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| f32::from_le_bytes(*v))
+            .collect(),
+        _ => panic!("not a reference file"),
+    }
+}
+
+/// The part of the values that may differ when the reference is from another rasterizer, see [compare_with_outliers].
+const EDGE_PIXELS: f32 = 0.02;
 
 /// One step of a `u8` color channel, plus rounding.
 pub(super) const STEP: f32 = 1.01 / 255.0;
@@ -456,7 +543,8 @@ fn texture_array_and_several_color_targets() {
 
 #[test]
 fn texture_3d() {
-    compare(2.0 * STEP, |context| {
+    // Three steps, because the software adapter of Windows interpolates between the layers a bit less exactly
+    compare(3.0 * STEP, |context| {
         let data: Vec<[u8; 4]> = (0..4).flat_map(|z| pattern(4, 4, 30 + z)).collect();
         let texture = Texture3D::new_empty::<[u8; 4]>(
             context,
@@ -1254,5 +1342,121 @@ fn renderer_with_shadows() {
             )
             .read_color();
         floats(pixels)
+    });
+}
+
+/// The geometry pass of the deferred pipeline packs two integers into one color channel.
+#[test]
+fn bits_packed_into_a_color_channel() {
+    compare(0.1 / 255.0, |context| {
+        let program = screen_program(
+            context,
+            "
+            in vec2 uvs;
+            layout (location = 0) out vec4 outColor;
+            void main() {
+                int o = int(uvs.x * 127.0);
+                int nz = 1;
+                if (uvs.y < 0.5) {
+                    nz = 0;
+                }
+                outColor = vec4(float(o | nz << 7) / 255.0, float(o) / 255.0, float(nz), 1.0);
+            }
+        ",
+        );
+        draw_screen(context, 16, &program, || {})
+    });
+}
+
+/// The lighting pass of the deferred pipeline takes the two integers apart again, for every value a color channel can have.
+#[test]
+fn bits_unpacked_from_a_color_channel() {
+    compare(0.1 / 255.0, |context| {
+        let texture = Texture2D::new(
+            context,
+            &CpuTexture {
+                data: TextureData::RgbaU8((0..=255).map(|i| [i, i, i, 255]).collect()),
+                width: 16,
+                height: 16,
+                min_filter: Interpolation::Nearest,
+                mag_filter: Interpolation::Nearest,
+                mipmap: None,
+                wrap_s: Wrapping::ClampToEdge,
+                wrap_t: Wrapping::ClampToEdge,
+                ..Default::default()
+            },
+        );
+        let program = screen_program(
+            context,
+            "
+            uniform sampler2D tex;
+            in vec2 uvs;
+            layout (location = 0) out vec4 outColor;
+            void main() {
+                float value = texture(tex, uvs).r;
+                int bits = int(floor(value * 255.0));
+                outColor = vec4((bits & 128) == 128 ? 1.0 : 0.0, float(bits & 127) / 127.0, value, 1.0);
+            }
+        ",
+        );
+        draw_screen(context, 16, &program, || {
+            program.use_texture("tex", &texture)
+        })
+    });
+}
+
+/// The lighting pass of the deferred pipeline copies the depth of the geometry pass and leaves out the background.
+#[test]
+fn depth_is_written_by_the_fragment_shader() {
+    compare(1.0e-4, |context| {
+        let program = Program::from_source(context, POSITION_VERTEX, COLOR_FRAGMENT).unwrap();
+        let positions = quad(context, 0.5);
+        let source = depth_texture::<f32>(context, 8, 8);
+        source
+            .as_depth_target()
+            .clear(ClearState::depth(1.0))
+            .write::<CoreError>(|| {
+                program.use_uniform("color", vec4(1.0, 0.0, 0.0, 1.0));
+                program.use_uniform("placement", vec4(0.25, -0.25, 0.5, 0.5));
+                program.use_vertex_attribute("position", &positions);
+                program.draw_arrays(RenderStates::default(), Viewport::new_at_origo(8, 8), 6);
+                Ok(())
+            })
+            .unwrap();
+        let copy = screen_program(
+            context,
+            "
+            uniform sampler2D depthMap;
+            in vec2 uvs;
+            layout (location = 0) out vec4 outColor;
+            void main() {
+                float depth = texture(depthMap, uvs).r;
+                if (depth > 0.99999) {
+                    discard;
+                }
+                gl_FragDepth = depth;
+                outColor = vec4(depth, uvs, 1.0);
+            }
+        ",
+        );
+        let color = color_texture(context, 8, 8);
+        let depth = depth_texture::<f32>(context, 8, 8);
+        let target = RenderTarget::new(color.as_color_target(None), depth.as_depth_target());
+        target
+            .clear(ClearState::color_and_depth(0.2, 0.2, 0.2, 1.0, 0.9))
+            .write::<CoreError>(|| {
+                copy.use_depth_texture("depthMap", &source);
+                full_screen_draw(
+                    context,
+                    &copy,
+                    RenderStates::default(),
+                    Viewport::new_at_origo(8, 8),
+                );
+                Ok(())
+            })
+            .unwrap();
+        let mut values = floats(target.read_color());
+        values.extend(target.read_depth());
+        values
     });
 }

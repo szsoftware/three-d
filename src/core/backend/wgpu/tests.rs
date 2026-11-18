@@ -404,3 +404,38 @@ fn errors_are_collected() {
     let _ = context.error_check();
     context.error_check().unwrap();
 }
+
+///
+/// Says which graphics API and adapter the tests run on (visible with `cargo test adapter -- --nocapture`).
+/// If the environment variable `THREE_D_EXPECT_BACKEND` is set (as in CI), it must be that API, for example `metal`, `dx12` or `vulkan`.
+///
+#[test]
+fn adapter_is_the_expected_one() {
+    super::one_gpu_test_at_a_time();
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = match pollster::block_on(super::WgpuBackend::request(
+        &instance,
+        super::AdapterPreference::Any,
+        None,
+    )) {
+        Ok((_, adapter)) => adapter,
+        Err(error) if std::env::var("THREE_D_REQUIRE_WGPU").is_ok() => {
+            panic!("no wgpu adapter: {error}")
+        }
+        Err(error) => {
+            eprintln!("skipped, no wgpu adapter: {error}");
+            return;
+        }
+    };
+    let info = adapter.get_info();
+    println!(
+        "wgpu adapter: {} ({:?}, {:?}, driver {} {})",
+        info.name, info.backend, info.device_type, info.driver, info.driver_info
+    );
+    if let Ok(expected) = std::env::var("THREE_D_EXPECT_BACKEND") {
+        assert_eq!(
+            format!("{:?}", info.backend).to_lowercase(),
+            expected.to_lowercase()
+        );
+    }
+}

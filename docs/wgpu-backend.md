@@ -57,7 +57,9 @@ The images are the same as with OpenGL within a few steps of 255 per channel. Th
 - **Float textures** with 32 bits are filtered linearly only if the adapter supports it (`FLOAT32_FILTERABLE`), otherwise with the nearest texel.
 - **Errors.** For a context created by `three-d`, validation errors are collected and returned by `Context::error_check` (at most 64 between two checks). For `Context::from_wgpu` they go to the error handler of your device.
 - **Custom GLSL.** The translation handles what the shaders of `three-d` and its examples use. A construct it does not know gives a `CoreError::ShaderCompilation` that names it, when the program is created. Known limits: no arrays of samplers, no arrays as inputs or outputs of a shader stage, and a function with a sampler parameter can only be called with the name of a sampler. Shaders are written without a version line, as for OpenGL.
-- **Not there yet:** rendering into a texture view of another wgpu application, compute shaders.
+- **Arrays of numbers in your own uniform blocks.** In a block you write yourself (`uniform Name { ... }`), an array of `float`, `int`, `uint` or of vectors with two components is not placed the same way on Metal and in the browser as in OpenGL. Use `vec4` (or `ivec4`, `uvec4`) as the element there. Loose uniforms like `uniform float weights[4];` are converted by themselves, but can only be used with an index (`weights[i]`).
+- **DirectX 12 needs the DXC shader compiler for some shaders.** Windows comes with an old shader compiler (FXC), which fails on shaders that sample a texture inside a loop. Of `three-d` itself that are the volume materials (`IsosurfaceMaterial` and the ray marching of voxel grids) and `WaterMaterial`, the error is `unable to unroll loop`. With the new compiler (DXC) they work. Either put `dxcompiler.dll` (from the [DXC releases](https://github.com/microsoft/DirectXShaderCompiler/releases), version 1.8.2502 or newer) next to your program, it is found by itself, or add `wgpu` in the version `three-d` uses to your own `Cargo.toml` with its feature `static-dxc`, which builds DXC into your program (that build downloads a prebuilt library and is not available for Windows on ARM).
+- **Not there yet:** rendering into a texture view of another wgpu application.
 
 ## Shaders in WGSL
 
@@ -111,10 +113,50 @@ fn fragment(in: Varyings) -> @location(0) vec4<f32> {
 
 Good to know:
 
-- The shader uses the conventions of OpenGL, like a GLSL shader of `three-d`. The matrices of a `Camera` work as they are: return the position in the clip space of OpenGL (y up, z from `-w` to `w`), `three-d` converts it. The first row of a texture is the bottom one.
+- The shader uses the conventions of OpenGL, like a GLSL shader of `three-d`. The matrices of a `Camera` work as they are: return the position in the clip space of OpenGL (y up, z from `-w` to `w`), `three-d` converts it. The texel (0, 0) of a texture is at the bottom left of the image.
 - Textures have `f32` values: `texture_2d<f32>`, `texture_2d_array<f32>`, `texture_cube<f32>` or `texture_3d<f32>`. A depth texture is bound the same way and gives the depth in the first channel. Depth texture types, multisampled textures, integer textures and comparison samplers are not supported.
 - A mistake in the source or against the conventions gives a `CoreError::ShaderCompilation` that says what is wrong.
 - With an OpenGL/WebGL context, `Program::from_wgsl_source` returns an error. The materials and effects of `three-d` itself stay in GLSL.
+
+## Compute shaders
+
+With the `wgsl` feature, a `ComputeProgram` runs a compute shader written in WGSL. It draws nothing and writes its results into textures, which are then used like every other texture: read them, use them in a material or feed them into the next run.
+
+```rust
+let program = ComputeProgram::from_wgsl_source(&context, include_str!("blur.wgsl"))?;
+program.use_uniform("radius", 3.0);
+program.use_texture("source", &source);
+program.use_storage_texture("result", &result);
+// 8 x 8 texels per workgroup, see the shader
+program.dispatch(result.width().div_ceil(8), result.height().div_ceil(8), 1);
+let pixels: Vec<[u8; 4]> = result.as_color_target(None).read();
+```
+
+```wgsl
+struct Uniforms {
+    radius: f32,
+}
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+@group(1) @binding(0) var source: texture_2d<f32>;
+@group(3) @binding(0) var result: texture_storage_2d<rgba8unorm, write>;
+
+@compute @workgroup_size(8, 8)
+fn run(@builtin(global_invocation_id) id: vec3<u32>) {
+    let size = textureDimensions(result);
+    if (id.x >= size.x || id.y >= size.y) {
+        return;
+    }
+    // ... compute the color from `source` with textureLoad ...
+    textureStore(result, vec2<i32>(id.xy), color);
+}
+```
+
+- Uniforms, textures and uniform buffers follow the conventions of the table above (groups 0, 1 and 2).
+- The textures the program writes to are in group 3: `@group(3) @binding(i) var name: texture_storage_2d<F, write>`, counting from 0. `F` is `rgba8unorm` (a `Texture2D` of `[u8; 4]` or `[u8; 3]`), `rgba16float` or `rgba32float` (three or four channels of `f16` or `f32`) or `r32float` (one channel of `f32`). These formats work on every platform including WebGPU.
+- The program writes to the largest mip level of a texture. A texture cannot be read and written in the same run.
+- Everything drawn before `dispatch` is finished before the program runs.
+- Writing into vertex or instance buffers is not supported, put such data into a texture.
+- Compute shaders do not exist in OpenGL 3.3 and WebGL2, so with such a context `ComputeProgram::from_wgsl_source` returns an error.
 
 ## How it works
 
@@ -126,6 +168,32 @@ Good to know:
 
 ## Tested where
 
-- Automatically on every pull request: Linux with software renderers (lavapipe for Vulkan, llvmpipe for OpenGL), image comparison of OpenGL against wgpu; build on Windows, macOS and for the web; API compatibility with upstream (`cargo semver-checks`).
+- Automatically on every pull request:
+  - Linux: Vulkan (lavapipe) against OpenGL (llvmpipe), both software renderers. Every test scene is drawn with both backends and the images are compared.
+  - macOS: Metal, on the virtual GPU of the build machine. The images are compared with what OpenGL returned on Linux (stored in `src/core/backend/wgpu/reference`).
+  - Windows: DirectX 12 with the DXC shader compiler, on the software adapter of Windows (WARP), compared in the same way.
+  - Build for the web, and API compatibility with upstream (`cargo semver-checks`).
 - By hand: a real window on Linux (X11), Chromium with WebGPU and the fallback to WebGL2.
-- Not tested yet: real GPUs, Metal, DirectX 12, Safari, Android.
+- Not tested yet: real GPUs, Safari, Android.
+
+## Test it on your own hardware
+
+The automatic tests use software or virtual adapters. To check a real GPU, run these on the machine in question (macOS for Metal, Windows for DirectX 12, Linux for Vulkan):
+
+```console
+$ cargo test --all-features --lib adapter -- --nocapture   # says which adapter and API is used
+$ cargo test --all-features --lib                          # all tests, including the image comparisons
+$ cargo run --release --features wgpu --example wgpu_window -- wgpu
+```
+
+The example shows a rotating cube with a sphere and its shadow, and a click on an object puts a yellow marker on it. With `gl` instead of `wgpu` it shows the same with OpenGL to compare.
+
+For a browser (Safari 26 or newer has WebGPU, as do Chrome and Edge), in the `web` directory:
+
+```console
+$ npm install
+$ npx wasm-pack build "../examples/wgpu_window" --target web --out-name web --out-dir ../../web/pkg
+$ npm run serve
+```
+
+Then open `http://localhost:8080`. The console of the browser says `rendering with WebGPU` or `rendering with WebGL`, the picture and the marker on click are the same as on the desktop.

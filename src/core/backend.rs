@@ -537,6 +537,28 @@ pub(crate) trait BackendApi {
             "shader programs written in WGSL need a context with the wgpu backend, this context uses another backend".to_string(),
         ))
     }
+    /// Creates a compute program from WGSL, which only a backend with compute shaders can do.
+    #[cfg(feature = "wgsl")]
+    fn create_compute_program(
+        &self,
+        source: &str,
+    ) -> Result<(ProgramId, ProgramReflection), CoreError> {
+        Err(CoreError::ShaderCompilation(
+            "WGSL".to_string(),
+            source.to_string(),
+            "compute programs need a context with the wgpu backend, this context uses another backend".to_string(),
+        ))
+    }
+    /// Binds the texture a compute program writes to, returns false if the program has no storage texture with that name.
+    #[cfg(feature = "wgsl")]
+    fn bind_storage_texture(&self, _program: ProgramId, _name: &str, _texture: TextureId) -> bool {
+        unreachable!("compute programs only exist with the wgpu backend")
+    }
+    /// Runs a compute program with the given number of workgroups.
+    #[cfg(feature = "wgsl")]
+    fn dispatch(&self, _program: ProgramId, _groups: [u32; 3]) {
+        unreachable!("compute programs only exist with the wgpu backend")
+    }
     fn delete_program(&self, program: ProgramId);
     fn set_uniform(&self, program: ProgramId, location: &UniformLocation, value: &UniformValue);
     fn bind_texture(&self, unit: u32, texture: TextureId, kind: TextureKind);
