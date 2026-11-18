@@ -2,7 +2,7 @@
 //! The scene description, independent of any backend.
 //!
 
-use crate::{RtError, Sky};
+use crate::{RtError, RtTexture, Sky, TextureId};
 use three_d_asset::prelude::*;
 use three_d_asset::{Geometry, Model, PbrMaterial, TriMesh};
 
@@ -27,13 +27,27 @@ pub struct RtMesh {
     pub positions: Vec<Vec3>,
     /// Vertex normals for smooth shading, the face normal is used without them.
     pub normals: Option<Vec<Vec3>>,
-    /// Texture coordinates, kept for textured materials.
+    /// Texture coordinates for textured materials.
     pub uvs: Option<Vec<Vec2>>,
+    /// Tangents for normal textures, the bitangent is cross(normal, tangent) · w as in three-d. Without them the tangents
+    /// follow the texture coordinates of each triangle.
+    pub tangents: Option<Vec<Vec4>>,
     /// Three vertex indices per triangle.
     pub triangles: Vec<[u32; 3]>,
 }
 
 impl RtMesh {
+    /// Texture coordinates at barycentric coordinates `u`, `v` of a triangle, zero without texture coordinates.
+    pub(crate) fn uv_at(&self, triangle: u32, u: f32, v: f32) -> Vec2 {
+        match &self.uvs {
+            Some(uvs) => {
+                let [a, b, c] = self.triangles[triangle as usize];
+                uvs[a as usize] * (1.0 - u - v) + uvs[b as usize] * u + uvs[c as usize] * v
+            }
+            None => vec2(0.0, 0.0),
+        }
+    }
+
     ///
     /// Copies the triangles of a [TriMesh](three_d_asset::TriMesh) (`CpuMesh` in three-d).
     ///
@@ -74,10 +88,12 @@ impl RtMesh {
         };
         check(mesh.normals.as_ref().map(|n| n.len()), "normals")?;
         check(mesh.uvs.as_ref().map(|n| n.len()), "uvs")?;
+        check(mesh.tangents.as_ref().map(|n| n.len()), "tangents")?;
         Ok(Self {
             positions,
             normals: mesh.normals.clone(),
             uvs: mesh.uvs.clone(),
+            tangents: mesh.tangents.clone(),
             triangles,
         })
     }
@@ -110,6 +126,18 @@ pub struct RtMaterial {
     pub alpha_cutout: Option<f32>,
     /// Transmissive surfaces are thin sheets (window panes modelled as one face) instead of the boundary of a solid.
     pub thin_walled: bool,
+    /// Multiplies the base color (sRGB) and the alpha.
+    pub base_color_texture: Option<TextureId>,
+    /// Multiplies the roughness (green) and the metallic value (blue), as in glTF.
+    pub metallic_roughness_texture: Option<TextureId>,
+    /// Normals in the tangent space of the texture coordinates, as in glTF.
+    pub normal_texture: Option<TextureId>,
+    /// Strength of the [RtMaterial::normal_texture] across the surface, 1 as painted.
+    pub normal_scale: f32,
+    /// Multiplies the emission (sRGB).
+    pub emission_texture: Option<TextureId>,
+    /// Multiplies the transmission (red).
+    pub transmission_texture: Option<TextureId>,
 }
 
 impl Default for RtMaterial {
@@ -125,6 +153,12 @@ impl Default for RtMaterial {
             index_of_refraction: 1.5,
             alpha_cutout: None,
             thin_walled: true,
+            base_color_texture: None,
+            metallic_roughness_texture: None,
+            normal_texture: None,
+            normal_scale: 1.0,
+            emission_texture: None,
+            transmission_texture: None,
         }
     }
 }
@@ -156,6 +190,92 @@ impl RtMaterial {
     }
 }
 
+impl RtMaterial {
+    ///
+    /// Whether the material uses any texture. Textures of a [PbrMaterial] are only taken over by
+    /// [RtScene::add_cpu_material], which adds them to the scene.
+    ///
+    pub fn has_textures(&self) -> bool {
+        self.base_color_texture.is_some()
+            || self.metallic_roughness_texture.is_some()
+            || self.normal_texture.is_some()
+            || self.emission_texture.is_some()
+            || self.transmission_texture.is_some()
+    }
+
+    /// Whether every part is cut out, without looking at textures.
+    pub(crate) fn is_cut_out_everywhere(&self) -> bool {
+        self.alpha_cutout.is_some_and(|c| self.alpha < c)
+    }
+
+    /// Whether some parts may be cut out by the base color texture, so rays have to test the alpha of every hit.
+    pub(crate) fn cuts_out_by_texture(&self) -> bool {
+        self.alpha_cutout.is_some() && self.base_color_texture.is_some()
+    }
+
+    /// The alpha at texture coordinates.
+    pub(crate) fn alpha_at(&self, textures: &[RtTexture], uv: Vec2) -> f32 {
+        match self
+            .base_color_texture
+            .and_then(|t| textures.get(t.0 as usize))
+        {
+            Some(t) => self.alpha * t.sample(uv).w,
+            None => self.alpha,
+        }
+    }
+
+    /// Whether the surface is cut out at texture coordinates.
+    pub(crate) fn is_cut_out_at(&self, textures: &[RtTexture], uv: Vec2) -> bool {
+        self.alpha_cutout
+            .is_some_and(|c| self.alpha_at(textures, uv) < c)
+    }
+
+    ///
+    /// The material at texture coordinates, with the textures applied and removed, and the normal of the normal texture
+    /// in tangent space (z up) if there is one.
+    ///
+    pub(crate) fn at(&self, textures: &[RtTexture], uv: Vec2) -> (RtMaterial, Option<Vec3>) {
+        let texture = |t: Option<TextureId>| t.and_then(|t| textures.get(t.0 as usize));
+        let mut m = self.clone();
+        if let Some(t) = texture(self.base_color_texture) {
+            let c = t.sample_color(uv);
+            m.base_color = vec3(
+                m.base_color.x * c.x,
+                m.base_color.y * c.y,
+                m.base_color.z * c.z,
+            );
+            m.alpha *= c.w;
+        }
+        if let Some(t) = texture(self.metallic_roughness_texture) {
+            let s = t.sample(uv);
+            m.roughness *= s.y;
+            m.metallic *= s.z;
+        }
+        if let Some(t) = texture(self.emission_texture) {
+            let c = t.sample_color(uv);
+            m.emission = vec3(m.emission.x * c.x, m.emission.y * c.y, m.emission.z * c.z);
+        }
+        if let Some(t) = texture(self.transmission_texture) {
+            m.transmission *= t.sample(uv).x;
+        }
+        let normal = texture(self.normal_texture).map(|t| {
+            let s = t.sample(uv);
+            let n = vec3(
+                (2.0 * s.x - 1.0) * self.normal_scale,
+                (2.0 * s.y - 1.0) * self.normal_scale,
+                2.0 * s.z - 1.0,
+            );
+            n.normalize()
+        });
+        m.base_color_texture = None;
+        m.metallic_roughness_texture = None;
+        m.normal_texture = None;
+        m.emission_texture = None;
+        m.transmission_texture = None;
+        (m, normal)
+    }
+}
+
 impl From<&PbrMaterial> for RtMaterial {
     fn from(m: &PbrMaterial) -> Self {
         let albedo = m.albedo.to_linear_srgb();
@@ -171,6 +291,8 @@ impl From<&PbrMaterial> for RtMaterial {
             index_of_refraction: m.index_of_refraction.max(1.0),
             alpha_cutout: m.alpha_cutout,
             thin_walled: true,
+            normal_scale: m.normal_scale,
+            ..Default::default()
         }
     }
 }
@@ -257,6 +379,7 @@ pub struct RtScene {
     /// Tells scenes apart for the acceleration structures, a clone shares its meshes and keeps it
     id: u64,
     meshes: Vec<RtMesh>,
+    textures: Vec<RtTexture>,
     materials: Vec<RtMaterial>,
     instances: Vec<RtInstance>,
     lights: Vec<RtLight>,
@@ -270,6 +393,7 @@ impl Default for RtScene {
         Self {
             id: next_revision(),
             meshes: Vec::new(),
+            textures: Vec::new(),
             materials: Vec::new(),
             instances: Vec::new(),
             lights: Vec::new(),
@@ -319,7 +443,7 @@ impl RtScene {
         let materials: Vec<MaterialId> = model
             .materials
             .iter()
-            .map(|m| self.add_material(m))
+            .map(|m| self.add_cpu_material(m))
             .collect();
         let mut default_material = None;
         let mut instances = Vec::new();
@@ -354,7 +478,39 @@ impl RtScene {
         MeshId(self.meshes.len() as u32 - 1)
     }
 
+    /// Adds a texture for materials.
+    pub fn add_texture(&mut self, texture: RtTexture) -> TextureId {
+        self.textures.push(texture);
+        self.revision = next_revision();
+        TextureId(self.textures.len() as u32 - 1)
+    }
+
+    ///
+    /// Adds a material of three-d (`CpuMaterial`) with its textures: base color, metallic and roughness (also from the
+    /// texture combined with occlusion), normals, emission and transmission. Occlusion textures are not needed, tracing
+    /// finds the occlusion itself.
+    ///
+    pub fn add_cpu_material(&mut self, material: &PbrMaterial) -> MaterialId {
+        let mut m = RtMaterial::from(material);
+        let mut add = |t: &Option<three_d_asset::Texture2D>| {
+            t.as_ref()
+                .map(|t| self.add_texture(RtTexture::from_cpu_texture(t)))
+        };
+        m.base_color_texture = add(&material.albedo_texture);
+        m.metallic_roughness_texture = match &material.metallic_roughness_texture {
+            Some(_) => add(&material.metallic_roughness_texture),
+            None => add(&material.occlusion_metallic_roughness_texture),
+        };
+        m.normal_texture = add(&material.normal_texture);
+        m.emission_texture = add(&material.emissive_texture);
+        m.transmission_texture = add(&material.transmission_texture);
+        self.add_material(m)
+    }
+
+    ///
     /// Adds a material, either an [RtMaterial] or a [PbrMaterial](three_d_asset::PbrMaterial) (`CpuMaterial` in three-d).
+    /// The textures of a `PbrMaterial` are left out here, [RtScene::add_cpu_material] takes them over.
+    ///
     pub fn add_material(&mut self, material: impl Into<RtMaterial>) -> MaterialId {
         self.materials.push(material.into());
         self.revision = next_revision();
@@ -448,6 +604,11 @@ impl RtScene {
     /// The meshes.
     pub fn meshes(&self) -> &[RtMesh] {
         &self.meshes
+    }
+
+    /// The textures.
+    pub fn textures(&self) -> &[RtTexture] {
+        &self.textures
     }
 
     /// The materials.

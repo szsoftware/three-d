@@ -190,9 +190,10 @@ impl CpuAccel {
             .traverse(origin, direction, t_max, |instance_index, t_max| {
                 let instance = &instances[instance_index as usize];
                 let material = &materials[instance.material.0 as usize];
-                if material.alpha_cutout.is_some_and(|c| material.alpha < c) {
+                if material.is_cut_out_everywhere() {
                     return false;
                 }
+                let cut_by_texture = material.cuts_out_by_texture();
                 let mesh = &meshes[instance.mesh.0 as usize];
                 // The same t on the ray in mesh coordinates, the direction is not normalised again
                 let o = (instance.inverse * origin.extend(1.0)).truncate();
@@ -207,7 +208,11 @@ impl CpuAccel {
                         mesh.positions[b as usize],
                         mesh.positions[c as usize],
                     ) {
-                        if t < *t_max {
+                        if t < *t_max
+                            && !(cut_by_texture
+                                && material
+                                    .is_cut_out_at(scene.textures(), mesh.uv_at(triangle, u, v)))
+                        {
                             let hit = Hit {
                                 t,
                                 instance: instance_index,
@@ -280,6 +285,7 @@ mod tests {
             positions,
             normals: None,
             uvs: None,
+            tangents: None,
         }
     }
 

@@ -242,7 +242,7 @@ struct PathContext<'a> {
 }
 
 /// The surface at a hit, in world space.
-struct Surface<'a> {
+struct Surface {
     position: Vec3,
     /// Face normal on the side the ray came from.
     geometric_normal: Vec3,
@@ -250,7 +250,8 @@ struct Surface<'a> {
     shading_normal: Vec3,
     /// Whether the ray hit the front of the triangle (counter clockwise seen from the ray).
     front_face: bool,
-    material: &'a RtMaterial,
+    /// The material with its textures applied at the hit.
+    material: RtMaterial,
 }
 
 impl PathContext<'_> {
@@ -292,7 +293,7 @@ impl PathContext<'_> {
                 break;
             };
             let surface = self.surface(&hit, direction);
-            let m = surface.material;
+            let m = &surface.material;
             result += self.add(bounce, mul(throughput, m.emission));
             if bounce >= self.settings.max_bounces {
                 break;
@@ -388,7 +389,7 @@ impl PathContext<'_> {
         }
     }
 
-    fn surface(&self, hit: &Hit, direction: Vec3) -> Surface<'_> {
+    fn surface(&self, hit: &Hit, direction: Vec3) -> Surface {
         let instance = &self.scene.instances()[hit.instance as usize];
         let mesh = &self.scene.meshes()[instance.mesh.0 as usize];
         let material = &self.scene.materials()[instance.material.0 as usize];
@@ -405,7 +406,7 @@ impl PathContext<'_> {
         let normal_matrix = instance.inverse.transpose();
         let to_world = |n: Vec3| (normal_matrix * n.extend(0.0)).truncate().normalize();
         let face = to_world((p1 - p0).cross(p2 - p0));
-        let smooth = match &mesh.normals {
+        let mut smooth = match &mesh.normals {
             Some(normals) => {
                 let n = normals[a as usize] * w
                     + normals[b as usize] * hit.u
@@ -424,6 +425,24 @@ impl PathContext<'_> {
             }
             None => face,
         };
+        let (material, mapped_normal) = if material.has_textures() {
+            material.at(
+                self.scene.textures(),
+                mesh.uv_at(hit.triangle, hit.u, hit.v),
+            )
+        } else {
+            (material.clone(), None)
+        };
+        if let Some(normal) = mapped_normal {
+            if let Some((t, b)) =
+                tangent_frame(mesh, [a, b, c], (hit.u, hit.v), smooth, &instance.transform)
+            {
+                let n = t * normal.x + b * normal.y + smooth * normal.z;
+                if n.magnitude2() > 0.0 {
+                    smooth = n.normalize();
+                }
+            }
+        }
         let front_face = face.dot(direction) < 0.0;
         let side = if front_face { 1.0 } else { -1.0 };
         Surface {
@@ -538,6 +557,7 @@ impl PathContext<'_> {
                     return true;
                 }
                 let s = self.surface(hit, direction);
+                let m = &s.material;
                 let cos_i = s.geometric_normal.dot(-direction).clamp(0.0, 1.0);
                 let f = fresnel_dielectric(cos_i, m.index_of_refraction);
                 t = mul(t, m.base_color * (m.transmission * (1.0 - f)));
@@ -545,6 +565,63 @@ impl PathContext<'_> {
             });
         t
     }
+}
+
+///
+/// Tangent and bitangent in world space around the normal `n`, as three-d uses them for normal textures: from the
+/// tangents of the mesh, or else with the tangent along u and the bitangent towards decreasing v, as three-d computes
+/// missing tangents.
+///
+fn tangent_frame(
+    mesh: &crate::RtMesh,
+    [a, b, c]: [u32; 3],
+    (u, v): (f32, f32),
+    n: Vec3,
+    transform: &Mat4,
+) -> Option<(Vec3, Vec3)> {
+    let to_world = |d: Vec3| (transform * d.extend(0.0)).truncate();
+    let (tangent, w) = match (&mesh.tangents, &mesh.uvs) {
+        (Some(tangents), _) => {
+            let t = tangents[a as usize] * (1.0 - u - v)
+                + tangents[b as usize] * u
+                + tangents[c as usize] * v;
+            let w = if tangents[a as usize].w < 0.0 {
+                -1.0
+            } else {
+                1.0
+            };
+            (to_world(t.truncate()), w)
+        }
+        (None, Some(uvs)) => {
+            let (p0, p1, p2) = (
+                mesh.positions[a as usize],
+                mesh.positions[b as usize],
+                mesh.positions[c as usize],
+            );
+            let (t0, t1, t2) = (uvs[a as usize], uvs[b as usize], uvs[c as usize]);
+            let (dp1, dp2) = (p1 - p0, p2 - p0);
+            let (du1, du2) = (t1 - t0, t2 - t0);
+            let det = du1.x * du2.y - du2.x * du1.y;
+            if det.abs() < 1e-20 {
+                return None;
+            }
+            let along_u = to_world((dp1 * du2.y - dp2 * du1.y) / det);
+            let along_v = to_world((dp2 * du1.x - dp1 * du2.x) / det);
+            let w = if n.cross(along_u).dot(along_v) < 0.0 {
+                1.0
+            } else {
+                -1.0
+            };
+            (along_u, w)
+        }
+        (None, None) => return None,
+    };
+    let t = tangent - n * n.dot(tangent);
+    if t.magnitude2() <= 0.0 {
+        return None;
+    }
+    let t = t.normalize();
+    Some((t, n.cross(t) * w))
 }
 
 /// Moves a point off a surface along its normal, relative to the size of its coordinates.

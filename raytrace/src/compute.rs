@@ -5,7 +5,8 @@
 
 use crate::{
     AccelBuilder, Camera, CpuAccel, CpuBvhBuilder, GpuDevice, RaytraceSupport, RenderImage,
-    RtEnvironment, RtError, RtLight, RtScene, TraceSettings, Tracer, TracerKind,
+    RtEnvironment, RtError, RtLight, RtScene, RtTexture, RtWrapping, TextureId, TraceSettings,
+    Tracer, TracerKind,
 };
 use three_d::wgpu as w;
 use three_d::wgpu::util::DeviceExt;
@@ -83,6 +84,7 @@ impl ComputeTracer {
                 storage(6, true),
                 storage(7, true),
                 storage(8, false),
+                storage(9, true),
             ],
         });
         let module = device.create_shader_module(w::ShaderModuleDescriptor {
@@ -248,6 +250,10 @@ impl ComputeTracer {
                 w::BindGroupEntry {
                     binding: 8,
                     resource: image.sums.as_entire_binding(),
+                },
+                w::BindGroupEntry {
+                    binding: 9,
+                    resource: buffers.texels.as_entire_binding(),
                 },
             ],
         });
@@ -713,6 +719,7 @@ struct SceneBuffers {
     instances: w::Buffer,
     materials: w::Buffer,
     lights: w::Buffer,
+    texels: w::Buffer,
 }
 
 /// Words of a buffer, floats by their bits.
@@ -748,6 +755,10 @@ impl Words {
 
 impl SceneBuffers {
     fn new(device: &w::Device, scene: &RtScene, accel: &CpuAccel) -> Self {
+        let limits = device.limits();
+        let max_bytes = limits
+            .max_storage_buffer_binding_size
+            .min(limits.max_buffer_size);
         // Boxes without anything in them are infinite, which shaders do not compare reliably
         let finite = |v: f32| v.clamp(-1e30, 1e30);
         let mut nodes = Words::default();
@@ -771,7 +782,7 @@ impl SceneBuffers {
             mesh_nodes.push((nodes.0.len() / 8) as u32);
             mesh_triangles.push((triangles.0.len() / 4) as u32);
             push_nodes(&mut nodes, bvh);
-            let first_vertex = (vertices.0.len() / 8) as u32;
+            let first_vertex = (vertices.0.len() / 12) as u32;
             for &t in &bvh.indices {
                 let [a, b, c] = mesh.triangles[t as usize];
                 triangles.u(first_vertex + a);
@@ -780,9 +791,19 @@ impl SceneBuffers {
                 triangles.u(t);
             }
             for (i, p) in mesh.positions.iter().enumerate() {
-                vertices.v3(*p, 1.0);
-                match &mesh.normals {
-                    Some(normals) => vertices.v3(normals[i], 1.0),
+                let uv = mesh.uvs.as_ref().map_or(vec2(0.0, 0.0), |uvs| uvs[i]);
+                vertices.v3(*p, uv.x);
+                let normal = mesh
+                    .normals
+                    .as_ref()
+                    .map_or(vec3(0.0, 0.0, 0.0), |normals| normals[i]);
+                vertices.v3(normal, uv.y);
+                match &mesh.tangents {
+                    // w is never zero for a tangent, zero means none
+                    Some(tangents) => {
+                        let t = tangents[i];
+                        vertices.v3(t.truncate(), if t.w < 0.0 { -1.0 } else { 1.0 })
+                    }
                     None => vertices.v3(vec3(0.0, 0.0, 0.0), 0.0),
                 }
             }
@@ -798,8 +819,13 @@ impl SceneBuffers {
             instances.u(mesh_nodes[instance.mesh.0 as usize]);
             instances.u(mesh_triangles[instance.mesh.0 as usize]);
             instances.u(instance.material.0);
-            let cut_out = material.alpha_cutout.is_some_and(|c| material.alpha < c);
-            instances.u(u32::from(!cut_out));
+            instances.u(if material.is_cut_out_everywhere() {
+                0
+            } else if material.cuts_out_by_texture() {
+                2
+            } else {
+                1
+            });
         }
 
         let mut materials = Words::default();
@@ -810,7 +836,23 @@ impl SceneBuffers {
             materials.f(m.specular);
             materials.f(m.transmission);
             materials.v3(m.emission, m.index_of_refraction);
-            materials.v3(vec3(if m.thin_walled { 1.0 } else { 0.0 }, 0.0, 0.0), 0.0);
+            materials.v3(
+                vec3(
+                    if m.thin_walled { 1.0 } else { 0.0 },
+                    m.normal_scale,
+                    m.alpha_cutout.unwrap_or(-1.0),
+                ),
+                0.0,
+            );
+            let id = |t: Option<TextureId>| t.map_or(NONE, |t| t.0);
+            materials.u(id(m.base_color_texture));
+            materials.u(id(m.metallic_roughness_texture));
+            materials.u(id(m.normal_texture));
+            materials.u(id(m.emission_texture));
+            materials.u(id(m.transmission_texture));
+            materials.u(NONE);
+            materials.u(NONE);
+            materials.u(NONE);
         }
 
         let mut lights = Words::default();
@@ -842,6 +884,7 @@ impl SceneBuffers {
                 usage: w::BufferUsages::STORAGE,
             })
         };
+        let texels = texel_words(scene.textures(), max_bytes);
         Self {
             revision: scene.revision(),
             nodes: storage("ray tracing nodes", &nodes),
@@ -850,7 +893,84 @@ impl SceneBuffers {
             instances: storage("ray tracing instances", &instances),
             materials: storage("ray tracing materials", &materials),
             lights: storage("ray tracing lights", &lights),
+            texels: storage("ray tracing textures", &texels),
         }
+    }
+}
+
+/// Texture id meaning no texture, as in trace.wgsl.
+const NONE: u32 = u32::MAX;
+
+///
+/// All textures in one buffer (layout in trace.wgsl). Textures are halved in size until they fit into `max_bytes`, the
+/// largest buffer the device binds.
+///
+fn texel_words(textures: &[RtTexture], max_bytes: u64) -> Words {
+    let mut textures: Vec<std::borrow::Cow<'_, RtTexture>> =
+        textures.iter().map(std::borrow::Cow::Borrowed).collect();
+    let size = |textures: &[std::borrow::Cow<'_, RtTexture>]| -> u64 {
+        4 * (4
+            + 4 * textures.len() as u64
+            + textures.iter().map(|t| t.texels.len() as u64).sum::<u64>())
+    };
+    while size(&textures) > max_bytes {
+        // Halve the largest texture
+        let Some(largest) = (0..textures.len()).max_by_key(|&i| textures[i].texels.len()) else {
+            break;
+        };
+        if textures[largest].texels.len() <= 1 {
+            break;
+        }
+        textures[largest] = std::borrow::Cow::Owned(halved(&textures[largest]));
+    }
+    let mut words = Words::default();
+    words.u(textures.len() as u32);
+    (0..3).for_each(|_| words.u(0));
+    let mut first = 4 + 4 * textures.len() as u32;
+    for t in &textures {
+        words.u(first);
+        words.u(t.width);
+        words.u(t.height);
+        let wrap = |w: RtWrapping| match w {
+            RtWrapping::Repeat => 0,
+            RtWrapping::MirroredRepeat => 1,
+            RtWrapping::ClampToEdge => 2,
+        };
+        words.u(u32::from(t.linear)
+            | (u32::from(t.nearest) << 1)
+            | (wrap(t.wrap_u) << 2)
+            | (wrap(t.wrap_v) << 4));
+        first += t.texels.len() as u32;
+    }
+    for t in &textures {
+        t.texels
+            .iter()
+            .for_each(|&texel| words.u(u32::from_le_bytes(texel)));
+    }
+    words
+}
+
+/// The texture with half the width and height, each texel the average of four.
+fn halved(t: &RtTexture) -> RtTexture {
+    let (w, h) = ((t.width / 2).max(1), (t.height / 2).max(1));
+    let mut texels = Vec::with_capacity((w * h) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let mut sum = [0u32; 4];
+            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                let sx = (2 * x + dx).min(t.width - 1);
+                let sy = (2 * y + dy).min(t.height - 1);
+                let texel = t.texels[(sy * t.width + sx) as usize];
+                (0..4).for_each(|c| sum[c] += texel[c] as u32);
+            }
+            texels.push(sum.map(|s| ((s + 2) / 4) as u8));
+        }
+    }
+    RtTexture {
+        width: w,
+        height: h,
+        texels,
+        ..t.clone()
     }
 }
 
@@ -923,6 +1043,22 @@ fn params_bytes(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn textures_shrink_to_fit_the_buffer() {
+        let large = RtTexture::new(64, 32, vec![[200, 100, 50, 255]; 64 * 32]);
+        let small = RtTexture::new(2, 2, vec![[0, 0, 0, 255]; 4]);
+        let all = [large, small];
+        let fits = texel_words(&all, 1 << 20);
+        assert_eq!(fits.0.len(), 4 + 8 + 64 * 32 + 4);
+        // Room for the header and a quarter of the large texture
+        let shrunk = texel_words(&all, 4 * (4 + 8 + 32 * 16 + 4));
+        assert_eq!(shrunk.0.len(), 4 + 8 + 32 * 16 + 4);
+        assert_eq!(&shrunk.0[4..7], &[12, 32, 16]);
+        assert_eq!(shrunk.0[12], u32::from_le_bytes([200, 100, 50, 255]));
+    }
+
     /// wgpu reports invalid shaders only to an error handler, so the shaders are checked here on every platform.
     #[test]
     fn shaders_are_valid() {

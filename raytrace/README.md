@@ -76,7 +76,20 @@ noise.
 `RtMaterial` is the metallic roughness model of `CpuMaterial` (GGX with height correlated Smith masking, Schlick's
 Fresnel term, Lambert for the diffuse part) plus a few settings for tracing: `specular` (strength of the reflection of
 non-metals, 0 is purely diffuse), `thin_walled` (glass panes modelled as one face, the default) and
-`alpha_cutout`. Textures follow in step 4 of the plan.
+`alpha_cutout`.
+
+Textures are added to the scene with `add_texture` (an `RtTexture` with four bytes per texel, the first row at v = 0
+as in three-d) and referred to by the material: `base_color_texture` (sRGB color and alpha), `metallic_roughness_texture`
+(glTF channels: roughness green, metallic blue), `normal_texture` with `normal_scale`, `emission_texture` and
+`transmission_texture` (red). `RtScene::add_cpu_material` and `add_cpu_model` take them over from a `CpuMaterial`;
+occlusion textures are not needed, tracing finds the occlusion itself. Normal textures use the tangents of the mesh,
+or the direction of u and v as three-d computes missing tangents. With `alpha_cutout`, every hit tests the alpha of the
+base color texture, so leaves on a few quads cast the shadows of their outline. Textures are interpolated between four
+texels (or the nearest with `nearest`) and repeat, mirror or clamp as given; there are no mip maps, the samples per
+pixel average fine detail. Textures with floats are stored clamped to 0 to 1.
+
+The compute tracer keeps all textures in one storage buffer. If they do not fit into the largest buffer the device
+binds (128 MB guaranteed by WebGPU), the largest ones are halved in size until they do.
 
 ## What the reference tracer does and does not do
 
