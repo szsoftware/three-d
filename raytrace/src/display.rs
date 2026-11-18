@@ -1,11 +1,11 @@
 //!
-//! Showing a film with three-d, on any of its backends.
+//! Showing a render image with three-d, on any of its backends.
 //!
 
-use crate::Film;
+use crate::RenderImage;
 use three_d::{Context, Interpolation, Texture2D, Wrapping};
 
-impl Film {
+impl RenderImage {
     ///
     /// A three-d texture with the linear average of every pixel in cd/m² (32 bit floats), for example to show it with a
     /// tone mapping of three-d or to combine it with the raster view. The bottom row of the image is at texture
@@ -27,15 +27,15 @@ impl Film {
     }
 
     ///
-    /// Writes the film into a texture made by [Film::to_three_d_texture], to show the image while samples are added.
+    /// Writes the render image into a texture made by [RenderImage::to_three_d_texture], to show the image while samples are added.
     ///
     /// # Panics
-    /// If the texture does not have the size of the film.
+    /// If the texture does not have the size of the render image.
     ///
     pub fn write_to_three_d_texture(&self, texture: &Texture2D) {
         assert!(
             texture.width() == self.width() && texture.height() == self.height(),
-            "the texture has another size than the film"
+            "the texture has another size than the render_image"
         );
         texture.fill(&self.bottom_up_rgba());
     }

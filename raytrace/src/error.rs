@@ -11,8 +11,8 @@ pub enum RtError {
     UnknownMaterial(u32),
     /// The id does not belong to an instance of this scene.
     UnknownInstance(u32),
-    /// The film has no pixels.
-    EmptyFilm,
+    /// The render image has no pixels.
+    EmptyImage,
     /// Writing the image failed, the text says why.
     Export(String),
 }
@@ -24,7 +24,7 @@ impl std::fmt::Display for RtError {
             RtError::UnknownMesh(id) => write!(f, "unknown mesh id {id}"),
             RtError::UnknownMaterial(id) => write!(f, "unknown material id {id}"),
             RtError::UnknownInstance(id) => write!(f, "unknown instance id {id}"),
-            RtError::EmptyFilm => write!(f, "the film has no pixels"),
+            RtError::EmptyImage => write!(f, "the render image has no pixels"),
             RtError::Export(why) => write!(f, "export failed: {why}"),
         }
     }

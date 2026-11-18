@@ -443,7 +443,7 @@ impl RtScene {
     }
 
     ///
-    /// Grows with every change of the scene. A film showing the scene has to be reset when it changes.
+    /// Grows with every change of the scene. A render image showing the scene has to be reset when it changes.
     ///
     pub fn revision(&self) -> u64 {
         self.revision

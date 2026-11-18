@@ -8,10 +8,10 @@
 //!   raster view ([CpuMesh], [CpuMaterial], [CpuModel]) and knows nothing about any backend.
 //! - [AccelBuilder] builds the acceleration structure, here a two level bounding volume hierarchy on the CPU
 //!   ([CpuBvhBuilder]): one hierarchy per mesh and one over the instances, so instanced vegetation stays small.
-//! - [Tracer] adds samples to a [Film]. The [CpuReferenceTracer] runs on any platform without a GPU and is the reference
+//! - [Tracer] adds samples to a [RenderImage]. The [CpuReferenceTracer] runs on any platform without a GPU and is the reference
 //!   the GPU tracers of the wgpu backend are compared against.
-//! - [Film] collects the samples and turns them into an image with a [ToneMapping].
-//! - With the `three-d` feature, [Film::to_three_d_texture] shows the film with three-d on any backend. With the `wgpu`
+//! - [RenderImage] collects the samples and turns them into an image with a [ToneMapping].
+//! - With the `three-d` feature, [RenderImage::to_three_d_texture] shows the render image with three-d on any backend. With the `wgpu`
 //!   feature, [RaytraceSupport] tells what a context can run and [GpuDevice] hands its device to GPU tracers.
 //! - [Sky] is a daylight sky with the sun at the position for a place, date and time ([GeoLocation], [LocalDateTime]).
 //!
@@ -26,9 +26,9 @@ mod bvh;
 #[cfg(feature = "three-d")]
 mod display;
 mod error;
-mod film;
 #[cfg(feature = "wgpu")]
 mod gpu;
+mod render_image;
 mod sampling;
 mod scene;
 mod sky;
@@ -38,9 +38,9 @@ mod tracer;
 pub use accel::*;
 pub use bvh::{Bvh, BvhNode};
 pub use error::*;
-pub use film::*;
 #[cfg(feature = "wgpu")]
 pub use gpu::*;
+pub use render_image::*;
 pub use scene::*;
 pub use sky::*;
 pub use sun::*;

@@ -2,7 +2,7 @@
 
 Path tracing for three-d scenes, part of the fork. Step 1 of the plan: the scene description, a two level bounding
 volume hierarchy and a reference path tracer on the CPU. GPU tracers on the wgpu backend come next and use the same
-scene, film and material model.
+scene, render image and material model.
 
 ```rust
 use three_d_raytrace::*;
@@ -18,13 +18,13 @@ let material = scene.add_material(CpuMaterial::default()); // or an RtMaterial
 scene.add_instance(mesh, material, Mat4::identity())?;
 
 let camera = Camera::new_perspective(/* as for the raster view */);
-let mut film = Film::new(960, 600);
+let mut render_image = RenderImage::new(960, 600);
 let mut tracer = CpuReferenceTracer::new();
-while film.sample_count() < 256 {
-    tracer.trace(&scene, &camera, &mut film, &TraceSettings { samples_per_call: 8, ..Default::default() })?;
+while render_image.sample_count() < 256 {
+    tracer.trace(&scene, &camera, &mut render_image, &TraceSettings { samples_per_call: 8, ..Default::default() })?;
 }
-film.save_png("garden.png", &ToneMapping { exposure_ev100: 14.0, ..Default::default() })?;
-film.save_exr("garden.exr")?; // linear, cd/m²
+render_image.save_png("garden.png", &ToneMapping { exposure_ev100: 14.0, ..Default::default() })?;
+render_image.save_exr("garden.exr")?; // linear, cd/m²
 ```
 
 ## Parts
@@ -34,7 +34,7 @@ film.save_exr("garden.exr")?; // linear, cd/m²
 | Scene | `RtScene`, built from `CpuMesh`, `CpuMaterial`, `CpuModel` or `RtMesh`, `RtMaterial` | no, shared by all tracers |
 | Acceleration structure | `AccelBuilder`, now `CpuBvhBuilder` → `CpuAccel` | yes: GPU buffers, wgpu `Blas`/`Tlas` later |
 | Tracer | `Tracer`, now `CpuReferenceTracer` | yes: compute shader and ray query tracers later |
-| Film | `Film` with `ToneMapping`, PNG and OpenEXR export | no |
+| Render image | `RenderImage` with `ToneMapping`, PNG and OpenEXR export | no |
 | Sky and sun | `Sky` (Preetham), `SunPosition` (NOAA), `GeoLocation`, `LocalDateTime`, `SceneOrientation` | no |
 
 Units are photometric: luminance in cd/m², illuminance in lux, intensity in cd. The exposure is given as EV100 like on
@@ -44,7 +44,7 @@ a camera, about 15 for a sunny day and 7 for a lit room.
 
 | Feature | Gives |
 | --- | --- |
-| `three-d` | `Film::to_three_d_texture` and `Film::write_to_three_d_texture`: the film as a three-d `Texture2D` (32 bit floats, upright), on any backend, to show it while samples are added |
+| `three-d` | `RenderImage::to_three_d_texture` and `RenderImage::write_to_three_d_texture`: the render image as a three-d `Texture2D` (32 bit floats, upright), on any backend, to show it while samples are added |
 | `wgpu` | `RaytraceSupport::of(&context)`: `Cpu` (OpenGL, WebGL2), `Compute` (WebGPU, Vulkan, Metal, DirectX 12) or `HardwareRayQuery`; `GpuDevice::from_context` with the device and queue for GPU tracers |
 
 Textures are shared with wgpu through `Texture2D::as_wgpu` in three-d, which keeps the order of three-d's work and the

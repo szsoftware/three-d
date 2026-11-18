@@ -27,7 +27,7 @@ fn main() {
     );
 
     let mut tracer = CpuReferenceTracer::new();
-    let mut film = Film::new(width, height);
+    let mut render_image = RenderImage::new(width, height);
     let start = std::time::Instant::now();
     tracer.prepare(&scene).unwrap();
     println!("Acceleration structure built in {:.2?}", start.elapsed());
@@ -35,11 +35,13 @@ fn main() {
         samples_per_call: 8,
         ..Default::default()
     };
-    while film.sample_count() < samples {
-        tracer.trace(&scene, &camera, &mut film, &settings).unwrap();
+    while render_image.sample_count() < samples {
+        tracer
+            .trace(&scene, &camera, &mut render_image, &settings)
+            .unwrap();
         println!(
             "{} samples after {:.1?}",
-            film.sample_count(),
+            render_image.sample_count(),
             start.elapsed()
         );
     }
@@ -47,7 +49,9 @@ fn main() {
         exposure_ev100: 14.0,
         ..Default::default()
     };
-    film.save_png(format!("{name}.png"), &tone_mapping).unwrap();
-    film.save_exr(format!("{name}.exr")).unwrap();
+    render_image
+        .save_png(format!("{name}.png"), &tone_mapping)
+        .unwrap();
+    render_image.save_exr(format!("{name}.exr")).unwrap();
     println!("Wrote {name}.png and {name}.exr");
 }

@@ -7,7 +7,7 @@ use three_d_asset::prelude::*;
 use three_d_asset::{Texture2D, TextureData};
 
 ///
-/// How the linear luminance of the film becomes displayable colors.
+/// How the linear luminance of the render image becomes displayable colors.
 ///
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ToneMapping {
@@ -67,18 +67,18 @@ impl ToneMapping {
 /// Sums of samples per pixel and how many samples each pixel has. Rows go from the top of the image to the bottom.
 ///
 /// A tracer adds the same number of samples to every pixel per call, so the average of a pixel is its sum divided by
-/// [Film::sample_count].
+/// [RenderImage::sample_count].
 ///
 #[derive(Clone, Debug)]
-pub struct Film {
+pub struct RenderImage {
     width: u32,
     height: u32,
     sum: Vec<[f32; 3]>,
     samples: u32,
 }
 
-impl Film {
-    /// A black film with the given size.
+impl RenderImage {
+    /// A black render image with the given size.
     pub fn new(width: u32, height: u32) -> Self {
         Self {
             width,
@@ -152,7 +152,7 @@ impl Film {
     /// The linear average as a texture with 32 bit floats, first row at the top.
     pub fn to_hdr_texture(&self) -> Texture2D {
         Texture2D {
-            name: "film".to_owned(),
+            name: "render image".to_owned(),
             data: TextureData::RgbaF32(
                 self.pixels()
                     .into_iter()
@@ -168,7 +168,7 @@ impl Film {
     /// The tone mapped image as an sRGB texture with 8 bits per channel, first row at the top.
     pub fn to_ldr_texture(&self, tone_mapping: &ToneMapping) -> Texture2D {
         Texture2D {
-            name: "film".to_owned(),
+            name: "render image".to_owned(),
             data: TextureData::RgbaU8(self.to_srgb8(tone_mapping)),
             width: self.width,
             height: self.height,
@@ -231,7 +231,7 @@ impl Film {
 
     pub(crate) fn check_not_empty(&self) -> Result<(), RtError> {
         if self.width == 0 || self.height == 0 {
-            Err(RtError::EmptyFilm)
+            Err(RtError::EmptyImage)
         } else {
             Ok(())
         }
@@ -274,12 +274,12 @@ mod tests {
 
     #[test]
     fn reset_forgets_samples() {
-        let mut film = Film::new(2, 2);
-        film.rows_mut()[3] = [4.0, 4.0, 4.0];
-        film.add_samples(2);
-        assert_eq!(film.pixel(1, 1), vec3(2.0, 2.0, 2.0));
-        film.reset();
-        assert_eq!(film.sample_count(), 0);
-        assert_eq!(film.pixel(1, 1), vec3(0.0, 0.0, 0.0));
+        let mut render_image = RenderImage::new(2, 2);
+        render_image.rows_mut()[3] = [4.0, 4.0, 4.0];
+        render_image.add_samples(2);
+        assert_eq!(render_image.pixel(1, 1), vec3(2.0, 2.0, 2.0));
+        render_image.reset();
+        assert_eq!(render_image.sample_count(), 0);
+        assert_eq!(render_image.pixel(1, 1), vec3(0.0, 0.0, 0.0));
     }
 }

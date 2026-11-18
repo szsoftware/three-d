@@ -39,13 +39,13 @@ fn render(
     size: (u32, u32),
     samples: u32,
     max_bounces: u32,
-) -> Film {
-    let mut film = Film::new(size.0, size.1);
+) -> RenderImage {
+    let mut render_image = RenderImage::new(size.0, size.1);
     CpuReferenceTracer::new()
         .trace(
             scene,
             camera,
-            &mut film,
+            &mut render_image,
             &TraceSettings {
                 samples_per_call: samples,
                 max_bounces,
@@ -53,11 +53,11 @@ fn render(
             },
         )
         .unwrap();
-    film
+    render_image
 }
 
-fn mean(film: &Film) -> Vec3 {
-    let pixels = film.pixels();
+fn mean(render_image: &RenderImage) -> Vec3 {
+    let pixels = render_image.pixels();
     pixels.iter().fold(vec3(0.0, 0.0, 0.0), |a, b| a + *b) / pixels.len() as f32
 }
 
@@ -81,11 +81,15 @@ fn white_furnace() {
         0.1,
         100.0,
     );
-    let film = render(&scene, &camera, (16, 16), 256, 64);
-    for p in film.pixels() {
+    let render_image = render(&scene, &camera, (16, 16), 256, 64);
+    for p in render_image.pixels() {
         assert!((p.x - 1000.0).abs() < 60.0, "{p:?}");
     }
-    assert!((mean(&film).x - 1000.0).abs() < 5.0, "{:?}", mean(&film));
+    assert!(
+        (mean(&render_image).x - 1000.0).abs() < 5.0,
+        "{:?}",
+        mean(&render_image)
+    );
 }
 
 #[test]
@@ -203,8 +207,8 @@ fn same_image_with_any_number_of_threads() {
         seed: 7,
         ..Default::default()
     };
-    let mut a = Film::new(24, 16);
-    let mut b = Film::new(24, 16);
+    let mut a = RenderImage::new(24, 16);
+    let mut b = RenderImage::new(24, 16);
     CpuReferenceTracer::with_threads(1)
         .trace(&scene, &camera, &mut a, &settings)
         .unwrap();
@@ -219,12 +223,16 @@ fn garden_reference_image() {
     let (width, height) = (96, 60);
     let scene = garden::scene();
     let camera = garden::camera(width, height);
-    let film = render(&scene, &camera, (width, height), 64, 8);
+    let render_image = render(&scene, &camera, (width, height), 64, 8);
     let tone_mapping = ToneMapping {
         exposure_ev100: 14.0,
         ..Default::default()
     };
-    let image: Vec<u8> = film.to_srgb8(&tone_mapping).into_iter().flatten().collect();
+    let image: Vec<u8> = render_image
+        .to_srgb8(&tone_mapping)
+        .into_iter()
+        .flatten()
+        .collect();
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/reference/garden.png");
     if std::env::var("THREE_D_WRITE_REFERENCE").is_ok() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
