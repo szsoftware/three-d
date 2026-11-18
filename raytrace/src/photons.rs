@@ -276,6 +276,18 @@ impl CausticSource {
     }
 }
 
+/// The gather radius of the `pass`th call, shrinking like in progressive photon mapping (alpha 2/3).
+pub(crate) fn gather_radius(first: f32, pass: u32) -> f32 {
+    first * ((pass + 1) as f32).powf(-1.0 / 6.0)
+}
+
+/// Center and diagonal of the scene's box, from the root of the instance hierarchy.
+pub(crate) fn scene_box(accel: &crate::CpuAccel) -> Option<(Vec3, f32)> {
+    let root = accel.instance_hierarchy().nodes.first()?;
+    let (min, max) = (Vec3::from(root.min), Vec3::from(root.max));
+    (min.x <= max.x).then(|| ((min + max) * 0.5, (max - min).magnitude()))
+}
+
 /// An index chosen with the probability of its weight.
 fn pick(weights: &[f32], u: f32) -> Option<usize> {
     let total: f32 = weights.iter().sum();

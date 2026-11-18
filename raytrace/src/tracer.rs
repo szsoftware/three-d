@@ -46,7 +46,7 @@ pub struct TraceSettings {
     /// Photons shot per call from the sun, directional and point lights at solid glass (transmissive and not thin
     /// walled), for caustics: the light such glass bends onto surfaces. 0 leaves caustics out and lets shadow rays
     /// pass solid glass straight, which is faster but shows neither the focused light nor the true shadow.
-    /// Only the [CpuReferenceTracer] shoots photons so far, the `ComputeTracer` ignores this.
+    /// The `ComputeTracer` keeps at most as many as fit into the largest buffer the device binds.
     ///
     pub caustic_photons: u32,
     ///
@@ -547,17 +547,14 @@ impl PathContext<'_> {
     /// surface behind it that is not glass. Light that only passed thin glass is left out, shadow rays find it.
     ///
     fn shoot_photons(&self, pass: u32) -> PhotonMap {
-        let radius = self.settings.caustic_radius * ((pass + 1) as f32).powf(-1.0 / 6.0);
+        let radius = gather_radius(self.settings.caustic_radius, pass);
         let spheres = glass_spheres(self.scene);
         let sources = caustic_sources(self.scene);
-        let root = self.accel.instance_hierarchy().nodes.first();
-        if spheres.is_empty() || sources.is_empty() || root.is_none() {
+        let scene_box = scene_box(self.accel);
+        if spheres.is_empty() || sources.is_empty() || scene_box.is_none() {
             return PhotonMap::new(Vec::new(), radius);
         }
-        let root = root.expect("a root");
-        let (min, max) = (Vec3::from(root.min), Vec3::from(root.max));
-        let center = (min + max) * 0.5;
-        let extent = (max - min).magnitude();
+        let (center, extent) = scene_box.expect("a box");
         let per_source = (self.settings.caustic_photons / sources.len() as u32).max(1);
         let mut photons = Vec::new();
         for (s, source) in sources.iter().enumerate() {

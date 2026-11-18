@@ -145,9 +145,10 @@ binds (128 MB guaranteed by WebGPU), the largest ones are halved in size until t
   surfaces gather the photons within `caustic_radius`, which shrinks with every call (progressive photon mapping),
   so focused light gets sharp and the image converges. Shadow rays of these lights then stop at solid glass, so the
   shadow of a glass ball is dark around its bright focus. Area lights and the sky reach surfaces behind glass by the
-  paths themselves. `RaytracePreview` shoots 20 000 photons per sample on the CPU (`PreviewSettings::cpu_caustic_photons`);
-  the compute tracer has no caustics yet and lets the light pass straight. A glass face lying exactly on another
-  surface sends its light below it; leave a millimetre between them.
+  paths themselves. The compute tracer does the same in compute passes per sample (shoot, count per cell of a hashed
+  grid, find where cells start, sort) and gathers in the trace pass. `RaytracePreview` shoots 200 000 photons per
+  sample on the GPU and 20 000 on the CPU (`PreviewSettings::gpu_caustic_photons`, `cpu_caustic_photons`). A glass
+  face lying exactly on another surface sends its light below it; leave a millimetre between them.
 - Not included: caustics of mirrors and of the light of area lights and the sky.
 - Depth of field with `TraceSettings::depth_of_field` (also `PreviewSettings::depth_of_field`), on CPU and GPU:
   `DepthOfField { f_number, focus_distance }` behaves like a photo camera with the same field of view on a full frame
@@ -162,7 +163,7 @@ binds (128 MB guaranteed by WebGPU), the largest ones are halved in size until t
 noon at the solstices and equinox, the material model for energy conservation, and the tracer against values known
 from physics: a white sphere disappears in a uniform environment (white furnace), a white ground under the sky
 reflects E/π, a point light falls off with the square of the distance, and a pane of glass lets 96 % of the light
-through. `tests/caustics.rs` checks that photons through a glass slab light the floor as brightly as the straight
+through. `tests/caustics.rs` checks on CPU and GPU that photons through a glass slab light the floor as brightly as the straight
 shadow rays and that a glass ball gathers the light of its shadow into a bright focus without making light.
 `tests/depth_of_field.rs` checks on CPU and GPU that an edge in the focus plane stays sharp and an edge behind it is
 blurred by the thin lens's circle of confusion, without losing light. A reference image of the garden scene is compared in blocks of 4 × 4 pixels, write it again with

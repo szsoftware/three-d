@@ -36,12 +36,22 @@ struct Params {
     lens_u: vec4<f32>,
     lens_v: vec4<f32>,
     lens_view: vec4<f32>,
+    // Caustic photons (photons.rs): x unused (the gather radius is in the tile), y 1 if on, z distance at which parallel
+    // light starts, w unused
+    caustics: vec4<f32>,
+    // Center of the scene's box
+    caustic_center: vec4<f32>,
+    // Word indices in photon_words / extras: x counter, y cell counts (then starts, then cursors), z sources, w spheres
+    caustic_layout: vec4<u32>,
+    // x sources, y glass spheres, z photons per source, w word index of the photons as shot (sorted after them)
+    caustic_counts: vec4<u32>,
 }
 
 struct Tile {
     // x, y: first pixel, z, w: size
     rect: vec4<u32>,
-    // x: index of the first sample, y: samples in this dispatch, z: 1 if the render image collects features
+    // x: index of the first sample, y: samples in this dispatch, z: 1 if the render image collects features, w: bits of
+    // the gather radius of caustic photons
     samples: vec4<u32>,
 }
 
@@ -102,11 +112,19 @@ struct Light {
 @group(0) @binding(4) var<storage, read> vertices: array<Vertex>;
 @group(0) @binding(5) var<storage, read> instances: array<Instance>;
 @group(0) @binding(6) var<storage, read> materials: array<Material>;
-@group(0) @binding(7) var<storage, read> lights: array<Light>;
+// The lights, four words each, then the caustic photons and their grid (photon_words in the photon passes)
+@group(0) @binding(7) var<storage, read> extras: array<vec4<f32>>;
 @group(0) @binding(8) var<storage, read_write> sums: array<vec4<f32>>;
 // Word 0: number of textures, then four words per texture (first texel, width, height, flags), then the texels with
 // four bytes each
 @group(0) @binding(9) var<storage, read> texels: array<u32>;
+// The same buffer as extras, written by the photon passes, which do not use extras
+@group(0) @binding(7) var<storage, read_write> photon_words: array<atomic<u32>>;
+
+fn light_at(i: u32) -> Light {
+    let b = 4u * i;
+    return Light(extras[b], extras[b + 1u], extras[b + 2u], extras[b + 3u]);
+}
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Textures (texture.rs), the first row at v = 0
@@ -303,6 +321,8 @@ struct Hit {
 
 // What a shadow ray lets through, set by walk in shadow mode
 var<private> transmittance: vec3<f32>;
+// Whether shadow rays stop at solid glass, for lights whose light through it comes as photons
+var<private> block_solid_glass: bool;
 // Direction of the shadow ray in world space, the hierarchies of the meshes see it in mesh coordinates
 var<private> shadow_direction: vec3<f32>;
 
@@ -355,7 +375,7 @@ fn face_normal_in_world(index: u32, p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f32>)
 
 // A triangle hit on a shadow ray, m with the textures for base color and transmission: true if nothing passes any more
 fn shadow_hit(index: u32, m: Material, p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f32>) -> bool {
-    if m.params.w <= 0.0 {
+    if m.params.w <= 0.0 || (block_solid_glass && m.flags.x == 0.0) {
         transmittance = vec3<f32>(0.0);
         return true;
     }
@@ -913,7 +933,7 @@ fn next_shadow_ray(first: u32, p: vec3<f32>, v: vec3<f32>, n: vec3<f32>, ng: vec
             l = normalize(t * c.x + b * c.y + s * c.z);
             e = params.sun_light.xyz;
         } else {
-            let light = lights[j - 1u];
+            let light = light_at(j - 1u);
             if light.position.w == 0.0 {
                 l = -normalize(light.position.xyz);
                 e = light.color.rgb;
@@ -1162,10 +1182,14 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
             light_distance = shadow_ray.distance;
             transmittance = vec3<f32>(1.0);
             shadow_direction = shadow_ray.direction;
+            // The sun (light 0 of next_shadow_ray), directional and point lights send their light through solid glass
+            // as photons
+            let tested = shadow_ray.next - 1u;
+            block_solid_glass = params.caustics.y > 0.0 && (tested == 0u || light_at(tested - 1u).position.w < 2.0);
         } else {
             for (var i = 0u; i < params.settings.y; i++) {
-                if lights[i].position.w >= 2.0 {
-                    let t = hit_area_light(lights[i], origin, direction);
+                if light_at(i).position.w >= 2.0 {
+                    let t = hit_area_light(light_at(i), origin, direction);
                     if t < light_distance {
                         light_distance = t;
                         light_index = i;
@@ -1186,7 +1210,7 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
         } else {
             if hit.instance == NONE && light_index != NONE {
                 // Area lights end the path; their light was also sampled directly, so both share it
-                let light = lights[light_index];
+                let light = light_at(light_index);
                 var weight = 1.0;
                 if !last_was_delta {
                     weight = power_heuristic(last_pdf, area_light_pdf(light, origin, direction, light_distance));
@@ -1207,7 +1231,7 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
                 break;
             }
             if hit.instance == NONE {
-                result += clamped(bounce, throughput * environment(direction, last_was_delta && (!diffuse_seen || glass_reflected)));
+                result += clamped(bounce, throughput * environment(direction, last_was_delta && (!diffuse_seen || (glass_reflected && params.caustics.y == 0.0))));
                 if bounce == 0u {
                     add_features(vec3<f32>(1.0), -direction, SKY_DISTANCE);
                 }
@@ -1260,6 +1284,9 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
                 surface_base_color = m.base_color.rgb;
                 surface_params = m.params.xyz;
                 direct = vec3<f32>(0.0);
+                if params.caustics.y > 0.0 {
+                    direct = gather_photons(s.position, v, n, ng, m);
+                }
                 shadow_ray = next_shadow_ray(0u, origin, v, n, ng, m);
                 if shadow_ray.next != NONE {
                     continue;
@@ -1381,5 +1408,311 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation
         sums[3u * i + 2u] = sums[3u * i + 2u] + vec4<f32>(normal_sum, 0.0);
     } else {
         sums[i] = sums[i] + vec4<f32>(sum, luminance_squared);
+    }
+}
+
+// Caustic photons (photons.rs): shot from the lights at solid glass, sorted into a hashed grid of cells as large as the
+// gather radius, gathered at diffuse and glossy points of the camera paths
+
+const PHOTON_CELLS: u32 = 65536u;
+const PHOTON_WORDS: u32 = 12u;
+
+// The gather radius of this sample's photons, which shrinks from sample to sample (in the tile)
+fn photon_radius() -> f32 {
+    return bitcast<f32>(tile.samples.w);
+}
+
+fn photon_cell(p: vec3<f32>) -> vec3<i32> {
+    return vec3<i32>(floor(p / photon_radius()));
+}
+
+fn cell_hash(c: vec3<i32>) -> u32 {
+    return pcg_hash(bitcast<u32>(c.x) ^ pcg_hash(bitcast<u32>(c.y) ^ pcg_hash(bitcast<u32>(c.z)))) & (PHOTON_CELLS - 1u);
+}
+
+fn photon_capacity() -> u32 {
+    return params.caustic_counts.x * params.caustic_counts.z;
+}
+
+// A word of extras, for the trace pass
+fn extra_word(i: u32) -> u32 {
+    return bitcast<u32>(extras[i >> 2u][i & 3u]);
+}
+
+fn extra_float(i: u32) -> f32 {
+    return extras[i >> 2u][i & 3u];
+}
+
+fn gather_photons(p: vec3<f32>, v: vec3<f32>, n: vec3<f32>, ng: vec3<f32>, m: Material) -> vec3<f32> {
+    let r = photon_radius();
+    let counts = params.caustic_layout.y;
+    let starts = counts + PHOTON_CELLS;
+    let sorted = params.caustic_counts.w + PHOTON_WORDS * photon_capacity();
+    let center = photon_cell(p);
+    var sum = vec3<f32>(0.0);
+    for (var dz = -1; dz <= 1; dz++) {
+        for (var dy = -1; dy <= 1; dy++) {
+            for (var dx = -1; dx <= 1; dx++) {
+                let c = center + vec3<i32>(dx, dy, dz);
+                let h = cell_hash(c);
+                let first = extra_word(starts + h);
+                let count = extra_word(counts + h);
+                for (var j = first; j < first + count; j++) {
+                    let w = sorted + PHOTON_WORDS * j;
+                    let position = vec3<f32>(extra_float(w), extra_float(w + 1u), extra_float(w + 2u));
+                    // Cells that share a hash: only the photons of this cell
+                    if any(photon_cell(position) != c) {
+                        continue;
+                    }
+                    let d = position - p;
+                    let direction = vec3<f32>(extra_float(w + 3u), extra_float(w + 4u), extra_float(w + 5u));
+                    if dot(d, d) <= r * r && abs(dot(d, ng)) <= 0.25 * r && dot(direction, ng) < 0.0 {
+                        let power = vec3<f32>(extra_float(w + 6u), extra_float(w + 7u), extra_float(w + 8u));
+                        sum += evaluate_material(m, v, -direction, n) * power;
+                    }
+                }
+            }
+        }
+    }
+    return sum / (PI * r * r);
+}
+
+fn photon_float(i: u32) -> f32 {
+    return bitcast<f32>(atomicLoad(&photon_words[i]));
+}
+
+fn photon_vec4(i: u32) -> vec4<f32> {
+    return vec4<f32>(photon_float(i), photon_float(i + 1u), photon_float(i + 2u), photon_float(i + 3u));
+}
+
+fn store_float(i: u32, value: f32) {
+    atomicStore(&photon_words[i], bitcast<u32>(value));
+}
+
+// The flux through glass sphere j as seen from a source: area of its disc (parallel) or solid angle (point)
+fn sphere_weight(kind: f32, at: vec3<f32>, j: u32) -> f32 {
+    let sphere = photon_vec4(params.caustic_layout.w + 4u * j);
+    if kind == 0.0 {
+        return PI * sphere.w * sphere.w;
+    }
+    let to = sphere.xyz - at;
+    let distance = length(to);
+    if distance <= sphere.w {
+        return 4.0 * PI;
+    }
+    let sin_max = sphere.w / distance;
+    return 2.0 * PI * (1.0 - sqrt(max(1.0 - sin_max * sin_max, 0.0)));
+}
+
+// Follows a photon through glass and keeps it where it lands, if the glass bent it (tracer.rs trace_photon)
+fn trace_photon(origin_in: vec3<f32>, direction_in: vec3<f32>, power_in: vec3<f32>) {
+    var origin = origin_in;
+    var direction = direction_in;
+    var power = power_in;
+    var bent = false;
+    for (var bounce = 0u; bounce < max(params.camera.w, 1u) + 8u; bounce++) {
+        let hit = walk(origin, direction, BIG, false);
+        if hit.instance == NONE {
+            return;
+        }
+        let s = surface_at(hit, direction);
+        let m = s.material;
+        let v = -direction;
+        let ng = s.geometric_normal;
+        var n = s.shading_normal;
+        if dot(n, v) <= 0.0 {
+            n = ng;
+        }
+        let transmission = m.params.w;
+        let thin_walled = m.flags.x > 0.0;
+        if transmission > 0.0 && next_f32() < transmission {
+            let ior = m.emission.w;
+            let eta = select(1.0 / ior, ior, thin_walled || s.front_face);
+            let cos_i = clamp(dot(n, v), 0.0, 1.0);
+            if next_f32() < fresnel_dielectric(cos_i, eta) {
+                direction = reflect_about(v, n);
+                origin = offset_point(s.position, ng);
+                bent = true;
+            } else {
+                power = power * m.base_color.rgb;
+                if !thin_walled {
+                    let r = refract_through(v, n, 1.0 / eta);
+                    direction = select(reflect_about(v, n), r.xyz, r.w > 0.0);
+                    bent = true;
+                }
+                origin = offset_point(s.position, -ng);
+            }
+        } else {
+            if bent {
+                let index = atomicAdd(&photon_words[params.caustic_layout.x], 1u);
+                if index < photon_capacity() {
+                    let w = params.caustic_counts.w + PHOTON_WORDS * index;
+                    store_float(w, s.position.x);
+                    store_float(w + 1u, s.position.y);
+                    store_float(w + 2u, s.position.z);
+                    store_float(w + 3u, direction.x);
+                    store_float(w + 4u, direction.y);
+                    store_float(w + 5u, direction.z);
+                    store_float(w + 6u, power.x);
+                    store_float(w + 7u, power.y);
+                    store_float(w + 8u, power.z);
+                }
+            }
+            return;
+        }
+    }
+}
+
+// One photon per invocation: from source i / photons per source, aimed at a glass sphere chosen by its size seen from
+// the light (CausticSource::emit)
+// 64 invocations like trace, for the traversal stacks in mesh_stack
+@compute @workgroup_size(64)
+fn shoot_photons(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_index) local_index: u32) {
+    invocation = local_index;
+    let i = id.x;
+    if i >= photon_capacity() {
+        return;
+    }
+    let per_source = params.caustic_counts.z;
+    let source_word = params.caustic_layout.z + 8u * (i / per_source);
+    let a = photon_vec4(source_word);
+    let light = photon_vec4(source_word + 4u);
+    // Plain random numbers, independent per photon and pass
+    rng = pcg_hash(params.settings.x ^ pcg_hash(tile.samples.x ^ pcg_hash(i + 0x5eedu)));
+    dimension = SOBOL_DIMENSIONS;
+    let spheres = params.caustic_counts.y;
+    var total = 0.0;
+    for (var j = 0u; j < spheres; j++) {
+        total += sphere_weight(a.w, a.xyz, j);
+    }
+    if total <= 0.0 {
+        return;
+    }
+    // Choose the sphere
+    var left = next_f32() * total;
+    var chosen = spheres - 1u;
+    for (var j = 0u; j < spheres; j++) {
+        let w = sphere_weight(a.w, a.xyz, j);
+        if left < w {
+            chosen = j;
+            break;
+        }
+        left -= w;
+    }
+    let sphere = photon_vec4(params.caustic_layout.w + 4u * chosen);
+    var origin: vec3<f32>;
+    var direction: vec3<f32>;
+    var covering = 0u;
+    if a.w == 0.0 {
+        // Parallel light, from a disc of the sun if it has one
+        direction = a.xyz;
+        if light.w < 1.0 {
+            let c = uniform_cone(next_f32(), next_f32(), light.w);
+            direction = normalize(orthonormal_t(a.xyz) * c.x + orthonormal_b(a.xyz) * c.y + a.xyz * c.z);
+        }
+        let r = sphere.w * sqrt(next_f32());
+        let phi = 2.0 * PI * next_f32();
+        let point = sphere.xyz + orthonormal_t(direction) * (r * cos(phi)) + orthonormal_b(direction) * (r * sin(phi));
+        for (var j = 0u; j < spheres; j++) {
+            let other = photon_vec4(params.caustic_layout.w + 4u * j);
+            let to = other.xyz - point;
+            let across = to - direction * dot(to, direction);
+            if dot(across, across) <= other.w * other.w {
+                covering += 1u;
+            }
+        }
+        origin = point - direction * (length(point - params.caustic_center.xyz) + params.caustics.z);
+    } else {
+        // Point light, into the cone of the sphere
+        let to = sphere.xyz - a.xyz;
+        let distance = length(to);
+        var axis = vec3<f32>(0.0, 0.0, 1.0);
+        var cos_max = -1.0;
+        if distance > sphere.w {
+            axis = to / distance;
+            let sin_max = sphere.w / distance;
+            cos_max = sqrt(max(1.0 - sin_max * sin_max, 0.0));
+        }
+        let c = uniform_cone(next_f32(), next_f32(), cos_max);
+        direction = normalize(orthonormal_t(axis) * c.x + orthonormal_b(axis) * c.y + axis * c.z);
+        for (var j = 0u; j < spheres; j++) {
+            let other = photon_vec4(params.caustic_layout.w + 4u * j);
+            let to_other = other.xyz - a.xyz;
+            let d = length(to_other);
+            var inside = d <= other.w;
+            if !inside {
+                let s = other.w / d;
+                inside = dot(direction, to_other / d) >= sqrt(max(1.0 - s * s, 0.0));
+            }
+            if inside {
+                covering += 1u;
+            }
+        }
+        origin = a.xyz;
+    }
+    let power = light.rgb * (total / (f32(per_source) * f32(max(covering, 1u))));
+    trace_photon(origin, direction, power);
+}
+
+fn landed_photons() -> u32 {
+    return min(atomicLoad(&photon_words[params.caustic_layout.x]), photon_capacity());
+}
+
+fn raw_photon_cell(i: u32) -> u32 {
+    let w = params.caustic_counts.w + PHOTON_WORDS * i;
+    return cell_hash(photon_cell(vec3<f32>(photon_float(w), photon_float(w + 1u), photon_float(w + 2u))));
+}
+
+@compute @workgroup_size(64)
+fn count_photons(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= landed_photons() {
+        return;
+    }
+    atomicAdd(&photon_words[params.caustic_layout.y + raw_photon_cell(id.x)], 1u);
+}
+
+var<workgroup> partial_sums: array<u32, 256>;
+
+// Where each cell's photons start: an exclusive prefix sum of the counts in one workgroup, 256 cells per invocation
+@compute @workgroup_size(256)
+fn find_cell_starts(@builtin(local_invocation_index) t: u32) {
+    let counts = params.caustic_layout.y;
+    let per = PHOTON_CELLS / 256u;
+    var sum = 0u;
+    for (var k = 0u; k < per; k++) {
+        sum += atomicLoad(&photon_words[counts + t * per + k]);
+    }
+    partial_sums[t] = sum;
+    workgroupBarrier();
+    // Hillis and Steele, inclusive
+    for (var step = 1u; step < 256u; step *= 2u) {
+        var add = 0u;
+        if t >= step {
+            add = partial_sums[t - step];
+        }
+        workgroupBarrier();
+        partial_sums[t] += add;
+        workgroupBarrier();
+    }
+    var start = partial_sums[t] - sum;
+    for (var k = 0u; k < per; k++) {
+        let h = t * per + k;
+        atomicStore(&photon_words[counts + PHOTON_CELLS + h], start);
+        atomicStore(&photon_words[counts + 2u * PHOTON_CELLS + h], start);
+        start += atomicLoad(&photon_words[counts + h]);
+    }
+}
+
+@compute @workgroup_size(64)
+fn sort_photons(@builtin(global_invocation_id) id: vec3<u32>) {
+    if id.x >= landed_photons() {
+        return;
+    }
+    let cursor = params.caustic_layout.y + 2u * PHOTON_CELLS + raw_photon_cell(id.x);
+    let slot = atomicAdd(&photon_words[cursor], 1u);
+    let source = params.caustic_counts.w + PHOTON_WORDS * id.x;
+    let destination = params.caustic_counts.w + PHOTON_WORDS * (photon_capacity() + slot);
+    for (var k = 0u; k < PHOTON_WORDS; k++) {
+        atomicStore(&photon_words[destination + k], atomicLoad(&photon_words[source + k]));
     }
 }

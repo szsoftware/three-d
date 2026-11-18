@@ -45,6 +45,11 @@ pub struct ComputeTracer {
     buffers: Option<SceneBuffers>,
     layout: w::BindGroupLayout,
     pipeline: w::ComputePipeline,
+    /// The passes of caustic photons: shoot, count per cell, find where cells start, sort
+    photon_layout: w::BindGroupLayout,
+    photon_pipelines: [w::ComputePipeline; 4],
+    /// The lights and, with caustics, the photons and their grid (binding 7)
+    extras: Option<w::Buffer>,
     tile_size: u32,
     scratch: Option<GpuRenderImage>,
 }
@@ -107,6 +112,42 @@ impl ComputeTracer {
             compilation_options: Default::default(),
             cache: None,
         });
+        // Without the render image, with the photons written
+        let photon_layout = device.create_bind_group_layout(&w::BindGroupLayoutDescriptor {
+            label: Some("caustic photons"),
+            entries: &[
+                uniform(0, false, 0),
+                uniform(1, true, TILE_BYTES),
+                storage(2, true),
+                storage(3, true),
+                storage(4, true),
+                storage(5, true),
+                storage(6, true),
+                storage(7, false),
+                storage(9, true),
+            ],
+        });
+        let photon_pipeline_layout = device.create_pipeline_layout(&w::PipelineLayoutDescriptor {
+            label: Some("caustic photons"),
+            bind_group_layouts: &[Some(&photon_layout)],
+            immediate_size: 0,
+        });
+        let photon_pipelines = [
+            "shoot_photons",
+            "count_photons",
+            "find_cell_starts",
+            "sort_photons",
+        ]
+        .map(|entry| {
+            device.create_compute_pipeline(&w::ComputePipelineDescriptor {
+                label: Some(entry),
+                layout: Some(&photon_pipeline_layout),
+                module: &module,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        });
         Self {
             gpu: gpu.clone(),
             builder: CpuBvhBuilder::default(),
@@ -114,6 +155,9 @@ impl ComputeTracer {
             buffers: None,
             layout,
             pipeline,
+            photon_layout,
+            photon_pipelines,
+            extras: None,
             tile_size: 256,
             scratch: None,
         }
@@ -161,12 +205,50 @@ impl ComputeTracer {
             return Err(RtError::EmptyImage);
         }
         self.prepare(scene)?;
-        let buffers = self.buffers.as_ref().expect("prepared");
         let device = &self.gpu.device;
+        let buffers = self.buffers.as_ref().expect("prepared");
+        let caustics = CausticPlan::new(
+            scene,
+            self.accel.as_ref().expect("prepared"),
+            settings,
+            buffers.lights.0.len() as u32,
+            device.limits().max_storage_buffer_binding_size,
+        );
+
+        // The lights and the room for the photons, written before the passes of this call
+        let light_bytes = buffers.lights.bytes();
+        let extras_size = match &caustics {
+            Some(plan) => 4 * plan.words as u64,
+            None => light_bytes.len().max(16) as u64,
+        };
+        if self.extras.as_ref().is_none_or(|b| b.size() < extras_size) {
+            self.extras = Some(device.create_buffer(&w::BufferDescriptor {
+                label: Some("ray tracing lights and photons"),
+                size: extras_size,
+                usage: w::BufferUsages::STORAGE | w::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        let extras = self.extras.as_ref().expect("created");
+        if !light_bytes.is_empty() {
+            self.gpu.queue.write_buffer(extras, 0, &light_bytes);
+        }
+        if let Some(plan) = &caustics {
+            self.gpu
+                .queue
+                .write_buffer(extras, 4 * plan.sources as u64, &plan.emitter_bytes());
+        }
 
         let params = device.create_buffer_init(&w::util::BufferInitDescriptor {
             label: Some("ray tracing parameters"),
-            contents: &params_bytes(scene, camera, image.width, image.height, settings),
+            contents: &params_bytes(
+                scene,
+                camera,
+                image.width,
+                image.height,
+                settings,
+                caustics.as_ref(),
+            ),
             usage: w::BufferUsages::UNIFORM,
         });
 
@@ -197,7 +279,10 @@ impl ComputeTracer {
                     image.samples + s,
                     1,
                     u32::from(image.features),
-                    0,
+                    caustics.as_ref().map_or(0, |_| {
+                        crate::photons::gather_radius(settings.caustic_radius, image.samples + s)
+                            .to_bits()
+                    }),
                 ];
                 for (i, word) in words.iter().enumerate() {
                     tile_data[at + 4 * i..at + 4 * i + 4].copy_from_slice(&word.to_le_bytes());
@@ -248,7 +333,7 @@ impl ComputeTracer {
                 },
                 w::BindGroupEntry {
                     binding: 7,
-                    resource: buffers.lights.as_entire_binding(),
+                    resource: extras.as_entire_binding(),
                 },
                 w::BindGroupEntry {
                     binding: 8,
@@ -261,11 +346,65 @@ impl ComputeTracer {
             ],
         });
 
+        let photon_bind_group = caustics.as_ref().map(|_| {
+            fn entry(binding: u32, buffer: &w::Buffer) -> w::BindGroupEntry<'_> {
+                w::BindGroupEntry {
+                    binding,
+                    resource: buffer.as_entire_binding(),
+                }
+            }
+            device.create_bind_group(&w::BindGroupDescriptor {
+                label: Some("caustic photons"),
+                layout: &self.photon_layout,
+                entries: &[
+                    entry(0, &params),
+                    w::BindGroupEntry {
+                        binding: 1,
+                        resource: w::BindingResource::Buffer(w::BufferBinding {
+                            buffer: &tile_buffer,
+                            offset: 0,
+                            size: std::num::NonZeroU64::new(TILE_BYTES),
+                        }),
+                    },
+                    entry(2, &buffers.nodes),
+                    entry(3, &buffers.triangles),
+                    entry(4, &buffers.vertices),
+                    entry(5, &buffers.instances),
+                    entry(6, &buffers.materials),
+                    entry(7, extras),
+                    entry(9, &buffers.texels),
+                ],
+            })
+        });
+
         // One submission per sample, so the GPU can go on with other work between them
         for s in 0..samples {
             let mut encoder = device.create_command_encoder(&w::CommandEncoderDescriptor {
                 label: Some("ray tracing"),
             });
+            if let (Some(plan), Some(bind_group)) = (&caustics, &photon_bind_group) {
+                // The photons of this sample: shot, counted per cell, sorted by cell
+                encoder.clear_buffer(
+                    extras,
+                    4 * plan.counter as u64,
+                    Some(4 * (plan.counts + PHOTON_CELLS - plan.counter) as u64),
+                );
+                let mut pass = encoder.begin_compute_pass(&w::ComputePassDescriptor {
+                    label: Some("caustic photons"),
+                    timestamp_writes: None,
+                });
+                let offset = (s as u64 * tiles.len() as u64 * stride) as u32;
+                pass.set_bind_group(0, bind_group, &[offset]);
+                let groups = plan.capacity().div_ceil(64);
+                for (pipeline, groups) in self
+                    .photon_pipelines
+                    .iter()
+                    .zip([groups, groups, 1, groups])
+                {
+                    pass.set_pipeline(pipeline);
+                    pass.dispatch_workgroups(groups, 1, 1);
+                }
+            }
             {
                 let mut pass = encoder.begin_compute_pass(&w::ComputePassDescriptor {
                     label: Some("ray tracing"),
@@ -836,12 +975,13 @@ struct SceneBuffers {
     vertices: w::Buffer,
     instances: w::Buffer,
     materials: w::Buffer,
-    lights: w::Buffer,
+    /// Four vec4 per light, written into the buffer of lights and photons with every call
+    lights: Words,
     texels: w::Buffer,
 }
 
 /// Words of a buffer, floats by their bits.
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct Words(Vec<u32>);
 
 impl Words {
@@ -1038,9 +1178,105 @@ impl SceneBuffers {
             vertices: storage("ray tracing vertices", &vertices),
             instances: storage("ray tracing instances", &instances),
             materials: storage("ray tracing materials", &materials),
-            lights: storage("ray tracing lights", &lights),
+            lights,
             texels: storage("ray tracing textures", &texels),
         }
+    }
+}
+
+/// Cells of the hashed photon grid, PHOTON_CELLS in trace.wgsl.
+const PHOTON_CELLS: u32 = 65536;
+/// Words of a photon, PHOTON_WORDS in trace.wgsl.
+const PHOTON_WORDS: u32 = 12;
+
+///
+/// Where the caustic photons of a call live in the buffer of lights and photons, in words (layout in trace.wgsl).
+///
+struct CausticPlan {
+    source_list: Vec<crate::photons::CausticSource>,
+    sphere_list: Vec<(Vec3, f32)>,
+    per_source: u32,
+    center: Vec3,
+    extent: f32,
+    counter: u32,
+    counts: u32,
+    sources: u32,
+    spheres: u32,
+    raw: u32,
+    words: u32,
+}
+
+impl CausticPlan {
+    /// The plan if caustics are asked for and the scene has solid glass and lights that cast them.
+    fn new(
+        scene: &RtScene,
+        accel: &CpuAccel,
+        settings: &TraceSettings,
+        light_words: u32,
+        max_binding: u64,
+    ) -> Option<Self> {
+        if settings.caustic_photons == 0 {
+            return None;
+        }
+        let sphere_list = crate::photons::glass_spheres(scene);
+        let source_list = crate::photons::caustic_sources(scene);
+        let (center, extent) = crate::photons::scene_box(accel)?;
+        if sphere_list.is_empty() || source_list.is_empty() {
+            return None;
+        }
+        let counter = light_words.next_multiple_of(4);
+        let counts = counter + 4;
+        let sources = counts + 3 * PHOTON_CELLS;
+        let spheres = sources + 8 * source_list.len() as u32;
+        let raw = spheres + 4 * sphere_list.len() as u32;
+        // Shot and sorted photons, as many as the largest buffer the device binds takes
+        let room = (max_binding / 4).saturating_sub(raw as u64) / (2 * PHOTON_WORDS as u64);
+        let photons = (settings.caustic_photons as u64).min(room);
+        let per_source = (photons / source_list.len() as u64).max(1) as u32;
+        let words = raw + 2 * PHOTON_WORDS * per_source * source_list.len() as u32;
+        Some(Self {
+            source_list,
+            sphere_list,
+            per_source,
+            center,
+            extent,
+            counter,
+            counts,
+            sources,
+            spheres,
+            raw,
+            words,
+        })
+    }
+
+    fn capacity(&self) -> u32 {
+        self.per_source * self.source_list.len() as u32
+    }
+
+    /// The sources and the glass spheres, written at `sources`.
+    fn emitter_bytes(&self) -> Vec<u8> {
+        use crate::photons::CausticSource;
+        let mut words = Words::default();
+        for source in &self.source_list {
+            match *source {
+                CausticSource::Parallel {
+                    direction,
+                    light,
+                    cos_radius,
+                } => {
+                    words.v3(direction, 0.0);
+                    words.v3(light, cos_radius);
+                }
+                CausticSource::Point { position, light } => {
+                    words.v3(position, 1.0);
+                    words.v3(light, 1.0);
+                }
+            }
+        }
+        for (center, radius) in &self.sphere_list {
+            words.v3(*center, *radius);
+        }
+        words.bytes()
     }
 }
 
@@ -1127,6 +1363,7 @@ fn params_bytes(
     width: u32,
     height: u32,
     settings: &TraceSettings,
+    caustics: Option<&CausticPlan>,
 ) -> Vec<u8> {
     let mut p = Words::default();
     let perspective = matches!(camera.projection_type(), ProjectionType::Perspective { .. });
@@ -1191,6 +1428,24 @@ fn params_bytes(
             p.v3(lens.view, 0.0);
         }
         None => (0..12).for_each(|_| p.f(0.0)),
+    }
+    match caustics {
+        Some(plan) => {
+            p.f(0.0);
+            p.f(1.0);
+            p.f(plan.extent);
+            p.f(0.0);
+            p.v3(plan.center, 0.0);
+            p.u(plan.counter);
+            p.u(plan.counts);
+            p.u(plan.sources);
+            p.u(plan.spheres);
+            p.u(plan.source_list.len() as u32);
+            p.u(plan.sphere_list.len() as u32);
+            p.u(plan.per_source);
+            p.u(plan.raw);
+        }
+        None => (0..16).for_each(|_| p.f(0.0)),
     }
     p.bytes()
 }

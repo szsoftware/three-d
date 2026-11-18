@@ -71,9 +71,11 @@ pub struct PreviewSettings {
     /// Most bounces of a path.
     pub max_bounces: u32,
     ///
-    /// Photons per sample for caustics of solid glass on the CPU, see [TraceSettings::caustic_photons]. They cost
-    /// time only in scenes with such glass; 0 lets light pass the glass straight. The GPU has no caustics yet.
+    /// Photons per sample for caustics of solid glass on the GPU, see [TraceSettings::caustic_photons]. They cost
+    /// time only in scenes with such glass; 0 lets light pass the glass straight.
     ///
+    pub gpu_caustic_photons: u32,
+    /// The same on the CPU, fewer since every photon there takes as long as a few pixels.
     pub cpu_caustic_photons: u32,
     /// Blur in front of and behind the focus distance, `None` for everything sharp.
     pub depth_of_field: Option<crate::DepthOfField>,
@@ -91,6 +93,7 @@ impl Default for PreviewSettings {
             cpu_in_background: true,
             max_samples: 1024,
             max_bounces: 6,
+            gpu_caustic_photons: 200_000,
             cpu_caustic_photons: 20_000,
             depth_of_field: None,
             tone_mapping: ToneMapping::default(),
@@ -262,6 +265,7 @@ impl RaytracePreview {
             && self.on_cpu();
         let restart = settings.max_bounces != self.settings.max_bounces
             || settings.cpu_caustic_photons != self.settings.cpu_caustic_photons
+            || settings.gpu_caustic_photons != self.settings.gpu_caustic_photons
             || settings.depth_of_field != self.settings.depth_of_field;
         self.settings = settings;
         if rebuild {
@@ -381,6 +385,7 @@ impl RaytracePreview {
             Engine::Gpu { tracer, image } => {
                 let settings = TraceSettings {
                     samples_per_call: self.settings.gpu_samples_per_frame.max(1),
+                    caustic_photons: self.settings.gpu_caustic_photons,
                     ..settings
                 };
                 tracer.trace_gpu(scene, camera, image, &settings)?;
