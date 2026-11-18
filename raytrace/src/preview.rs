@@ -4,8 +4,8 @@
 //!
 
 use crate::{
-    Camera, CpuReferenceTracer, RenderImage, RtScene, ToneMapping, ToneOperator, TraceSettings,
-    Tracer, TracerKind,
+    Camera, CpuReferenceTracer, Denoiser, RenderImage, RtScene, ToneMapping, ToneOperator,
+    TraceSettings, Tracer, TracerKind,
 };
 use three_d::{
     ColorTarget, Context, DepthTest, Effect, EffectMaterialId, Interpolation, Light, Program,
@@ -63,6 +63,8 @@ pub struct PreviewSettings {
     pub max_bounces: u32,
     /// Exposure and curve of [RaytracePreview::render].
     pub tone_mapping: ToneMapping,
+    /// Smooths the noise of the first samples with this filter, `None` to show the samples as they are.
+    pub denoiser: Option<crate::AtrousDenoiser>,
 }
 
 impl Default for PreviewSettings {
@@ -73,6 +75,7 @@ impl Default for PreviewSettings {
             max_samples: 1024,
             max_bounces: 6,
             tone_mapping: ToneMapping::default(),
+            denoiser: Some(crate::AtrousDenoiser::default()),
         }
     }
 }
@@ -161,7 +164,8 @@ impl RaytracePreview {
         #[cfg(feature = "wgpu")]
         if *availability == PreviewAvailability::Gpu {
             if let Some(tracer) = crate::ComputeTracer::from_context(context) {
-                let image = crate::GpuRenderImage::new(tracer.gpu(), width.max(1), height.max(1));
+                let image =
+                    crate::GpuRenderImage::with_features(tracer.gpu(), width.max(1), height.max(1));
                 let texture = empty_texture(context, width.max(1), height.max(1));
                 return (
                     Engine::Gpu {
@@ -178,7 +182,7 @@ impl RaytracePreview {
         (
             Engine::Cpu {
                 tracer: CpuReferenceTracer::new(),
-                image: RenderImage::new(w, h),
+                image: RenderImage::with_features(w, h),
             },
             texture,
         )
@@ -280,7 +284,12 @@ impl RaytracePreview {
                     ..settings
                 };
                 tracer.trace_gpu(scene, camera, image, &settings)?;
-                image.write_to_three_d_texture(&self.texture);
+                match &self.settings.denoiser {
+                    Some(denoiser) => {
+                        image.write_denoised_to_three_d_texture(&self.texture, denoiser)
+                    }
+                    None => image.write_to_three_d_texture(&self.texture),
+                }
             }
             Engine::Cpu { tracer, image } => {
                 // The camera of the reduced resolution
@@ -290,7 +299,12 @@ impl RaytracePreview {
                     image.height(),
                 ));
                 tracer.trace(scene, &small, image, &settings)?;
-                image.write_to_three_d_texture(&self.texture);
+                match self.settings.denoiser {
+                    Some(mut denoiser) => denoiser
+                        .denoise(image)?
+                        .write_to_three_d_texture(&self.texture),
+                    None => image.write_to_three_d_texture(&self.texture),
+                }
             }
         }
         Ok(true)

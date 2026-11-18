@@ -26,6 +26,7 @@ mod accel;
 mod bvh;
 #[cfg(feature = "wgpu")]
 mod compute;
+mod denoise;
 #[cfg(feature = "three-d")]
 mod display;
 mod error;
@@ -46,6 +47,7 @@ pub use accel::*;
 pub use bvh::{Bvh, BvhNode};
 #[cfg(feature = "wgpu")]
 pub use compute::*;
+pub use denoise::*;
 pub use error::*;
 #[cfg(feature = "wgpu")]
 pub use gpu::*;

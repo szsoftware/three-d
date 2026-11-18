@@ -30,7 +30,7 @@ fn main() {
     };
     let scene = garden::scene();
     let camera = garden::camera(width, height);
-    let mut image = GpuRenderImage::new(tracer.gpu(), width, height);
+    let mut image = GpuRenderImage::with_features(tracer.gpu(), width, height);
     let start = std::time::Instant::now();
     tracer.prepare(&scene).unwrap();
     println!("Scene on the GPU after {:.2?}", start.elapsed());
@@ -58,5 +58,10 @@ fn main() {
         .save_png(format!("{name}.png"), &tone_mapping)
         .unwrap();
     render_image.save_exr(format!("{name}.exr")).unwrap();
-    println!("Wrote {name}.png and {name}.exr");
+    AtrousDenoiser::default()
+        .denoise(&render_image)
+        .unwrap()
+        .save_png(format!("{name}_denoised.png"), &tone_mapping)
+        .unwrap();
+    println!("Wrote {name}.png, {name}.exr and {name}_denoised.png");
 }

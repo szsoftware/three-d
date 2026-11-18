@@ -36,7 +36,7 @@ struct Params {
 struct Tile {
     // x, y: first pixel, z, w: size
     rect: vec4<u32>,
-    // x: index of the first sample, y: samples in this dispatch
+    // x: index of the first sample, y: samples in this dispatch, z: 1 if the render image collects features
     samples: vec4<u32>,
 }
 
@@ -1042,6 +1042,19 @@ fn clamped(bounce: u32, contribution: vec3<f32>) -> vec3<f32> {
     return contribution;
 }
 
+// What the camera ray hits first, for the features of a denoiser (tracer.rs FirstHit)
+var<private> first_albedo: vec3<f32>;
+var<private> first_normal: vec3<f32>;
+var<private> first_distance: f32;
+const SKY_DISTANCE: f32 = 1e9;
+
+fn feature_albedo(m: Material) -> vec3<f32> {
+    if m.params.w > 0.0 || (m.params.x > 0.5 && m.params.y < 0.2) {
+        return vec3<f32>(1.0);
+    }
+    return m.base_color.rgb;
+}
+
 fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
     var origin = origin_in;
     var direction = direction_in;
@@ -1081,6 +1094,11 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
             break;
         }
         let s = surface_at(hit, direction);
+        if bounce == 0u {
+            first_albedo = feature_albedo(s.material);
+            first_normal = s.shading_normal;
+            first_distance = hit.t;
+        }
         let m = s.material;
         result += clamped(bounce, throughput * m.emission.rgb);
         if bounce >= params.camera.w {
@@ -1164,6 +1182,10 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
     let width = params.camera.y;
     let height = params.camera.z;
     var sum = vec3<f32>(0.0);
+    var luminance_squared = 0.0;
+    var albedo = vec3<f32>(0.0);
+    var normal = vec3<f32>(0.0);
+    var distance = 0.0;
     for (var s = 0u; s < tile.samples.y; s++) {
         let sample = tile.samples.x + s;
         rng = pcg_hash(params.settings.x ^ pcg_hash(x ^ pcg_hash(y ^ pcg_hash(sample))));
@@ -1172,12 +1194,28 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
         dimension = 0u;
         let u = (f32(x) + next_f32()) / f32(width);
         let v = 1.0 - (f32(y) + next_f32()) / f32(height);
-        let l = radiance(camera_ray_origin(u, v), camera_ray_direction(u, v));
+        let direction = camera_ray_direction(u, v);
+        first_albedo = vec3<f32>(1.0);
+        first_normal = -direction;
+        first_distance = SKY_DISTANCE;
+        let l = radiance(camera_ray_origin(u, v), direction);
         // A broken sample must not spoil the pixel for good (comparisons with NaN are false)
         if all(abs(l) < vec3<f32>(BIG)) {
             sum += l;
+            let lum = luminance(l);
+            luminance_squared += lum * lum;
         }
+        albedo += first_albedo;
+        normal += first_normal;
+        distance += first_distance;
     }
     let i = y * width + x;
-    sums[i] = sums[i] + vec4<f32>(sum, 0.0);
+    if tile.samples.z == 1u {
+        // Three words per pixel: color and squared luminance, albedo and distance, normal
+        sums[3u * i] = sums[3u * i] + vec4<f32>(sum, luminance_squared);
+        sums[3u * i + 1u] = sums[3u * i + 1u] + vec4<f32>(albedo, distance);
+        sums[3u * i + 2u] = sums[3u * i + 2u] + vec4<f32>(normal, 0.0);
+    } else {
+        sums[i] = sums[i] + vec4<f32>(sum, luminance_squared);
+    }
 }

@@ -3,12 +3,15 @@
 //! the sums of the samples in a buffer on the GPU.
 //!
 
+use crate::render_image::FEATURE_WORDS;
 use crate::{
     AccelBuilder, Camera, CpuAccel, CpuBvhBuilder, GpuDevice, RaytraceSupport, RenderImage,
     RtEnvironment, RtError, RtLight, RtScene, RtTexture, RtWrapping, TextureId, TraceSettings,
     Tracer, TracerKind,
 };
 use three_d::wgpu as w;
+
+mod denoise_gpu;
 use three_d::wgpu::util::DeviceExt;
 use three_d_asset::prelude::*;
 use three_d_asset::ProjectionType;
@@ -193,7 +196,7 @@ impl ComputeTracer {
                     rect[3],
                     image.samples + s,
                     1,
-                    0,
+                    u32::from(image.features),
                     0,
                 ];
                 for (i, word) in words.iter().enumerate() {
@@ -337,8 +340,10 @@ impl Tracer for ComputeTracer {
             ));
         }
         let (width, height) = (render_image.width(), render_image.height());
+        let features = render_image.has_features();
         let mut scratch = match self.scratch.take() {
-            Some(s) if s.width == width && s.height == height => s,
+            Some(s) if s.width == width && s.height == height && s.features == features => s,
+            _ if features => GpuRenderImage::with_features(&self.gpu, width, height),
             _ => GpuRenderImage::new(&self.gpu, width, height),
         };
         scratch.reset();
@@ -346,7 +351,11 @@ impl Tracer for ComputeTracer {
         scratch.samples = render_image.sample_count();
         let result = self.trace_gpu(scene, camera, &mut scratch, settings);
         if result.is_ok() {
-            render_image.accumulate(&scratch.read_sums(), settings.samples_per_call);
+            scratch.add_to(
+                render_image,
+                &scratch.read_sums(),
+                settings.samples_per_call,
+            );
         }
         self.scratch = Some(scratch);
         result
@@ -364,15 +373,36 @@ pub struct GpuRenderImage {
     height: u32,
     samples: u32,
     sums: w::Buffer,
+    /// Three words per pixel with the features for a denoiser instead of one.
+    features: bool,
     resolve: Option<Resolve>,
+    denoise: Option<Box<denoise_gpu::GpuDenoise>>,
 }
 
 impl GpuRenderImage {
     /// A black render image with the given size.
     pub fn new(gpu: &GpuDevice, width: u32, height: u32) -> Self {
+        Self::create(gpu, width, height, false)
+    }
+
+    ///
+    /// A black render image that also collects the features for denoising, like [RenderImage::with_features]. Costs 32
+    /// more bytes per pixel.
+    ///
+    pub fn with_features(gpu: &GpuDevice, width: u32, height: u32) -> Self {
+        Self::create(gpu, width, height, true)
+    }
+
+    /// Whether the image collects features.
+    pub fn has_features(&self) -> bool {
+        self.features
+    }
+
+    fn create(gpu: &GpuDevice, width: u32, height: u32, features: bool) -> Self {
+        let words = if features { 3 } else { 1 };
         let sums = gpu.device.create_buffer(&w::BufferDescriptor {
             label: Some("render image"),
-            size: (width.max(1) as u64) * (height.max(1) as u64) * 16,
+            size: (width.max(1) as u64) * (height.max(1) as u64) * 16 * words,
             usage: w::BufferUsages::STORAGE | w::BufferUsages::COPY_SRC | w::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -382,7 +412,9 @@ impl GpuRenderImage {
             height,
             samples: 0,
             sums,
+            features,
             resolve: None,
+            denoise: None,
         }
     }
 
@@ -416,7 +448,43 @@ impl GpuRenderImage {
 
     /// Changes the size and forgets all samples.
     pub fn resize(&mut self, width: u32, height: u32) {
-        *self = Self::new(&self.gpu, width, height);
+        *self = Self::create(&self.gpu, width, height, self.features);
+    }
+
+    /// A render image of the CPU for the sums read back, with features if collected.
+    fn empty_render_image(&self) -> RenderImage {
+        if self.features {
+            RenderImage::with_features(self.width, self.height)
+        } else {
+            RenderImage::new(self.width, self.height)
+        }
+    }
+
+    /// Adds sums read back from this image to a render image.
+    fn add_to(&self, render_image: &mut RenderImage, sums: &[[f32; 4]], samples: u32) {
+        if self.features {
+            let features: Vec<[f32; FEATURE_WORDS]> = sums
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|p| {
+                    [
+                        p[1][0], p[1][1], p[1][2], p[2][0], p[2][1], p[2][2], p[1][3], p[0][3],
+                    ]
+                })
+                .collect();
+            render_image.accumulate_features(&features);
+            let colors: Vec<[f32; 3]> = sums
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|p| [p[0][0], p[0][1], p[0][2]])
+                .collect();
+            render_image.accumulate(&colors, samples);
+        } else {
+            let colors: Vec<[f32; 3]> = sums.iter().map(|p| [p[0], p[1], p[2]]).collect();
+            render_image.accumulate(&colors, samples);
+        }
     }
 
     ///
@@ -425,20 +493,20 @@ impl GpuRenderImage {
     ///
     #[cfg(not(target_arch = "wasm32"))]
     pub fn read(&self) -> RenderImage {
-        let mut render_image = RenderImage::new(self.width, self.height);
-        render_image.accumulate(&self.read_sums(), self.samples);
+        let mut render_image = self.empty_render_image();
+        self.add_to(&mut render_image, &self.read_sums(), self.samples);
         render_image
     }
 
     /// Copies the samples into a [RenderImage] once the GPU is done, also in a browser.
     pub async fn read_async(&self) -> RenderImage {
         let sums = self.start_read().await;
-        let mut render_image = RenderImage::new(self.width, self.height);
-        render_image.accumulate(&sums, self.samples);
+        let mut render_image = self.empty_render_image();
+        self.add_to(&mut render_image, &sums, self.samples);
         render_image
     }
 
-    fn read_sums(&self) -> Vec<[f32; 3]> {
+    fn read_sums(&self) -> Vec<[f32; 4]> {
         let pending = self.start_read();
         #[cfg(not(target_arch = "wasm32"))]
         let _ = self.gpu.device.poll(w::PollType::wait_indefinitely());
@@ -475,7 +543,7 @@ impl GpuRenderImage {
         PendingSums {
             device: self.gpu.device.clone(),
             buffer: staging,
-            pixels: (self.width * self.height) as usize,
+            words: (self.width * self.height) as usize * if self.features { 3 } else { 1 },
             state,
         }
     }
@@ -503,7 +571,7 @@ impl GpuRenderImage {
             self.width,
             self.height,
             pitch,
-            0,
+            if self.features { 3 } else { 1 },
             (1.0 / self.samples.max(1) as f32).to_bits(),
             0,
             0,
@@ -548,29 +616,45 @@ impl GpuRenderImage {
                 1,
             );
         }
-        // Rows of wgpu textures start at the top like the render image, which three-d shows upright
-        encoder.copy_buffer_to_texture(
-            w::TexelCopyBufferInfo {
-                buffer: &resolve.averages,
-                layout: w::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(pitch * 16),
-                    rows_per_image: Some(self.height),
-                },
-            },
-            w::TexelCopyTextureInfo {
-                texture: &target,
-                mip_level: 0,
-                origin: w::Origin3d::ZERO,
-                aspect: w::TextureAspect::All,
-            },
-            w::Extent3d {
-                width: self.width,
-                height: self.height,
-                depth_or_array_layers: 1,
-            },
+        copy_rows_to_texture(
+            &mut encoder,
+            &resolve.averages,
+            pitch,
+            self.width,
+            self.height,
+            &target,
         );
         self.gpu.queue.submit([encoder.finish()]);
+    }
+
+    ///
+    /// Like [GpuRenderImage::write_to_three_d_texture], but denoised on the GPU by the filter of `denoiser`.
+    ///
+    /// # Panics
+    /// If the image collects no features (see [GpuRenderImage::with_features]), or as
+    /// [GpuRenderImage::write_to_three_d_texture].
+    ///
+    pub fn write_denoised_to_three_d_texture(
+        &mut self,
+        texture: &three_d::Texture2D,
+        denoiser: &crate::AtrousDenoiser,
+    ) {
+        assert!(self.features, "the render image collects no features");
+        assert!(
+            texture.width() == self.width && texture.height() == self.height,
+            "the texture has another size than the render image"
+        );
+        let target = texture
+            .as_wgpu()
+            .expect("the texture is not from the wgpu backend");
+        let denoise = self.denoise.get_or_insert_with(|| {
+            Box::new(denoise_gpu::GpuDenoise::new(
+                &self.gpu.device,
+                self.width,
+                self.height,
+            ))
+        });
+        denoise.run(&self.gpu, &self.sums, self.samples, denoiser, &target);
     }
 
     /// A three-d texture with the average of every pixel, see [GpuRenderImage::write_to_three_d_texture].
@@ -588,6 +672,39 @@ impl GpuRenderImage {
         self.write_to_three_d_texture(&texture);
         texture
     }
+}
+
+/// Copies rows of RGBA floats with `pitch` pixels each into a texture. Rows of wgpu textures start at the top like the
+/// render image, which three-d shows upright.
+fn copy_rows_to_texture(
+    encoder: &mut w::CommandEncoder,
+    buffer: &w::Buffer,
+    pitch: u32,
+    width: u32,
+    height: u32,
+    target: &w::Texture,
+) {
+    encoder.copy_buffer_to_texture(
+        w::TexelCopyBufferInfo {
+            buffer,
+            layout: w::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(pitch * 16),
+                rows_per_image: Some(height),
+            },
+        },
+        w::TexelCopyTextureInfo {
+            texture: target,
+            mip_level: 0,
+            origin: w::Origin3d::ZERO,
+            aspect: w::TextureAspect::All,
+        },
+        w::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
 }
 
 /// The pipeline and buffers that turn the sums into averages in rows a texture copy accepts.
@@ -645,12 +762,13 @@ struct PendingSums {
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     device: w::Device,
     buffer: w::Buffer,
-    pixels: usize,
+    /// Number of vec4 to read.
+    words: usize,
     state: std::sync::Arc<std::sync::Mutex<MapState>>,
 }
 
 impl PendingSums {
-    fn finish(&self) -> Vec<[f32; 3]> {
+    fn finish(&self) -> Vec<[f32; 4]> {
         let ok = self
             .state
             .lock()
@@ -659,7 +777,7 @@ impl PendingSums {
             .unwrap_or(false);
         if !ok {
             // The device was lost: no samples
-            return vec![[0.0; 3]; self.pixels];
+            return vec![[0.0; 4]; self.words];
         }
         let data = self.buffer.slice(..).get_mapped_range();
         let floats: Vec<f32> = data
@@ -674,14 +792,14 @@ impl PendingSums {
             .as_chunks::<4>()
             .0
             .iter()
-            .take(self.pixels)
-            .map(|p| [p[0], p[1], p[2]])
+            .take(self.words)
+            .copied()
             .collect()
     }
 }
 
 impl std::future::Future for PendingSums {
-    type Output = Vec<[f32; 3]>;
+    type Output = Vec<[f32; 4]>;
 
     fn poll(
         self: std::pin::Pin<&mut Self>,
@@ -1093,6 +1211,7 @@ mod tests {
         for (name, source) in [
             ("trace.wgsl", include_str!("compute/trace.wgsl")),
             ("resolve.wgsl", include_str!("compute/resolve.wgsl")),
+            ("denoise.wgsl", include_str!("compute/denoise.wgsl")),
         ] {
             let module = naga::front::wgsl::parse_str(source)
                 .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(source)));

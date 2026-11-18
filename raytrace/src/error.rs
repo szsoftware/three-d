@@ -17,6 +17,8 @@ pub enum RtError {
     Export(String),
     /// The GPU can not do what was asked, the text says why.
     Gpu(String),
+    /// The render image has no features for the denoiser, see `RenderImage::with_features`.
+    NoFeatures,
 }
 
 impl std::fmt::Display for RtError {
@@ -29,6 +31,7 @@ impl std::fmt::Display for RtError {
             RtError::EmptyImage => write!(f, "the render image has no pixels"),
             RtError::Export(why) => write!(f, "export failed: {why}"),
             RtError::Gpu(why) => write!(f, "GPU: {why}"),
+            RtError::NoFeatures => write!(f, "the render image collects no features for denoising"),
         }
     }
 }

@@ -80,6 +80,25 @@ the GPU. `ComputeTracer` also implements `Tracer` and then reads every call back
 can not wait for. Its random numbers differ from the CPU tracer's, so the images agree in their averages, not in their
 noise.
 
+## Denoising
+
+```rust
+let mut image = RenderImage::with_features(width, height); // or GpuRenderImage::with_features
+tracer.trace(&scene, &camera, &mut image, &settings)?;
+let smooth = AtrousDenoiser::default().denoise(&image)?;   // on the CPU, also for GPU images after read()
+// On the GPU, without leaving it:
+// gpu_image.write_denoised_to_three_d_texture(&texture, &AtrousDenoiser::default());
+```
+
+`AtrousDenoiser` is an edge avoiding à-trous wavelet filter like the spatial part of SVGF. With features the render
+image also collects, per pixel, the albedo, normal and distance of what the camera sees first and the squared
+luminance of the samples (32 more bytes per pixel). The filter blurs the light per surface (color divided by albedo)
+in five passes of growing reach, only between pixels with similar normals and distances and only as far as the
+variance says the differences are noise, then multiplies the albedo back so textures stay sharp. With more samples
+the variance falls and the filter steps back by itself. `RaytracePreview` denoises by default
+(`PreviewSettings::denoiser`). In the garden at 8 samples the difference to 512 samples drops from 6.3 to 3.6 (RMSE of
+8 bit sRGB); denoising 960 × 600 takes about 0.7 s on four cores and a few milliseconds on a GPU.
+
 ## Material model
 
 `RtMaterial` is the metallic roughness model of `CpuMaterial` (GGX with height correlated Smith masking, Schlick's

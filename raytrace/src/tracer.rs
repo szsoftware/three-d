@@ -3,6 +3,7 @@
 //!
 
 use crate::light::*;
+use crate::render_image::FEATURE_WORDS;
 use crate::sampling::*;
 use crate::{
     AccelBuilder, Camera, CpuAccel, CpuBvhBuilder, Hit, RenderImage, RtEnvironment, RtError,
@@ -163,16 +164,24 @@ impl Tracer for CpuReferenceTracer {
             .thread_count()
             .min(render_image.height() as usize)
             .max(1);
-        let rows = render_image.rows_mut();
+        let (rows, features) = render_image.rows_and_features_mut();
+        let mut row_slices: Vec<RowSlice> = match features {
+            Some(f) => rows
+                .chunks_mut(width)
+                .zip(f.chunks_mut(width))
+                .map(|(r, f)| (r, Some(f)))
+                .collect(),
+            None => rows.chunks_mut(width).map(|r| (r, None)).collect(),
+        };
         if threads == 1 {
-            for (y, row) in rows.chunks_mut(width).enumerate() {
-                context.render_row(y as u32, row);
+            for (y, (row, features)) in row_slices.iter_mut().enumerate() {
+                context.render_row(y as u32, row, features.as_deref_mut());
             }
         } else {
             // Rows are handed out one at a time, so threads stay busy where the scene is uneven
             let next = std::sync::atomic::AtomicUsize::new(0);
-            let row_slices: Vec<std::sync::Mutex<&mut [[f32; 3]]>> =
-                rows.chunks_mut(width).map(std::sync::Mutex::new).collect();
+            let row_slices: Vec<std::sync::Mutex<_>> =
+                row_slices.into_iter().map(std::sync::Mutex::new).collect();
             std::thread::scope(|s| {
                 for _ in 0..threads {
                     s.spawn(|| loop {
@@ -180,8 +189,9 @@ impl Tracer for CpuReferenceTracer {
                         if y >= row_slices.len() {
                             break;
                         }
-                        let mut row = row_slices[y].lock().unwrap();
-                        context.render_row(y as u32, &mut row);
+                        let mut guard = row_slices[y].lock().unwrap();
+                        let (row, features) = &mut *guard;
+                        context.render_row(y as u32, row, features.as_deref_mut());
                     });
                 }
             });
@@ -231,6 +241,47 @@ impl CameraRays {
     }
 }
 
+/// The sums of one row and, if collected, its feature sums.
+type RowSlice<'a> = (&'a mut [[f32; 3]], Option<&'a mut [[f32; FEATURE_WORDS]]>);
+
+/// What a camera ray hits first, for the features of a denoiser.
+struct FirstHit {
+    albedo: Vec3,
+    normal: Vec3,
+    distance: f32,
+}
+
+/// The distance given to the sky in the features.
+pub(crate) const SKY_DISTANCE: f32 = 1e9;
+
+impl FirstHit {
+    fn sky(direction: Vec3) -> Self {
+        Self {
+            albedo: vec3(1.0, 1.0, 1.0),
+            normal: -direction,
+            distance: SKY_DISTANCE,
+        }
+    }
+
+    fn at(surface: &Surface, distance: f32) -> Self {
+        let m = &surface.material;
+        Self {
+            albedo: feature_albedo(m),
+            normal: surface.shading_normal,
+            distance,
+        }
+    }
+}
+
+/// The albedo a denoiser divides by: one where the surface shows what lies behind or in front of it.
+pub(crate) fn feature_albedo(m: &RtMaterial) -> Vec3 {
+    if m.transmission > 0.0 || (m.metallic > 0.5 && m.roughness < 0.2) {
+        vec3(1.0, 1.0, 1.0)
+    } else {
+        m.base_color
+    }
+}
+
 /// Everything one call of trace shares between threads.
 struct PathContext<'a> {
     scene: &'a RtScene,
@@ -256,7 +307,12 @@ struct Surface {
 }
 
 impl PathContext<'_> {
-    fn render_row(&self, y: u32, row: &mut [[f32; 3]]) {
+    fn render_row(
+        &self,
+        y: u32,
+        row: &mut [[f32; 3]],
+        mut features: Option<&mut [[f32; FEATURE_WORDS]]>,
+    ) {
         for (x, sum) in row.iter_mut().enumerate() {
             for s in 0..self.settings.samples_per_call {
                 let sample = self.first_sample + s;
@@ -264,19 +320,39 @@ impl PathContext<'_> {
                 let u = (x as f32 + rng.next_f32()) / self.width as f32;
                 let v = 1.0 - (y as f32 + rng.next_f32()) / self.height as f32;
                 let (origin, direction) = self.rays.ray(u, v);
-                let l = self.radiance(origin, direction, &mut rng);
+                let mut first = FirstHit::sky(direction);
+                let mut l = self.radiance(origin, direction, &mut rng, &mut first);
                 // A broken sample must not spoil the pixel for good
-                if l.x.is_finite() && l.y.is_finite() && l.z.is_finite() {
-                    sum[0] += l.x;
-                    sum[1] += l.y;
-                    sum[2] += l.z;
+                if !(l.x.is_finite() && l.y.is_finite() && l.z.is_finite()) {
+                    l = vec3(0.0, 0.0, 0.0);
+                }
+                sum[0] += l.x;
+                sum[1] += l.y;
+                sum[2] += l.z;
+                if let Some(features) = features.as_deref_mut() {
+                    let f = &mut features[x];
+                    f[0] += first.albedo.x;
+                    f[1] += first.albedo.y;
+                    f[2] += first.albedo.z;
+                    f[3] += first.normal.x;
+                    f[4] += first.normal.y;
+                    f[5] += first.normal.z;
+                    f[6] += first.distance;
+                    let lum = luminance(l);
+                    f[7] += lum * lum;
                 }
             }
         }
     }
 
     /// Luminance arriving along the ray, by following one path.
-    fn radiance(&self, mut origin: Vec3, mut direction: Vec3, rng: &mut Rng) -> Vec3 {
+    fn radiance(
+        &self,
+        mut origin: Vec3,
+        mut direction: Vec3,
+        rng: &mut Rng,
+        first: &mut FirstHit,
+    ) -> Vec3 {
         let mut result = vec3(0.0, 0.0, 0.0);
         let mut throughput = vec3(1.0, 1.0, 1.0);
         // Lights that can not be hit by chance (the sun disc) are seen directly only after camera rays and mirrors
@@ -314,6 +390,9 @@ impl PathContext<'_> {
             };
             let surface = self.surface(&hit, direction);
             let m = &surface.material;
+            if bounce == 0 {
+                *first = FirstHit::at(&surface, hit.t);
+            }
             result += self.add(bounce, mul(throughput, m.emission));
             if bounce >= self.settings.max_bounces {
                 break;
