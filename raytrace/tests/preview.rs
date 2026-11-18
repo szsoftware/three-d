@@ -231,8 +231,11 @@ fn the_cpu_traces_in_the_background() {
     assert!(preview.settings().cpu_in_background);
     let wait_for = |preview: &mut RaytracePreview, at: Vec3, samples: u32| {
         let start = std::time::Instant::now();
-        while preview.sample_count() < samples {
+        loop {
             preview.update(&scene, &camera(16, 8, at)).unwrap();
+            if preview.sample_count() >= samples {
+                break;
+            }
             assert!(start.elapsed().as_secs() < 30, "no samples from the worker");
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -244,15 +247,15 @@ fn the_cpu_traces_in_the_background() {
         .unwrap();
     assert_eq!(preview.sample_count(), 0);
     wait_for(&mut preview, vec3(1.0, 0.0, 0.0), 2);
-    // The worker stops at the most samples
+    // The worker stops at the most samples (set before a new start, a fast worker may be past them already)
     preview.set_settings(PreviewSettings {
         max_samples: 4,
         ..*preview.settings()
     });
-    wait_for(&mut preview, vec3(1.0, 0.0, 0.0), 4);
+    wait_for(&mut preview, vec3(2.0, 0.0, 0.0), 4);
     std::thread::sleep(std::time::Duration::from_millis(50));
     preview
-        .update(&scene, &camera(16, 8, vec3(1.0, 0.0, 0.0)))
+        .update(&scene, &camera(16, 8, vec3(2.0, 0.0, 0.0)))
         .unwrap();
     assert_eq!(preview.sample_count(), 4);
     assert!(preview.is_done());
