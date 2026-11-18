@@ -112,11 +112,21 @@ fn from_byte_slice<T: DataType>(data: &[u8]) -> &[T] {
 }
 
 fn flip_y<T: TextureDataType>(pixels: &mut [T], width: usize, height: usize) {
-    for row in 0..height / 2 {
-        for col in 0..width {
-            let index0 = width * row + col;
-            let index1 = width * (height - row - 1) + col;
-            pixels.swap(index0, index1);
+    let (top, bottom) = pixels[..width * height].split_at_mut(width * (height / 2));
+    // With an odd height, the row in the middle stays
+    let bottom = &mut bottom[width * (height % 2)..];
+    if width > 0 {
+        for (upper, lower) in top
+            .chunks_exact_mut(width)
+            .zip(bottom.chunks_exact_mut(width).rev())
+        {
+            upper.swap_with_slice(lower);
         }
+    }
+}
+
+fn to_byte_slice_mut<T: DataType>(data: &mut [T]) -> &mut [u8] {
+    unsafe {
+        std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut _, std::mem::size_of_val(data))
     }
 }

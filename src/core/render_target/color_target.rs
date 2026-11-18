@@ -147,6 +147,25 @@ impl<'a> ColorTarget<'a> {
     }
 
     ///
+    /// Writes the colors of the pixels in this color target into the given slice without allocating memory, see [RenderTarget::read_color_into].
+    ///
+    pub fn read_into<T: TextureDataType>(&self, pixels: &mut [T]) {
+        self.read_partially_into(self.scissor_box(), pixels)
+    }
+
+    ///
+    /// Writes the colors of the pixels in this color target inside the given scissor box into the given slice, see [RenderTarget::read_color_into].
+    ///
+    pub fn read_partially_into<T: TextureDataType>(
+        &self,
+        scissor_box: ScissorBox,
+        pixels: &mut [T],
+    ) {
+        self.as_render_target()
+            .read_color_partially_into(scissor_box, pixels)
+    }
+
+    ///
     /// Returns the colors of the pixels in this color target like [ColorTarget::read], but as a future.
     /// This is the only way to read pixels with the wgpu backend in a browser, see [RenderTarget::read_color_async].
     ///
@@ -166,6 +185,30 @@ impl<'a> ColorTarget<'a> {
     ) -> impl std::future::Future<Output = Vec<T>> + 'static {
         self.as_render_target()
             .read_color_partially_async(scissor_box)
+    }
+
+    ///
+    /// Reads the colors of the pixels in this color target into the given vector and hands it back when the pixels are in it,
+    /// see [RenderTarget::read_color_into_async].
+    ///
+    pub fn read_into_async<T: TextureDataType + 'static>(
+        &self,
+        pixels: Vec<T>,
+    ) -> impl std::future::Future<Output = Vec<T>> + 'static {
+        self.read_partially_into_async(self.scissor_box(), pixels)
+    }
+
+    ///
+    /// Reads the colors of the pixels in this color target inside the given scissor box into the given vector
+    /// and hands it back when the pixels are in it, see [RenderTarget::read_color_into_async].
+    ///
+    pub fn read_partially_into_async<T: TextureDataType + 'static>(
+        &self,
+        scissor_box: ScissorBox,
+        pixels: Vec<T>,
+    ) -> impl std::future::Future<Output = Vec<T>> + 'static {
+        self.as_render_target()
+            .read_color_partially_into_async(scissor_box, pixels)
     }
 
     ///

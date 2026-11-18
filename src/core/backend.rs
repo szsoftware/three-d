@@ -397,6 +397,28 @@ pub(crate) struct CopyMask {
 /// The pixels that are read by [BackendApi::read_pixels_async].
 pub(crate) type PixelsFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>>>>;
 
+///
+/// Memory of the caller that pixels are read into by [BackendApi::read_pixels_async_into], for example a vector of texels.
+/// The backend only sees the bytes and hands the memory back when they are written.
+///
+pub(crate) trait PixelStorage: 'static {
+    fn bytes(&mut self) -> &mut [u8];
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any>;
+}
+
+impl<T: DataType + 'static> PixelStorage for Vec<T> {
+    fn bytes(&mut self) -> &mut [u8] {
+        crate::core::to_byte_slice_mut(self)
+    }
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
+}
+
+/// The memory with the pixels that are read by [BackendApi::read_pixels_async_into].
+pub(crate) type StorageFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Box<dyn PixelStorage>>>>;
+
 /// The format of the data returned by [BackendApi::read_pixels].
 ///
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -510,6 +532,16 @@ pub(crate) trait BackendApi {
     fn copy_target(&self, source: &PassTarget, destination: &PassTarget, mask: CopyMask);
     /// Reads pixels inside the rectangle, bottom row first.
     fn read_pixels(&self, source: &PassTarget, rect: ScissorBox, format: ReadFormat) -> Vec<u8>;
+    /// The same as [BackendApi::read_pixels], but the pixels are written to the given bytes, which must have the right length.
+    fn read_pixels_into(
+        &self,
+        source: &PassTarget,
+        rect: ScissorBox,
+        format: ReadFormat,
+        bytes: &mut [u8],
+    ) {
+        bytes.copy_from_slice(&self.read_pixels(source, rect, format));
+    }
     /// The same as [BackendApi::read_pixels] for backends that cannot wait for the pixels on every platform.
     /// What is read is the content of the source at the time of the call, not at the time the future is awaited.
     fn read_pixels_async(
@@ -519,6 +551,17 @@ pub(crate) trait BackendApi {
         format: ReadFormat,
     ) -> PixelsFuture {
         Box::pin(std::future::ready(self.read_pixels(source, rect, format)))
+    }
+    /// The same as [BackendApi::read_pixels_async], but the pixels are written to the given memory, which must have the right size.
+    fn read_pixels_async_into(
+        &self,
+        source: &PassTarget,
+        rect: ScissorBox,
+        format: ReadFormat,
+        mut storage: Box<dyn PixelStorage>,
+    ) -> StorageFuture {
+        self.read_pixels_into(source, rect, format, storage.bytes());
+        Box::pin(std::future::ready(storage))
     }
 
     // PROGRAMS

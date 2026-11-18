@@ -664,7 +664,7 @@ pub fn ray_intersect_async(
 /// like [pick], but returns the result as a future.
 ///
 /// This is the only way to pick with the wgpu backend in a browser (WebGPU), which cannot wait for the GPU.
-/// It works with every backend and on every platform. Where the result can be waited for, the future is ready at once.
+/// It works with every backend and on every platform. On native targets the future does not block, see [RenderTarget::read_color_async].
 /// The geometries are rendered when this function is called, so the future does not borrow them
 /// and can be handed to something like `wasm_bindgen_futures::spawn_local`.
 ///

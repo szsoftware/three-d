@@ -612,6 +612,120 @@ impl GlBackend {
     }
 }
 
+/// The number of bytes of the pixels in the rectangle.
+fn read_size(rect: ScissorBox, format: ReadFormat) -> usize {
+    let pixel_size = match format {
+        ReadFormat::Color(format) => format.channels as usize * primitive_size(format.primitive),
+        ReadFormat::Depth => 4,
+    };
+    rect.width as usize * rect.height as usize * pixel_size
+}
+
+///
+/// Pixels that are on their way from the graphics card into memory, see [GlBackend::read_pixels_async].
+/// Must be polled and dropped on the thread where the context is current.
+///
+#[cfg(not(target_arch = "wasm32"))]
+struct PendingRead {
+    context: Arc<crate::context::Context>,
+    /// `None` when the pixels have been handed out.
+    resources: Option<(crate::context::Buffer, crate::context::Fence)>,
+    /// Where the pixels go.
+    storage: Option<Box<dyn PixelStorage>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::future::Future for PendingRead {
+    type Output = Box<dyn PixelStorage>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        task: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let (buffer, fence) = self
+            .resources
+            .expect("the pixels have already been handed out");
+        let context = self.context.clone();
+        unsafe {
+            let status = context.client_wait_sync(fence, 0, 0);
+            if status == crate::context::TIMEOUT_EXPIRED {
+                // Nothing announces the fence, so the future asks to be polled again.
+                // The thread makes room first, for when it is all the executor does (as in a blocking wait).
+                std::thread::yield_now();
+                task.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            // Also if waiting failed: reading the buffer then waits for the card itself
+            let mut storage = self
+                .storage
+                .take()
+                .expect("the pixels have already been handed out");
+            let bytes = storage.bytes();
+            context.bind_buffer(crate::context::PIXEL_PACK_BUFFER, Some(buffer));
+            let mapped = context.map_buffer_range(
+                crate::context::PIXEL_PACK_BUFFER,
+                0,
+                bytes.len() as i32,
+                crate::context::MAP_READ_BIT,
+            );
+            if !mapped.is_null() {
+                std::ptr::copy_nonoverlapping(mapped, bytes.as_mut_ptr(), bytes.len());
+            }
+            context.unmap_buffer(crate::context::PIXEL_PACK_BUFFER);
+            context.bind_buffer(crate::context::PIXEL_PACK_BUFFER, None);
+            self.resources = None;
+            context.delete_buffer(buffer);
+            context.delete_sync(fence);
+            std::task::Poll::Ready(storage)
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for PendingRead {
+    fn drop(&mut self) {
+        if let Some((buffer, fence)) = self.resources.take() {
+            unsafe {
+                self.context.delete_buffer(buffer);
+                self.context.delete_sync(fence);
+            }
+        }
+    }
+}
+
+impl GlBackend {
+    /// Reads the pixels in the rectangle to memory or to the buffer that is bound for it.
+    fn read_pixels_to(
+        &self,
+        source: &PassTarget,
+        rect: ScissorBox,
+        format: ReadFormat,
+        destination: crate::context::PixelPackData,
+    ) {
+        self.bind_target(source, crate::context::DRAW_FRAMEBUFFER);
+        self.bind_target(source, crate::context::READ_FRAMEBUFFER);
+        self.resolve_offscreen_screen(source);
+        let (gl_format, gl_data_type) = match format {
+            ReadFormat::Color(format) => (
+                format_from_channels(format.channels),
+                data_type(format.primitive),
+            ),
+            ReadFormat::Depth => (crate::context::DEPTH_COMPONENT, crate::context::FLOAT),
+        };
+        unsafe {
+            self.context.read_pixels(
+                rect.x,
+                rect.y,
+                rect.width as i32,
+                rect.height as i32,
+                gl_format,
+                gl_data_type,
+                destination,
+            );
+        }
+    }
+}
+
 impl BackendApi for GlBackend {
     fn set_viewport(&self, viewport: Viewport) {
         unsafe {
@@ -1064,30 +1178,92 @@ impl BackendApi for GlBackend {
     }
 
     fn read_pixels(&self, source: &PassTarget, rect: ScissorBox, format: ReadFormat) -> Vec<u8> {
-        self.bind_target(source, crate::context::DRAW_FRAMEBUFFER);
-        self.bind_target(source, crate::context::READ_FRAMEBUFFER);
-        self.resolve_offscreen_screen(source);
-        let (gl_format, gl_data_type, pixel_size) = match format {
-            ReadFormat::Color(format) => (
-                format_from_channels(format.channels),
-                data_type(format.primitive),
-                format.channels as usize * primitive_size(format.primitive),
-            ),
-            ReadFormat::Depth => (crate::context::DEPTH_COMPONENT, crate::context::FLOAT, 4),
-        };
-        let mut bytes = vec![0u8; rect.width as usize * rect.height as usize * pixel_size];
-        unsafe {
-            self.context.read_pixels(
-                rect.x,
-                rect.y,
-                rect.width as i32,
-                rect.height as i32,
-                gl_format,
-                gl_data_type,
-                crate::context::PixelPackData::Slice(Some(&mut bytes)),
-            );
-        }
+        let mut bytes = vec![0u8; read_size(rect, format)];
+        self.read_pixels_into(source, rect, format, &mut bytes);
         bytes
+    }
+
+    fn read_pixels_into(
+        &self,
+        source: &PassTarget,
+        rect: ScissorBox,
+        format: ReadFormat,
+        bytes: &mut [u8],
+    ) {
+        assert_eq!(bytes.len(), read_size(rect, format));
+        self.read_pixels_to(
+            source,
+            rect,
+            format,
+            crate::context::PixelPackData::Slice(Some(bytes)),
+        );
+    }
+
+    // In a browser the default stays, which reads at once: a future that asks to be polled again would keep the browser
+    // from ever finishing the frame it waits for
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_pixels_async(
+        &self,
+        source: &PassTarget,
+        rect: ScissorBox,
+        format: ReadFormat,
+    ) -> PixelsFuture {
+        let pixels = self.read_pixels_async_into(
+            source,
+            rect,
+            format,
+            Box::new(vec![0u8; read_size(rect, format)]),
+        );
+        Box::pin(async move {
+            *pixels
+                .await
+                .into_any()
+                .downcast::<Vec<u8>>()
+                .expect("the memory that was handed in")
+        })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_pixels_async_into(
+        &self,
+        source: &PassTarget,
+        rect: ScissorBox,
+        format: ReadFormat,
+        mut storage: Box<dyn PixelStorage>,
+    ) -> StorageFuture {
+        // The pixels are copied into a buffer of the graphics card, which does not wait for the card to finish drawing.
+        // The fence tells when the card is done, then the buffer is read without waiting.
+        let size = read_size(rect, format);
+        unsafe {
+            let context = &self.context;
+            let buffer = context
+                .create_buffer()
+                .expect("Failed creating a buffer for reading pixels");
+            context.bind_buffer(crate::context::PIXEL_PACK_BUFFER, Some(buffer));
+            context.buffer_data_size(
+                crate::context::PIXEL_PACK_BUFFER,
+                size as i32,
+                crate::context::STREAM_READ,
+            );
+            self.read_pixels_to(
+                source,
+                rect,
+                format,
+                crate::context::PixelPackData::BufferOffset(0),
+            );
+            context.bind_buffer(crate::context::PIXEL_PACK_BUFFER, None);
+            let fence = context
+                .fence_sync(crate::context::SYNC_GPU_COMMANDS_COMPLETE, 0)
+                .expect("Failed creating a fence for reading pixels");
+            // Otherwise the card may not start before the future is polled
+            context.flush();
+            assert_eq!(storage.bytes().len(), size);
+            Box::pin(PendingRead {
+                context: self.context.clone(),
+                resources: Some((buffer, fence)),
+                storage: Some(storage),
+            })
+        }
     }
 
     fn create_program(
