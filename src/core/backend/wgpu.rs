@@ -22,7 +22,14 @@ use ::wgpu as w;
 use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex};
 
+mod bits;
 mod builtin;
+// wgpu draws with OpenGL on these systems only
+#[cfg(all(
+    feature = "wgpu-gl",
+    any(target_os = "linux", target_os = "windows", target_os = "android")
+))]
+mod raw_gl;
 mod screen;
 #[cfg_attr(not(feature = "window"), allow(unused_imports))]
 pub(crate) use screen::{AdapterPreference, ScreenDesc};
@@ -59,8 +66,12 @@ pub(crate) struct WgpuBackend {
     errors: Option<Arc<Mutex<Vec<String>>>>,
     /// Offsets into the ring buffer must be a multiple of this.
     uniform_alignment: usize,
-    float32_filterable: bool,
+    pub(super) float32_filterable: bool,
     max_vertex_buffers: usize,
+    /// The device draws with OpenGL, where wgpu needs help with cube maps, texture arrays and multisampling. See the `flat` function.
+    gl: bool,
+    /// Whether the device can render into textures of 32 bit floats. If not, see [TextureEntry::bits].
+    pub(super) float32_renderable: bool,
 }
 
 // The backend only holds handles and plain data behind a mutex, a panic cannot leave it in a state that is unsafe to observe.
@@ -223,6 +234,12 @@ struct TextureEntry {
     nearest_sampler: w::Sampler,
     /// The views used for sampling the texture.
     views: HashMap<w::TextureViewDimension, w::TextureView>,
+    /// For a texture of 32 bit floats on a device that cannot render into it: a texture of integers that is the target instead. See [bits].
+    bits: Option<w::Texture>,
+    /// The mip levels and layers that were rendered into the bits and not copied into the texture yet.
+    stale: Vec<(u32, u32)>,
+    /// Whether the texture has content that its bits must get when they are created.
+    has_content: bool,
 }
 
 /// Where a uniform lives inside one of the two uniform blocks of a program.
@@ -268,6 +285,10 @@ struct ProgramEntry {
     user_blocks: Vec<(String, Option<u32>)>,
     user_block_layout: w::BindGroupLayout,
     number_of_outputs: usize,
+    /// The module with the fragment shader, kept if the device cannot render into textures of 32 bit floats.
+    /// From it come the fragment shaders that write bits to the color targets in the mask, see [bits].
+    fragment_source: Option<naga::Module>,
+    bits_fragments: HashMap<u32, w::ShaderModule>,
 }
 
 /// What a compute program has in addition to the uniforms, textures and uniform blocks of every program.
@@ -324,17 +345,32 @@ pub(crate) fn one_gpu_test_at_a_time() {
     });
 }
 
+/// Whether the device draws with OpenGL.
+fn gl_device(device: &w::Device) -> bool {
+    device.adapter_info().backend == w::Backend::Gl
+}
+
 fn unsupported(what: &str) -> ! {
     panic!("{what} is not supported by the wgpu backend yet")
 }
 
 impl WgpuBackend {
     pub fn new(device: w::Device, queue: w::Queue) -> Self {
+        #[cfg(all(
+            feature = "wgpu-gl",
+            any(target_os = "linux", target_os = "windows", target_os = "android")
+        ))]
+        if gl_device(&device) {
+            raw_gl::seamless_cube_maps(&device);
+        }
         let ring = Ring::new(&device, RING_CAPACITY, 0);
         Self {
             uniform_alignment: device.limits().min_uniform_buffer_offset_alignment as usize,
             float32_filterable: device.features().contains(w::Features::FLOAT32_FILTERABLE),
             max_vertex_buffers: device.limits().max_vertex_buffers as usize,
+            gl: gl_device(&device),
+            // Who has the adapter knows better, see [WgpuBackend::request]
+            float32_renderable: !gl_device(&device),
             state: Mutex::new(State {
                 next_id: 0,
                 buffers: HashMap::new(),
@@ -372,7 +408,9 @@ impl WgpuBackend {
     pub fn new_headless_with(preference: AdapterPreference) -> Result<Self, CoreError> {
         #[cfg(test)]
         one_gpu_test_at_a_time();
-        let instance = w::Instance::new(w::InstanceDescriptor::new_without_display_handle());
+        // From the environment: `WGPU_BACKEND` chooses the graphics API
+        let instance =
+            w::Instance::new(w::InstanceDescriptor::new_without_display_handle_from_env());
         let (backend, _) = pollster::block_on(Self::request(&instance, preference, None))?;
         Ok(backend)
     }
@@ -484,10 +522,14 @@ impl WgpuBackend {
 
     /// The color attachments of a target.
     fn color_slices(&self, state: &State, target: &PassTarget) -> Vec<Slice> {
-        let slice = |texture: &TextureId, mip_level: u32, layer: u32| Slice {
-            texture: state.textures[&texture.wgpu()].texture.clone(),
-            mip_level,
-            layer,
+        let slice = |texture: &TextureId, mip_level: u32, layer: u32| {
+            let entry = &state.textures[&texture.wgpu()];
+            Slice {
+                // See [WgpuBackend::prepare_bits]
+                texture: entry.bits.as_ref().unwrap_or(&entry.texture).clone(),
+                mip_level,
+                layer,
+            }
         };
         if target.framebuffer.is_none() {
             return vec![Slice {
@@ -574,6 +616,7 @@ impl WgpuBackend {
                 && open.target.height == target.height
         };
         if clear.is_some() || !state.frame.pass.as_ref().is_some_and(same_target) {
+            self.prepare_bits(state, target, true);
             let colors = self.color_slices(state, target);
             let depth = self.depth_slice(state, target);
             let formats = TargetFormats {
@@ -585,19 +628,29 @@ impl WgpuBackend {
                     .map(|s| s.texture.sample_count())
                     .unwrap_or(1),
             };
-            let color_load = match clear {
+            let color_load = |format: w::TextureFormat| match clear {
                 Some(ClearState {
                     red: Some(r),
                     green: Some(g),
                     blue: Some(b),
                     alpha: Some(a),
                     ..
-                }) => w::LoadOp::Clear(w::Color {
-                    r: r as f64,
-                    g: g as f64,
-                    b: b as f64,
-                    a: a as f64,
-                }),
+                }) => {
+                    // A target of integers gets the bit patterns of the floats, see [bits]
+                    let value = |v: f32| {
+                        if bits::is_bits(format) {
+                            v.to_bits() as f64
+                        } else {
+                            v as f64
+                        }
+                    };
+                    w::LoadOp::Clear(w::Color {
+                        r: value(r),
+                        g: value(g),
+                        b: value(b),
+                        a: value(a),
+                    })
+                }
                 _ => w::LoadOp::Load,
             };
             let depth_load = match clear.and_then(|c| c.depth) {
@@ -608,13 +661,14 @@ impl WgpuBackend {
             let depth_view = depth.as_ref().map(Slice::view);
             let color_attachments: Vec<_> = color_views
                 .iter()
-                .map(|view| {
+                .zip(&formats.colors)
+                .map(|(view, format)| {
                     Some(w::RenderPassColorAttachment {
                         view,
                         depth_slice: None,
                         resolve_target: None,
                         ops: w::Operations {
-                            load: color_load,
+                            load: color_load(*format),
                             store: w::StoreOp::Store,
                         },
                     })
@@ -791,6 +845,146 @@ impl WgpuBackend {
         texel_size: usize,
     ) -> Vec<u8> {
         self.start_read(state, source, rect, texel_size).wait()
+    }
+
+    /// The usage of a texture that makes it a render target, if the device can render into its format.
+    fn render_usage(&self, format: w::TextureFormat) -> w::TextureUsages {
+        use w::TextureFormat as F;
+        if !self.float32_renderable && matches!(format, F::R32Float | F::Rg32Float | F::Rgba32Float)
+        {
+            w::TextureUsages::empty()
+        } else {
+            w::TextureUsages::RENDER_ATTACHMENT
+        }
+    }
+
+    ///
+    /// The usage of a multisample texture. On OpenGL, wgpu can only create one that is rendered into and resolved,
+    /// see [WgpuBackend::resolved_depth] for its depth.
+    ///
+    pub(super) fn multisample_usage(&self) -> w::TextureUsages {
+        if self.gl {
+            w::TextureUsages::RENDER_ATTACHMENT
+        } else {
+            w::TextureUsages::TEXTURE_BINDING
+                | w::TextureUsages::COPY_SRC
+                | w::TextureUsages::RENDER_ATTACHMENT
+        }
+    }
+
+    ///
+    /// The depth of a multisample texture on OpenGL as a texture with one sample, where the depth of a pixel is the depth of one of its samples.
+    /// wgpu cannot do that there, so OpenGL is used directly. Without the `wgpu-gl` feature (with a device of the application
+    /// that draws with OpenGL), the result is the largest depth everywhere.
+    ///
+    fn resolved_depth(&self, state: &mut State, from: &Slice) -> Slice {
+        let size = from.texture.size();
+        let resolved = Slice {
+            texture: self.device.create_texture(&w::TextureDescriptor {
+                label: None,
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: w::TextureDimension::D2,
+                format: from.texture.format(),
+                usage: w::TextureUsages::RENDER_ATTACHMENT | w::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            }),
+            mip_level: 0,
+            layer: 0,
+        };
+        // wgpu clears a texture before its first use, which must not happen after the depth is copied behind its back
+        let view = resolved.view();
+        self.encoder(state)
+            .begin_render_pass(&w::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[],
+                depth_stencil_attachment: Some(w::RenderPassDepthStencilAttachment {
+                    view: &view,
+                    depth_ops: Some(w::Operations {
+                        load: w::LoadOp::Clear(1.0),
+                        store: w::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        self.flush(state);
+        #[cfg(all(
+            feature = "wgpu-gl",
+            any(target_os = "linux", target_os = "windows", target_os = "android")
+        ))]
+        raw_gl::resolve_depth(&self.device, &from.texture, &resolved.texture);
+        resolved
+    }
+
+    ///
+    /// A slice that the builtin passes can sample as a 2D texture and that can be copied into a buffer or another texture.
+    /// That is the slice itself, except on OpenGL: there wgpu cannot copy from a cube map or a depth texture
+    /// and cannot bind one layer of a cube map or of an array as a 2D texture. So the slice is drawn into a 2D texture first.
+    ///
+    fn flat(&self, state: &mut State, slice: Slice) -> Slice {
+        let texture = &slice.texture;
+        let depth = texture.format().is_depth_stencil_format();
+        let layers = texture.depth_or_array_layers();
+        if !self.gl || texture.dimension() != w::TextureDimension::D2 || layers == 1 {
+            return slice;
+        }
+        let size = texture.size();
+        let cube = size.width == size.height && layers == 6;
+        // Layers of an array with colors can be copied, everything else is drawn
+        let copy = !cube && !depth;
+        let flat = Slice {
+            texture: self.device.create_texture(&w::TextureDescriptor {
+                label: None,
+                size: w::Extent3d {
+                    width: (size.width >> slice.mip_level).max(1),
+                    height: (size.height >> slice.mip_level).max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: w::TextureDimension::D2,
+                format: texture.format(),
+                usage: w::TextureUsages::COPY_SRC
+                    | w::TextureUsages::TEXTURE_BINDING
+                    | if copy {
+                        w::TextureUsages::COPY_DST
+                    } else {
+                        w::TextureUsages::RENDER_ATTACHMENT
+                    },
+                view_formats: &[],
+            }),
+            mip_level: 0,
+            layer: 0,
+        };
+        if copy {
+            self.copy_slice(state, &slice, &flat);
+            return flat;
+        }
+        let source = texture.create_view(&w::TextureViewDescriptor {
+            dimension: Some(if cube {
+                w::TextureViewDimension::Cube
+            } else {
+                w::TextureViewDimension::D2Array
+            }),
+            ..Default::default()
+        });
+        self.builtin_pass(
+            state,
+            builtin::Kind::Flatten {
+                cube,
+                depth,
+                bits: false,
+            },
+            &source,
+            &flat.view(),
+            texture.format(),
+            Some(slice.layer | (slice.mip_level << 8)),
+        );
+        flat
     }
 
     /// A texture with one sample that the builtin passes can render into and that can be read back.
@@ -994,9 +1188,10 @@ fn texel_layout(format: w::TextureFormat) -> (PrimitiveType, usize) {
         F::R16Float => (PrimitiveType::F16, 1),
         F::Rg16Float => (PrimitiveType::F16, 2),
         F::Rgba16Float => (PrimitiveType::F16, 4),
-        F::R32Float => (PrimitiveType::F32, 1),
-        F::Rg32Float => (PrimitiveType::F32, 2),
-        F::Rgba32Float => (PrimitiveType::F32, 4),
+        // The integer formats hold the bits of floats, see [bits]
+        F::R32Float | F::R32Uint => (PrimitiveType::F32, 1),
+        F::Rg32Float | F::Rg32Uint => (PrimitiveType::F32, 2),
+        F::Rgba32Float | F::Rgba32Uint => (PrimitiveType::F32, 4),
         _ => unsupported(&format!("reading from the format {format:?}")),
     }
 }
@@ -1447,6 +1642,15 @@ impl BackendApi for WgpuBackend {
         let (format, _) = texture_format(storage.format);
         let (dimension, layers) = match desc.kind {
             TextureKind::D2 => (w::TextureDimension::D2, 1),
+            // On OpenGL, wgpu makes a cube map out of every square texture with 6 layers and a plain 2D texture out of one layer.
+            // Neither can be sampled as an array, so such an array gets one layer more than it needs.
+            TextureKind::D2Array
+                if self.gl
+                    && (storage.depth == 1
+                        || (storage.width == storage.height && storage.depth % 6 == 0)) =>
+            {
+                (w::TextureDimension::D2, storage.depth + 1)
+            }
             TextureKind::D2Array => (w::TextureDimension::D2, storage.depth),
             TextureKind::D3 => (w::TextureDimension::D3, storage.depth),
             TextureKind::CubeMap => (w::TextureDimension::D2, 6),
@@ -1465,7 +1669,7 @@ impl BackendApi for WgpuBackend {
             usage: w::TextureUsages::TEXTURE_BINDING
                 | w::TextureUsages::COPY_DST
                 | w::TextureUsages::COPY_SRC
-                | w::TextureUsages::RENDER_ATTACHMENT
+                | self.render_usage(format)
                 | storage_usage(format),
             view_formats: &[],
         });
@@ -1475,6 +1679,9 @@ impl BackendApi for WgpuBackend {
             sampler: self.sampler(&desc.sampler, false),
             nearest_sampler: self.sampler(&desc.sampler, true),
             views: HashMap::new(),
+            bits: None,
+            stale: Vec::new(),
+            has_content: false,
         };
         let mut state = self.lock();
         let id = Self::id(&mut state);
@@ -1505,7 +1712,9 @@ impl BackendApi for WgpuBackend {
         let state = &mut *self.lock();
         // Recorded commands must see the old content
         self.flush(state);
-        let entry = &state.textures[&texture.wgpu()];
+        let entry = state.textures.get_mut(&texture.wgpu()).unwrap();
+        entry.has_content = true;
+        let entry = &*entry;
         let TextureFormat::Color(stored) = entry.format else {
             unsupported("writing to a depth texture")
         };
@@ -1525,36 +1734,71 @@ impl BackendApi for WgpuBackend {
             TextureRegion::Layer(layer) => (layer, 1),
             TextureRegion::Side(side) => (cube_layer(side), 1),
         };
-        // The first row of the data is the bottom row, which is the first row in memory in this backend as well
-        self.queue.write_texture(
-            w::TexelCopyTextureInfo {
-                texture: &entry.texture,
-                mip_level: 0,
-                origin: w::Origin3d {
-                    x: 0,
-                    y: 0,
-                    z: layer,
+        // The first row of the data is the bottom row, which is the first row in memory in this backend as well.
+        // The bits of the texture get the same bytes, see [bits].
+        for texture in [Some(&entry.texture), entry.bits.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            self.queue.write_texture(
+                w::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: w::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: layer,
+                    },
+                    aspect: w::TextureAspect::All,
                 },
-                aspect: w::TextureAspect::All,
-            },
-            &bytes,
-            w::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(width * texel_size as u32),
-                rows_per_image: Some(height),
-            },
-            w::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: layers,
-            },
-        );
+                &bytes,
+                w::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(width * texel_size as u32),
+                    rows_per_image: Some(height),
+                },
+                w::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: layers,
+                },
+            );
+        }
     }
 
     fn generate_mipmaps(&self, texture: TextureId, _kind: TextureKind) {
         let state = &mut *self.lock();
-        let texture = state.textures[&texture.wgpu()].texture.clone();
+        let id = texture.wgpu();
+        // A texture that the device cannot render into gets its mipmaps through its bits
+        let bits = self.bits(state, id);
+        let texture = bits
+            .clone()
+            .unwrap_or_else(|| state.textures[&id].texture.clone());
         let format = texture.format();
+        let kind = if bits.is_some() {
+            builtin::Kind::Mip2DBits
+        } else {
+            builtin::Kind::Mip2D
+        };
+        if bits.is_some() {
+            let entry = state.textures.get_mut(&id).unwrap();
+            let layers = entry.texture.depth_or_array_layers();
+            for level in 1..texture.mip_level_count() {
+                for layer in 0..layers {
+                    if !entry.stale.contains(&(level, layer)) {
+                        entry.stale.push((level, layer));
+                    }
+                }
+            }
+        }
+        if !texture
+            .usage()
+            .contains(w::TextureUsages::RENDER_ATTACHMENT)
+        {
+            unsupported(
+                "mipmaps of a 3D texture of 32 bit floats on a device that cannot render into it",
+            );
+        }
         for level in 1..texture.mip_level_count() {
             if texture.dimension() == w::TextureDimension::D3 {
                 let view = |level: u32| {
@@ -1577,10 +1821,18 @@ impl BackendApi for WgpuBackend {
                 }
             } else {
                 for layer in 0..texture.depth_or_array_layers() {
+                    let source = self.flat(
+                        state,
+                        Slice {
+                            texture: texture.clone(),
+                            mip_level: level - 1,
+                            layer,
+                        },
+                    );
                     self.builtin_pass(
                         state,
-                        builtin::Kind::Mip2D,
-                        &attachment_view(&texture, level - 1, layer),
+                        kind,
+                        &source.view(),
                         &attachment_view(&texture, level, layer),
                         format,
                         None,
@@ -1610,9 +1862,7 @@ impl BackendApi for WgpuBackend {
             sample_count: if number_of_samples > 1 { 4 } else { 1 },
             dimension: w::TextureDimension::D2,
             format,
-            usage: w::TextureUsages::TEXTURE_BINDING
-                | w::TextureUsages::COPY_SRC
-                | w::TextureUsages::RENDER_ATTACHMENT,
+            usage: self.multisample_usage(),
             view_formats: &[],
         });
         let mut state = self.lock();
@@ -1675,12 +1925,15 @@ impl BackendApi for WgpuBackend {
     fn copy_target(&self, source: &PassTarget, destination: &PassTarget, mask: CopyMask) {
         let state = &mut *self.lock();
         if mask.color {
+            self.prepare_bits(state, source, false);
+            self.prepare_bits(state, destination, true);
             let from = self.color_slices(state, source).into_iter().next();
             let to = self.color_slices(state, destination).into_iter().next();
             if let (Some(from), Some(to)) = (from, to) {
                 if from.texture.sample_count() > to.texture.sample_count() {
                     self.resolve_color(state, &from, &to);
                 } else {
+                    let from = self.flat(state, from);
                     self.copy_slice(state, &from, &to);
                 }
             }
@@ -1689,7 +1942,24 @@ impl BackendApi for WgpuBackend {
             let from = self.depth_slice(state, source);
             let to = self.depth_slice(state, destination);
             if let (Some(from), Some(to)) = (from, to) {
-                if from.texture.sample_count() > to.texture.sample_count() {
+                if self.gl {
+                    // wgpu cannot copy depth on OpenGL, so the depth is drawn
+                    let from = if from.texture.sample_count() > 1 {
+                        self.resolved_depth(state, &from)
+                    } else {
+                        self.flat(state, from)
+                    };
+                    self.builtin_pass(
+                        state,
+                        builtin::Kind::DepthToDepth {
+                            multisampled: false,
+                        },
+                        &from.view(),
+                        &to.view(),
+                        to.texture.format(),
+                        None,
+                    );
+                } else if from.texture.sample_count() > to.texture.sample_count() {
                     // Like OpenGL, the depth of a pixel is the depth of one of its samples
                     self.builtin_pass(
                         state,
@@ -1830,6 +2100,23 @@ impl BackendApi for WgpuBackend {
         let program_id = program.wgpu();
         let state = &mut *self.lock();
         let bindings = self.bindings(state, program_id);
+
+        // The program writes to the textures themselves, so their bits are created again when they are needed, see [bits]
+        let written: Vec<u32> = state.programs[&program_id]
+            .compute
+            .as_ref()
+            .unwrap()
+            .storage
+            .iter()
+            .filter_map(|(_, _, texture)| *texture)
+            .collect();
+        for texture in written {
+            self.synchronize_bits(state, texture);
+            if let Some(entry) = state.textures.get_mut(&texture) {
+                entry.bits = None;
+                entry.has_content = true;
+            }
+        }
 
         // The textures the program writes to
         let compute = state.programs[&program_id].compute.as_ref().unwrap();
@@ -2221,6 +2508,28 @@ impl BackendApi for WgpuBackend {
             textures: sample_kinds,
         };
         if !state.pipelines.contains_key(&key) {
+            // The color targets that take the bits of floats, see [bits]
+            let bits_mask = key
+                .formats
+                .colors
+                .iter()
+                .enumerate()
+                .fold(0, |mask, (index, format)| {
+                    mask | (u32::from(bits::is_bits(*format)) << index)
+                });
+            let bits_fragment = (bits_mask != 0).then(|| {
+                let program = state.programs.get_mut(&program_id).unwrap();
+                if !program.bits_fragments.contains_key(&bits_mask) {
+                    let mut module = program
+                        .fragment_source
+                        .clone()
+                        .expect("the program has no fragment shader that can write to this target");
+                    bits::output_bits(&mut module, &program.entry_points[1], bits_mask);
+                    let module = self.shader_module(module);
+                    program.bits_fragments.insert(bits_mask, module);
+                }
+                program.bits_fragments[&bits_mask].clone()
+            });
             let program = &state.programs[&program_id];
             let mut bind_group_layouts = vec![
                 Some(&program.uniform_layout),
@@ -2274,7 +2583,9 @@ impl BackendApi for WgpuBackend {
                 .map(|(index, format)| {
                     Some(w::ColorTargetState {
                         format: *format,
-                        blend: blend_state(call.render_states.blend),
+                        // Integers cannot be blended
+                        blend: blend_state(call.render_states.blend)
+                            .filter(|_| !bits::is_bits(*format)),
                         // A target the fragment shader does not write to keeps its content
                         write_mask: if index < program.number_of_outputs {
                             color_writes(write_mask)
@@ -2317,7 +2628,7 @@ impl BackendApi for WgpuBackend {
                         ..Default::default()
                     },
                     fragment: Some(w::FragmentState {
-                        module: &program.fragment,
+                        module: bits_fragment.as_ref().unwrap_or(&program.fragment),
                         entry_point: Some(&program.entry_points[1]),
                         compilation_options: Default::default(),
                         targets: &targets,
@@ -2370,6 +2681,7 @@ impl WgpuBackend {
         let state = &mut *self.lock();
         match format {
             ReadFormat::Color(format) => {
+                self.prepare_bits(state, source, false);
                 let mut slice = self
                     .color_slices(state, source)
                     .into_iter()
@@ -2381,6 +2693,7 @@ impl WgpuBackend {
                     self.resolve_color(state, &slice, &resolved);
                     slice = resolved;
                 }
+                let slice = self.flat(state, slice);
                 let (primitive, channels) = texel_layout(slice.texture.format());
                 if primitive != format.primitive {
                     unsupported("reading pixels as another type than the texture has");
@@ -2394,9 +2707,15 @@ impl WgpuBackend {
                 let slice = self
                     .depth_slice(state, source)
                     .expect("the target that is read from has no depth");
-                // Not every depth format can be copied into a buffer, so the depth is drawn into a color texture first
+                let slice = if self.gl && slice.texture.sample_count() > 1 {
+                    self.resolved_depth(state, &slice)
+                } else {
+                    self.flat(state, slice)
+                };
+                // Not every depth format can be copied into a buffer, so the depth is drawn into a color texture first.
+                // Its texels are the bits of the depth, since OpenGL cannot always render into a texture of 32 bit floats.
                 let color =
-                    self.temporary_texture(w::TextureFormat::R32Float, source.width, source.height);
+                    self.temporary_texture(w::TextureFormat::R32Uint, source.width, source.height);
                 self.builtin_pass(
                     state,
                     builtin::Kind::DepthToColor {
@@ -2404,7 +2723,7 @@ impl WgpuBackend {
                     },
                     &slice.view(),
                     &color.view(),
-                    w::TextureFormat::R32Float,
+                    w::TextureFormat::R32Uint,
                     None,
                 );
                 self.start_read(state, &color, rect, 4)
@@ -2540,6 +2859,9 @@ impl WgpuBackend {
                     entries: &user_block_entries,
                 });
 
+        let fragment_source =
+            (!self.float32_renderable && number_of_outputs > 0 && storage.is_none())
+                .then(|| fragment.as_ref().unwrap_or(&vertex).clone());
         let vertex = self.shader_module(vertex);
         let fragment = match fragment {
             Some(fragment) => self.shader_module(fragment),
@@ -2596,6 +2918,8 @@ impl WgpuBackend {
                 .collect(),
             user_block_layout,
             number_of_outputs,
+            fragment_source,
+            bits_fragments: HashMap::new(),
         };
         let mut state = self.lock();
         let id = Self::id(&mut state);
@@ -2620,6 +2944,17 @@ impl WgpuBackend {
     /// Submits the recorded commands if the ring buffer for the uniforms is full.
     ///
     fn bindings(&self, state: &mut State, program_id: u32) -> Bindings {
+        if !self.float32_renderable {
+            // What was rendered into the textures must be there when they are sampled, see [bits]
+            let textures: Vec<u32> = state.programs[&program_id]
+                .samplers
+                .iter()
+                .filter_map(|(_, unit)| state.units.get(unit).copied())
+                .collect();
+            for texture in textures {
+                self.synchronize_bits(state, texture);
+            }
+        }
         let program = &state.programs[&program_id];
 
         // Textures and samplers

@@ -85,6 +85,11 @@ jobs:
           command: test
           args: --all-features --lib
 
+      # The same tests with wgpu on top of OpenGL (feature wgpu-gl), again on the software driver
+      - name: Test wgpu on OpenGL
+        if: startsWith(matrix.os, 'ubuntu')
+        run: WGPU_BACKEND=gl THREE_D_EXPECT_BACKEND=gl cargo test --all-features --lib
+
   semver:
     name: Check API compatibility with upstream
     runs-on: ubuntu-latest

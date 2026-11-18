@@ -57,9 +57,32 @@ context.resize_offscreen_screen(new_width, new_height)?;
 - The pixels are RGBA and the first row is the top row of the image, as for every `read_color` of `three-d` with both backends. (Positions inside a render target, such as a viewport or a scissor box, count from the bottom left.)
 - The last two arguments say whether the screen has a depth buffer and whether it is multisampled (four samples per pixel).
 - Reading hands the frame to the graphics card. For a frame that is not read, call `context.submit_offscreen_screen()` at its end instead.
-- **Graphics cards without a usable Vulkan driver** (for example older integrated ones on Linux): wgpu only finds a software adapter there, which is slow. With the feature `headless-gl`, `Context::new_headless_gl_with_screen` creates the same kind of context with the OpenGL backend (Linux only, through EGL), and it is used in exactly the same way. `Context::new_headless_with_screen` chooses for you: wgpu on hardware, then OpenGL on hardware, then wgpu in software, then OpenGL in software. `context.as_wgpu()` and `context.as_gl()` tell what it chose. An OpenGL context has to be used on the thread that created it.
+- **Graphics cards without a usable Vulkan driver** (for example older integrated ones on Linux): wgpu only finds a software adapter there, which is slow. With the feature `headless-gl`, `Context::new_headless_gl_with_screen` creates the same kind of context with the OpenGL backend (Linux only, through EGL), and it is used in exactly the same way. `Context::new_headless_with_screen` chooses for you: wgpu on hardware, then OpenGL on hardware, then wgpu on top of OpenGL on hardware (see below), then wgpu in software, then OpenGL in software. `context.as_wgpu()` and `context.as_gl()` tell what it chose. An OpenGL context has to be used on the thread that created it.
 - Before you drop such a context while the application keeps running, empty its program cache with `context.programs.write().unwrap().clear()`. The cached programs hold the context, so otherwise it and its graphics device are never freed.
 - This is only for native targets, since reading has to wait for the graphics card. In a browser use a canvas.
+
+## wgpu on top of OpenGL
+
+With the feature `wgpu-gl`, the wgpu backend can also draw with OpenGL (3.3 or newer) or OpenGL ES 3 on native targets:
+
+```toml
+three-d = { git = "https://github.com/szsoftware/three-d", features = ["wgpu-gl"] }
+```
+
+This is for graphics cards without a Vulkan driver that wgpu accepts, where wgpu would otherwise only find a slow software adapter. Code that is written for the wgpu backend (WGSL shaders, `context.as_wgpu()`) then still runs in hardware.
+
+- **Which adapter is taken.** wgpu asks Vulkan, Metal and DirectX 12 first. If that gives no hardware adapter and OpenGL has one, `Window::new_with_backend(settings, BackendPreference::Wgpu)`, `Context::new_headless_wgpu` and `Context::new_headless_wgpu_with_screen` take the one of OpenGL. `BackendPreference::Auto` does not: it uses the OpenGL backend of `three-d` then, which does the same with less effort. For a context without a window, the environment variable `WGPU_BACKEND=gl` forces OpenGL.
+- **Everything of `three-d` works**: the renderer, picking, reading color and depth, cube maps, texture arrays, 3D textures, multisampling, the GUI and shaders in WGSL. The tests of the repository run the whole suite on it.
+- wgpu itself has gaps on OpenGL (rendering into textures of 32 bit floats with the drivers of Mesa, reading cube maps, copying depth, the depth of multisample targets, cube maps that are filtered across their sides). `three-d` works around them, so they cost some extra passes and copies but do not change the result.
+
+What stays different from wgpu on Vulkan:
+
+- **Textures of 32 bit floats are not filtered linearly** with the drivers of Mesa, they are sampled with the nearest texel. Use 16 bit floats for textures that are filtered, such as an environment map.
+- **Render targets of 32 bit floats** cannot be blended and cannot be multisampled.
+- **3D textures of 32 bit floats** get no mipmaps.
+- **Compute shaders** need OpenGL 4.3 or OpenGL ES 3.1. On older versions, using a `ComputeProgram` gives an error in `Context::error_check`.
+- `textureSize` of a texture array with one layer, or with square layers whose number is a multiple of six, reports one layer more than the array has.
+- With your own device (`Context::from_wgpu`) that draws with OpenGL, enable the `wgpu-gl` feature as well. Without it, cube maps are not filtered across their sides and the depth of a multisample target reads as 1.
 
 ## What works
 
@@ -192,12 +215,12 @@ fn run(@builtin(global_invocation_id) id: vec3<u32>) {
 ## Tested where
 
 - Automatically on every pull request:
-  - Linux: Vulkan (lavapipe) against OpenGL (llvmpipe), both software renderers. Every test scene is drawn with both backends and the images are compared.
+  - Linux: Vulkan (lavapipe) against OpenGL (llvmpipe), both software renderers. Every test scene is drawn with both backends and the images are compared. Then the same again with wgpu on top of OpenGL (llvmpipe).
   - macOS: Metal, on the virtual GPU of the build machine. The images are compared with what OpenGL returned on Linux (stored in `src/core/backend/wgpu/reference`).
   - Windows: DirectX 12 with the DXC shader compiler, on the software adapter of Windows (WARP), compared in the same way.
   - Build for the web, and API compatibility with upstream (`cargo semver-checks`).
 - By hand: a real window on Linux (X11), Chromium with WebGPU and the fallback to WebGL2.
-- Not tested yet: real GPUs, Safari, Android.
+- Not tested yet: real GPUs, Safari, Android. wgpu on top of OpenGL is only tested on the software renderer of Mesa, not on a graphics card and not on Windows.
 
 ## Test it on your own hardware
 
