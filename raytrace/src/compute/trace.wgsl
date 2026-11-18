@@ -149,18 +149,30 @@ fn sample_texture(id: u32, uv: vec2<f32>, color: bool) -> vec4<f32> {
     let flags = texels[h + 3u];
     let x = uv.x * f32(width);
     let y = uv.y * f32(height);
-    if (flags & TEXTURE_NEAREST) != 0u {
-        return fetch_texel(first, width, height, flags, i32(floor(x)), i32(floor(y)), color);
+    var x0 = i32(floor(x));
+    var y0 = i32(floor(y));
+    var fx = 0.0;
+    var fy = 0.0;
+    if (flags & TEXTURE_NEAREST) == 0u {
+        let fx0 = floor(x - 0.5);
+        let fy0 = floor(y - 0.5);
+        fx = x - 0.5 - fx0;
+        fy = y - 0.5 - fy0;
+        x0 = i32(fx0);
+        y0 = i32(fy0);
     }
-    let fx0 = floor(x - 0.5);
-    let fy0 = floor(y - 0.5);
-    let fx = x - 0.5 - fx0;
-    let fy = y - 0.5 - fy0;
-    let x0 = i32(fx0);
-    let y0 = i32(fy0);
-    let top = mix(fetch_texel(first, width, height, flags, x0, y0, color), fetch_texel(first, width, height, flags, x0 + 1, y0, color), fx);
-    let bottom = mix(fetch_texel(first, width, height, flags, x0, y0 + 1, color), fetch_texel(first, width, height, flags, x0 + 1, y0 + 1, color), fx);
-    return mix(top, bottom, fy);
+    // The four texels in a loop with one fetch, which keeps the shader small (see next_shadow_ray); a nearest texture
+    // has weight 1 for the first
+    var result = vec4<f32>(0.0);
+    for (var k = 0u; k < 4u; k++) {
+        let dx = k & 1u;
+        let dy = k >> 1u;
+        let weight = select(1.0 - fx, fx, dx == 1u) * select(1.0 - fy, fy, dy == 1u);
+        if weight > 0.0 {
+            result += weight * fetch_texel(first, width, height, flags, x0 + i32(dx), y0 + i32(dy), color);
+        }
+    }
+    return result;
 }
 
 fn uv_at(tri: vec4<u32>, u: f32, v: f32) -> vec2<f32> {
@@ -171,33 +183,44 @@ fn uv_at(tri: vec4<u32>, u: f32, v: f32) -> vec2<f32> {
     return vec2<f32>(a.position.w, a.normal.w) * w + vec2<f32>(b.position.w, b.normal.w) * u + vec2<f32>(c.position.w, c.normal.w) * v;
 }
 
-// The material with its textures applied at uv
-fn material_at(m: Material, uv: vec2<f32>) -> Material {
+// The texel of the normal map at the uv of the last material_at with all five slots
+var<private> normal_texel: vec4<f32>;
+
+// The material with the textures of its first `slots` slots applied at uv: base color (with alpha), transmission,
+// metallic and roughness, emission and the normal map (into normal_texel). One texture lookup in a loop for all, which
+// keeps the shader small (see next_shadow_ray).
+fn material_at(m: Material, uv: vec2<f32>, slots: u32) -> Material {
     var r = m;
-    if m.textures.x != NONE {
-        let c = sample_texture(m.textures.x, uv, true);
-        r.base_color = m.base_color * c;
-    }
-    if m.textures.y != NONE {
-        let s = sample_texture(m.textures.y, uv, false);
-        r.params.y = m.params.y * s.y;
-        r.params.x = m.params.x * s.z;
-    }
-    if m.textures.w != NONE {
-        r.emission = vec4<f32>(m.emission.rgb * sample_texture(m.textures.w, uv, true).rgb, m.emission.w);
-    }
-    if m.more_textures.x != NONE {
-        r.params.w = m.params.w * sample_texture(m.more_textures.x, uv, false).x;
+    normal_texel = vec4<f32>(0.5, 0.5, 1.0, 1.0);
+    for (var k = 0u; k < slots; k++) {
+        var id = m.textures.x;
+        if k == 1u {
+            id = m.more_textures.x;
+        } else if k == 2u {
+            id = m.textures.y;
+        } else if k == 3u {
+            id = m.textures.w;
+        } else if k == 4u {
+            id = m.textures.z;
+        }
+        if id == NONE {
+            continue;
+        }
+        let t = sample_texture(id, uv, k == 0u || k == 3u);
+        if k == 0u {
+            r.base_color = m.base_color * t;
+        } else if k == 1u {
+            r.params.w = m.params.w * t.x;
+        } else if k == 2u {
+            r.params.y = m.params.y * t.y;
+            r.params.x = m.params.x * t.z;
+        } else if k == 3u {
+            r.emission = vec4<f32>(m.emission.rgb * t.rgb, m.emission.w);
+        } else {
+            normal_texel = t;
+        }
     }
     return r;
-}
-
-fn is_cut_out(m: Material, uv: vec2<f32>) -> bool {
-    var alpha = m.base_color.a;
-    if m.textures.x != NONE {
-        alpha *= sample_texture(m.textures.x, uv, false).w;
-    }
-    return alpha < m.flags.z;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -320,21 +343,19 @@ fn intersect_triangle(o: vec3<f32>, d: vec3<f32>, p0: vec3<f32>, p1: vec3<f32>, 
     return vec3<f32>(dot(e2, q) * inv, u, v);
 }
 
-fn face_normal_in_world(instance: Instance, p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f32>) -> vec3<f32> {
+fn face_normal_in_world(index: u32, p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f32>) -> vec3<f32> {
     // Normals transform with the inverse transpose
-    return normalize((transpose(instance.inverse) * vec4<f32>(cross(p1 - p0, p2 - p0), 0.0)).xyz);
+    return normalize((transpose(instances[index].inverse) * vec4<f32>(cross(p1 - p0, p2 - p0), 0.0)).xyz);
 }
 
-// A triangle hit on a shadow ray: true if nothing passes any more
-fn shadow_hit(instance: Instance, tri: vec4<u32>, u: f32, v: f32, p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f32>) -> bool {
-    let raw = materials[instance.info.z];
-    if raw.params.w <= 0.0 {
+// A triangle hit on a shadow ray, m with the textures for base color and transmission: true if nothing passes any more
+fn shadow_hit(index: u32, m: Material, p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f32>) -> bool {
+    if m.params.w <= 0.0 {
         transmittance = vec3<f32>(0.0);
         return true;
     }
-    let m = material_at(raw, uv_at(tri, u, v));
     let transmission = m.params.w;
-    let cos_i = clamp(abs(dot(face_normal_in_world(instance, p0, p1, p2), shadow_direction)), 0.0, 1.0);
+    let cos_i = clamp(abs(dot(face_normal_in_world(index, p0, p1, p2), shadow_direction)), 0.0, 1.0);
     let f = fresnel_dielectric(cos_i, m.emission.w);
     transmittance = transmittance * m.base_color.rgb * (transmission * (1.0 - f));
     return max(max(transmittance.x, transmittance.y), transmittance.z) <= 0.0;
@@ -342,14 +363,16 @@ fn shadow_hit(instance: Instance, tri: vec4<u32>, u: f32, v: f32, p0: vec3<f32>,
 
 // Traverses the hierarchy of one instance's mesh, the ray in mesh coordinates. Returns true to stop.
 fn walk_mesh(index: u32, o: vec3<f32>, d: vec3<f32>, t_max: ptr<function, f32>, hit: ptr<function, Hit>, shadow: bool) -> bool {
-    let instance = instances[index];
-    let base = instance.info.x;
+    // Only the fields needed: whole instances (two matrices) kept during the traversal take many registers
+    let info = instances[index].info;
+    let base = info.x;
     let inv = safe_inverse(d);
     let root = nodes[base];
     if root.min.x > root.max.x || slab(root, o, inv, *t_max) < 0.0 {
         return false;
     }
-    var stack: array<u32, 64>;
+    // The stack in workgroup memory, see mesh_stack
+    let stack_base = invocation * MESH_STACK;
     var size = 0u;
     var current = base;
     loop {
@@ -357,15 +380,25 @@ fn walk_mesh(index: u32, o: vec3<f32>, d: vec3<f32>, t_max: ptr<function, f32>, 
         var descend = false;
         if node.count > 0u {
             for (var i = node.first; i < node.first + node.count; i++) {
-                let ti = instance.info.y + i;
+                let ti = info.y + i;
                 let tri = triangles[ti];
                 let p0 = vertices[tri.x].position.xyz;
                 let p1 = vertices[tri.y].position.xyz;
                 let p2 = vertices[tri.z].position.xyz;
                 let r = intersect_triangle(o, d, p0, p1, p2);
-                if r.x > 0.0 && r.x < *t_max && !(instance.info.w == 2u && is_cut_out(materials[instance.info.z], uv_at(tri, r.y, r.z))) {
+                if r.x > 0.0 && r.x < *t_max {
+                    // Textures for cut-outs (alpha of the base color) and for glass on shadow rays, with one lookup
+                    let raw = materials[info.z];
+                    let glass = shadow && raw.params.w > 0.0;
+                    var m = raw;
+                    if info.w == 2u || glass {
+                        m = material_at(raw, uv_at(tri, r.y, r.z), select(1u, 2u, glass));
+                    }
+                    if info.w == 2u && m.base_color.a < raw.flags.z {
+                        continue;
+                    }
                     if shadow {
-                        if shadow_hit(instance, tri, r.y, r.z, p0, p1, p2) {
+                        if shadow_hit(index, m, p0, p1, p2) {
                             return true;
                         }
                     } else {
@@ -380,8 +413,8 @@ fn walk_mesh(index: u32, o: vec3<f32>, d: vec3<f32>, t_max: ptr<function, f32>, 
             let ta = slab(nodes[a], o, inv, *t_max);
             let tb = slab(nodes[b], o, inv, *t_max);
             if ta >= 0.0 && tb >= 0.0 {
-                if size < 64u {
-                    stack[size] = select(a, b, ta <= tb);
+                if size < MESH_STACK {
+                    mesh_stack[stack_base + size] = select(a, b, ta <= tb);
                     size += 1u;
                 }
                 current = select(b, a, ta <= tb);
@@ -402,7 +435,7 @@ fn walk_mesh(index: u32, o: vec3<f32>, d: vec3<f32>, t_max: ptr<function, f32>, 
                     break;
                 }
                 size -= 1u;
-                let candidate = stack[size];
+                let candidate = mesh_stack[stack_base + size];
                 if slab(nodes[candidate], o, inv, *t_max) >= 0.0 {
                     current = candidate;
                     found = true;
@@ -435,13 +468,13 @@ fn walk(o: vec3<f32>, d: vec3<f32>, t_max_in: f32, shadow: bool) -> Hit {
         var descend = false;
         if node.count > 0u {
             for (var i = node.first; i < node.first + node.count; i++) {
-                let instance = instances[i];
-                if instance.info.w == 0u {
+                if instances[i].info.w == 0u {
                     continue;
                 }
                 // The same t on the ray in mesh coordinates, the direction is not normalised again
-                let lo = (instance.inverse * vec4<f32>(o, 1.0)).xyz;
-                let ld = (instance.inverse * vec4<f32>(d, 0.0)).xyz;
+                let inverse = instances[i].inverse;
+                let lo = (inverse * vec4<f32>(o, 1.0)).xyz;
+                let ld = (inverse * vec4<f32>(d, 0.0)).xyz;
                 if walk_mesh(i, lo, ld, &t_max, &hit, shadow) {
                     return hit;
                 }
@@ -526,11 +559,11 @@ fn surface_at(hit: Hit, d: vec3<f32>) -> Surface {
     }
     let raw = materials[instance.info.z];
     let uv = uv_at(tri, hit.u, hit.v);
-    let material = material_at(raw, uv);
+    let material = material_at(raw, uv, 5u);
     if raw.textures.z != NONE {
         let frame = tangent_frame(instance, v0, v1, v2, w, hit.u, hit.v, shading);
         if frame.valid {
-            let s = sample_texture(raw.textures.z, uv, false);
+            let s = normal_texel;
             let nt = normalize(vec3<f32>((2.0 * s.x - 1.0) * raw.flags.y, (2.0 * s.y - 1.0) * raw.flags.y, 2.0 * s.z - 1.0));
             let n = frame.t * nt.x + frame.b * nt.y + shading * nt.z;
             if dot(n, n) > 0.0 {
@@ -841,57 +874,75 @@ fn environment(d: vec3<f32>, include_sun: bool) -> vec3<f32> {
     return l;
 }
 
-// Reflected luminance for illuminance e from direction l
-fn light_from(p: vec3<f32>, v: vec3<f32>, n: vec3<f32>, ng: vec3<f32>, m: Material, l: vec3<f32>, distance: f32, e: vec3<f32>) -> vec3<f32> {
-    let c = dot(n, l);
-    if c <= 0.0 || dot(ng, l) <= 0.0 {
-        return vec3<f32>(0.0);
-    }
-    let f = evaluate_material(m, v, l, n);
-    if all(f == vec3<f32>(0.0)) {
-        return f;
-    }
-    transmittance = vec3<f32>(1.0);
-    shadow_direction = l;
-    _ = walk(p, l, distance, true);
-    return f * e * transmittance * c;
+// A ray towards a light, with what the light adds to the reflected luminance if nothing is in between
+struct ShadowRay {
+    // The light to continue with after this one, NONE without a ray
+    next: u32,
+    direction: vec3<f32>,
+    distance: f32,
+    contribution: vec3<f32>,
 }
 
-fn direct_light(p: vec3<f32>, v: vec3<f32>, n: vec3<f32>, ng: vec3<f32>, m: Material) -> vec3<f32> {
-    var result = vec3<f32>(0.0);
-    if params.settings.z == 1u && params.sun_light.w > 0.0 {
-        let s = params.sun_direction.xyz;
-        let t = orthonormal_t(s);
-        let b = orthonormal_b(s);
-        let u1 = next_f32();
-        let u2 = next_f32();
-        let c = uniform_cone(u1, u2, params.sun_direction.w);
-        let l = normalize(t * c.x + b * c.y + s * c.z);
-        result += light_from(p, v, n, ng, m, l, BIG, params.sun_light.xyz);
+// The ray to the first light from `first` on (0 is the sun, i + 1 the light i) that can light the surface. The lights are
+// tested one after the other with a shadow ray each, which radiance traces with the same traversal as every other ray:
+// each call site of walk inlines a whole traversal, which makes the shader too large for some compilers (Mesa's for
+// Intel graphics of the 7th generation crashes).
+fn next_shadow_ray(first: u32, p: vec3<f32>, v: vec3<f32>, n: vec3<f32>, ng: vec3<f32>, m: Material) -> ShadowRay {
+    let sun = params.settings.z == 1u && params.sun_light.w > 0.0;
+    var j = first;
+    if j == 0u && !sun {
+        j = 1u;
     }
-    for (var i = 0u; i < params.settings.y; i++) {
-        let light = lights[i];
-        if light.position.w == 0.0 {
-            result += light_from(p, v, n, ng, m, -normalize(light.position.xyz), BIG, light.color.rgb);
-        } else if light.position.w == 1.0 {
-            let to_light = light.position.xyz - p;
-            let d2 = dot(to_light, to_light);
-            if d2 > 0.0 {
-                let d = sqrt(d2);
-                result += light_from(p, v, n, ng, m, to_light / d, d * (1.0 - 1e-4), light.color.rgb / d2);
-            }
-        } else {
+    for (; j <= params.settings.y; j++) {
+        var l = vec3<f32>(0.0);
+        var distance = BIG;
+        // Illuminance from direction l
+        var e = vec3<f32>(0.0);
+        if j == 0u {
+            let s = params.sun_direction.xyz;
+            let t = orthonormal_t(s);
+            let b = orthonormal_b(s);
             let u1 = next_f32();
             let u2 = next_f32();
-            let ls = sample_area_light(light, p, u1, u2);
-            if ls.pdf > 0.0 {
-                // Shared with the material's own samples that hit the light
-                let weight = power_heuristic(ls.pdf, material_pdf(m, v, ls.direction, n)) / ls.pdf;
-                result += light_from(p, v, n, ng, m, ls.direction, ls.distance * (1.0 - 1e-4), light.color.rgb * weight);
+            let c = uniform_cone(u1, u2, params.sun_direction.w);
+            l = normalize(t * c.x + b * c.y + s * c.z);
+            e = params.sun_light.xyz;
+        } else {
+            let light = lights[j - 1u];
+            if light.position.w == 0.0 {
+                l = -normalize(light.position.xyz);
+                e = light.color.rgb;
+            } else if light.position.w == 1.0 {
+                let to_light = light.position.xyz - p;
+                let d2 = dot(to_light, to_light);
+                if d2 > 0.0 {
+                    let d = sqrt(d2);
+                    l = to_light / d;
+                    distance = d * (1.0 - 1e-4);
+                    e = light.color.rgb / d2;
+                }
+            } else {
+                let u1 = next_f32();
+                let u2 = next_f32();
+                let ls = sample_area_light(light, p, u1, u2);
+                if ls.pdf > 0.0 {
+                    // Shared with the material's own samples that hit the light
+                    let weight = power_heuristic(ls.pdf, material_pdf(m, v, ls.direction, n)) / ls.pdf;
+                    l = ls.direction;
+                    distance = ls.distance * (1.0 - 1e-4);
+                    e = light.color.rgb * weight;
+                }
+            }
+        }
+        let c = dot(n, l);
+        if any(e != vec3<f32>(0.0)) && c > 0.0 && dot(ng, l) > 0.0 {
+            let f = evaluate_material(m, v, l, n);
+            if any(f != vec3<f32>(0.0)) {
+                return ShadowRay(j + 1u, l, distance, f * e * c);
             }
         }
     }
-    return result;
+    return ShadowRay(NONE, vec3<f32>(0.0), 0.0, vec3<f32>(0.0));
 }
 
 // Area lights (light.rs)
@@ -1042,11 +1093,23 @@ fn clamped(bounce: u32, contribution: vec3<f32>) -> vec3<f32> {
     return contribution;
 }
 
-// What the camera ray hits first, for the features of a denoiser (tracer.rs FirstHit)
-var<private> first_albedo: vec3<f32>;
-var<private> first_normal: vec3<f32>;
-var<private> first_distance: f32;
+// Sums over the samples of what the camera ray hits first, for the features of a denoiser (tracer.rs FirstHit). Added
+// up here instead of returned by radiance: fewer values live through the path loop.
+var<private> albedo_sum: vec3<f32>;
+var<private> normal_sum: vec3<f32>;
+var<private> distance_sum: f32;
 const SKY_DISTANCE: f32 = 1e9;
+
+fn add_features(albedo: vec3<f32>, normal: vec3<f32>, distance: f32) {
+    albedo_sum += albedo;
+    normal_sum += normal;
+    distance_sum += distance;
+}
+
+// The material for evaluating and sampling reflection, which needs only base color and the parameters
+fn reflecting(base_color: vec3<f32>, p: vec3<f32>) -> Material {
+    return Material(vec4<f32>(base_color, 1.0), vec4<f32>(p, 0.0), vec4<f32>(0.0), vec4<f32>(0.0), vec4<u32>(NONE), vec4<u32>(NONE));
+}
 
 fn feature_albedo(m: Material) -> vec3<f32> {
     if m.params.w > 0.0 || (m.params.x > 0.5 && m.params.y < 0.2) {
@@ -1071,98 +1134,146 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
     var glass_reflected = false;
     var glass_bent = false;
     var bounce = 0u;
+    // The diffuse or glossy surface whose lights are tested with shadow rays, and the light they add so far
+    var shadow_ray = ShadowRay(NONE, vec3<f32>(0.0), 0.0, vec3<f32>(0.0));
+    // Kept small, it lives through the whole loop: the point is origin, the view direction -direction and only the
+    // parameters of the material for reflection
+    var surface_n = vec3<f32>(0.0);
+    var surface_ng = vec3<f32>(0.0);
+    var surface_base_color = vec3<f32>(0.0);
+    var surface_params = vec3<f32>(0.0);
+    var direct = vec3<f32>(0.0);
     loop {
+        // The only traversal in the shader: a shadow ray while lights of a surface are tested, else the path's next ray
+        let shadow = shadow_ray.next != NONE;
+        var ray_origin = origin;
+        var ray_direction = direction;
         // The nearest area light, ignoring the scene
         var light_distance = BIG;
         var light_index = NONE;
-        for (var i = 0u; i < params.settings.y; i++) {
-            if lights[i].position.w >= 2.0 {
-                let t = hit_area_light(lights[i], origin, direction);
-                if t < light_distance {
-                    light_distance = t;
-                    light_index = i;
-                }
-            }
-        }
-        let hit = walk(origin, direction, light_distance, false);
-        if hit.instance == NONE && light_index != NONE {
-            // Area lights end the path; their light was also sampled directly, so both share it
-            let light = lights[light_index];
-            var weight = 1.0;
-            if !last_was_delta {
-                weight = power_heuristic(last_pdf, area_light_pdf(light, origin, direction, light_distance));
-            } else if diffuse_seen && !glass_reflected {
-                if glass_bent {
-                    // Through solid glass the light was sampled straight already
-                    weight = 0.0;
-                } else {
-                    // Straight through thin glass, the direction drawn at the last diffuse bounce
-                    let at = origin + direction * light_distance;
-                    weight = power_heuristic(last_pdf, area_light_pdf(light, diffuse_origin, direction, length(at - diffuse_origin)));
-                }
-            }
-            result += clamped(bounce, throughput * light.color.rgb * weight);
-            break;
-        }
-        if hit.instance == NONE {
-            result += clamped(bounce, throughput * environment(direction, last_was_delta && (!diffuse_seen || glass_reflected)));
-            break;
-        }
-        let s = surface_at(hit, direction);
-        if bounce == 0u {
-            first_albedo = feature_albedo(s.material);
-            first_normal = s.shading_normal;
-            first_distance = hit.t;
-        }
-        let m = s.material;
-        result += clamped(bounce, throughput * m.emission.rgb);
-        if bounce >= params.camera.w {
-            break;
-        }
-        let v = -direction;
-        let ng = s.geometric_normal;
-        var n = s.shading_normal;
-        if dot(n, v) <= 0.0 {
-            n = ng;
-        }
-
-        let transmission = m.params.w;
-        let thin_walled = m.flags.x > 0.0;
-        if transmission > 0.0 && next_f32() < transmission {
-            // Smooth glass: reflect or pass, chosen by the Fresnel term
-            let ior = m.emission.w;
-            let eta = select(1.0 / ior, ior, thin_walled || s.front_face);
-            let cos_i = clamp(dot(n, v), 0.0, 1.0);
-            if next_f32() < fresnel_dielectric(cos_i, eta) {
-                direction = reflect_about(v, n);
-                origin = offset_point(s.position, ng);
-                glass_reflected = true;
-                glass_bent = true;
-            } else {
-                throughput = throughput * m.base_color.rgb;
-                if !thin_walled {
-                    let r = refract_through(v, n, 1.0 / eta);
-                    direction = select(reflect_about(v, n), r.xyz, r.w > 0.0);
-                    glass_bent = true;
-                }
-                origin = offset_point(s.position, -ng);
-            }
-            last_was_delta = true;
+        if shadow {
+            ray_origin = origin;
+            ray_direction = shadow_ray.direction;
+            light_distance = shadow_ray.distance;
+            transmittance = vec3<f32>(1.0);
+            shadow_direction = shadow_ray.direction;
         } else {
-            // Diffuse and glossy reflection: light sources directly, then a new direction from the material
-            let p = offset_point(s.position, ng);
-            result += clamped(bounce, throughput * direct_light(p, v, n, ng, m));
-            let next = sample_material(m, v, n);
-            if !next.valid || dot(next.direction, ng) <= 0.0 {
+            for (var i = 0u; i < params.settings.y; i++) {
+                if lights[i].position.w >= 2.0 {
+                    let t = hit_area_light(lights[i], origin, direction);
+                    if t < light_distance {
+                        light_distance = t;
+                        light_index = i;
+                    }
+                }
+            }
+        }
+        let hit = walk(ray_origin, ray_direction, light_distance, shadow);
+        // A diffuse or glossy surface whose lights are all tested: continue the path with a direction from its material
+        var lit = false;
+        if shadow {
+            direct += shadow_ray.contribution * transmittance;
+            shadow_ray = next_shadow_ray(shadow_ray.next, origin, -direction, surface_n, surface_ng, reflecting(surface_base_color, surface_params));
+            if shadow_ray.next != NONE {
+                continue;
+            }
+            lit = true;
+        } else {
+            if hit.instance == NONE && light_index != NONE {
+                // Area lights end the path; their light was also sampled directly, so both share it
+                let light = lights[light_index];
+                var weight = 1.0;
+                if !last_was_delta {
+                    weight = power_heuristic(last_pdf, area_light_pdf(light, origin, direction, light_distance));
+                } else if diffuse_seen && !glass_reflected {
+                    if glass_bent {
+                        // Through solid glass the light was sampled straight already
+                        weight = 0.0;
+                    } else {
+                        // Straight through thin glass, the direction drawn at the last diffuse bounce
+                        let at = origin + direction * light_distance;
+                        weight = power_heuristic(last_pdf, area_light_pdf(light, diffuse_origin, direction, length(at - diffuse_origin)));
+                    }
+                }
+                result += clamped(bounce, throughput * light.color.rgb * weight);
+                if bounce == 0u {
+                    add_features(vec3<f32>(1.0), -direction, SKY_DISTANCE);
+                }
+                break;
+            }
+            if hit.instance == NONE {
+                result += clamped(bounce, throughput * environment(direction, last_was_delta && (!diffuse_seen || glass_reflected)));
+                if bounce == 0u {
+                    add_features(vec3<f32>(1.0), -direction, SKY_DISTANCE);
+                }
+                break;
+            }
+            let s = surface_at(hit, direction);
+            if bounce == 0u {
+                add_features(feature_albedo(s.material), s.shading_normal, hit.t);
+            }
+            let m = s.material;
+            result += clamped(bounce, throughput * m.emission.rgb);
+            if bounce >= params.camera.w {
+                break;
+            }
+            let v = -direction;
+            let ng = s.geometric_normal;
+            var n = s.shading_normal;
+            if dot(n, v) <= 0.0 {
+                n = ng;
+            }
+
+            let transmission = m.params.w;
+            let thin_walled = m.flags.x > 0.0;
+            if transmission > 0.0 && next_f32() < transmission {
+                // Smooth glass: reflect or pass, chosen by the Fresnel term
+                let ior = m.emission.w;
+                let eta = select(1.0 / ior, ior, thin_walled || s.front_face);
+                let cos_i = clamp(dot(n, v), 0.0, 1.0);
+                if next_f32() < fresnel_dielectric(cos_i, eta) {
+                    direction = reflect_about(v, n);
+                    origin = offset_point(s.position, ng);
+                    glass_reflected = true;
+                    glass_bent = true;
+                } else {
+                    throughput = throughput * m.base_color.rgb;
+                    if !thin_walled {
+                        let r = refract_through(v, n, 1.0 / eta);
+                        direction = select(reflect_about(v, n), r.xyz, r.w > 0.0);
+                        glass_bent = true;
+                    }
+                    origin = offset_point(s.position, -ng);
+                }
+                last_was_delta = true;
+            } else {
+                // Diffuse and glossy reflection: light sources directly with shadow rays, then a new direction from the
+                // material
+                origin = offset_point(s.position, ng);
+                surface_n = n;
+                surface_ng = ng;
+                surface_base_color = m.base_color.rgb;
+                surface_params = m.params.xyz;
+                direct = vec3<f32>(0.0);
+                shadow_ray = next_shadow_ray(0u, origin, v, n, ng, m);
+                if shadow_ray.next != NONE {
+                    continue;
+                }
+                lit = true;
+            }
+        }
+        if lit {
+            result += clamped(bounce, throughput * direct);
+            let next = sample_material(reflecting(surface_base_color, surface_params), -direction, surface_n);
+            if !next.valid || dot(next.direction, surface_ng) <= 0.0 {
                 break;
             }
             throughput = throughput * next.weight;
             last_pdf = next.pdf;
             direction = next.direction;
-            origin = p;
             last_was_delta = false;
             diffuse_seen = true;
-            diffuse_origin = p;
+            diffuse_origin = origin;
             glass_reflected = false;
             glass_bent = false;
         }
@@ -1194,8 +1305,16 @@ fn camera_ray_direction(u: f32, v: f32) -> vec3<f32> {
     return params.ortho_direction.xyz;
 }
 
+// The traversal stacks of the meshes, MESH_STACK entries for each invocation of a workgroup. In workgroup memory instead
+// of an array in each invocation: Mesa's compiler for Intel graphics of the 7th generation keeps such arrays in
+// scratch memory, of which these chips have only 12 KB per thread (the 16 KB here are the minimum WebGPU guarantees).
+const MESH_STACK: u32 = 64u;
+var<workgroup> mesh_stack: array<u32, MESH_STACK * 64u>;
+var<private> invocation: u32;
+
 @compute @workgroup_size(8, 8)
-fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
+fn trace(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_index) local_index: u32) {
+    invocation = local_index;
     if id.x >= tile.rect.z || id.y >= tile.rect.w {
         return;
     }
@@ -1205,9 +1324,9 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
     let height = params.camera.z;
     var sum = vec3<f32>(0.0);
     var luminance_squared = 0.0;
-    var albedo = vec3<f32>(0.0);
-    var normal = vec3<f32>(0.0);
-    var distance = 0.0;
+    albedo_sum = vec3<f32>(0.0);
+    normal_sum = vec3<f32>(0.0);
+    distance_sum = 0.0;
     for (var s = 0u; s < tile.samples.y; s++) {
         let sample = tile.samples.x + s;
         rng = pcg_hash(params.settings.x ^ pcg_hash(x ^ pcg_hash(y ^ pcg_hash(sample))));
@@ -1217,9 +1336,6 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
         let u = (f32(x) + next_f32()) / f32(width);
         let v = 1.0 - (f32(y) + next_f32()) / f32(height);
         let direction = camera_ray_direction(u, v);
-        first_albedo = vec3<f32>(1.0);
-        first_normal = -direction;
-        first_distance = SKY_DISTANCE;
         let l = radiance(camera_ray_origin(u, v), direction);
         // A broken sample must not spoil the pixel for good (comparisons with NaN are false)
         if all(abs(l) < vec3<f32>(BIG)) {
@@ -1227,16 +1343,13 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
             let lum = luminance(l);
             luminance_squared += lum * lum;
         }
-        albedo += first_albedo;
-        normal += first_normal;
-        distance += first_distance;
     }
     let i = y * width + x;
     if tile.samples.z == 1u {
         // Three words per pixel: color and squared luminance, albedo and distance, normal
         sums[3u * i] = sums[3u * i] + vec4<f32>(sum, luminance_squared);
-        sums[3u * i + 1u] = sums[3u * i + 1u] + vec4<f32>(albedo, distance);
-        sums[3u * i + 2u] = sums[3u * i + 2u] + vec4<f32>(normal, 0.0);
+        sums[3u * i + 1u] = sums[3u * i + 1u] + vec4<f32>(albedo_sum, distance_sum);
+        sums[3u * i + 2u] = sums[3u * i + 2u] + vec4<f32>(normal_sum, 0.0);
     } else {
         sums[i] = sums[i] + vec4<f32>(sum, luminance_squared);
     }
