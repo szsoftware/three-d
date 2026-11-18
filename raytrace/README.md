@@ -97,7 +97,7 @@ in five passes of growing reach, only between pixels with similar normals and di
 variance says the differences are noise, then multiplies the albedo back so textures stay sharp. With more samples
 the variance falls and the filter steps back by itself. `RaytracePreview` denoises by default
 (`PreviewSettings::denoiser`). In the garden at 8 samples the difference to 512 samples drops from 6.3 to 3.6 (RMSE of
-8 bit sRGB); denoising 960 × 600 takes about 0.7 s on four cores and a few milliseconds on a GPU.
+8 bit sRGB); denoising 960 × 600 takes about 0.7 s on four cores.
 
 ## Material model
 
