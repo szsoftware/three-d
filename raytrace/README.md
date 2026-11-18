@@ -40,6 +40,16 @@ film.save_exr("garden.exr")?; // linear, cd/m²
 Units are photometric: luminance in cd/m², illuminance in lux, intensity in cd. The exposure is given as EV100 like on
 a camera, about 15 for a sunny day and 7 for a lit room.
 
+## With three-d
+
+| Feature | Gives |
+| --- | --- |
+| `three-d` | `Film::to_three_d_texture` and `Film::write_to_three_d_texture`: the film as a three-d `Texture2D` (32 bit floats, upright), on any backend, to show it while samples are added |
+| `wgpu` | `RaytraceSupport::of(&context)`: `Cpu` (OpenGL, WebGL2), `Compute` (WebGPU, Vulkan, Metal, DirectX 12) or `HardwareRayQuery`; `GpuDevice::from_context` with the device and queue for GPU tracers |
+
+Textures are shared with wgpu through `Texture2D::as_wgpu` in three-d, which keeps the order of three-d's work and the
+tracer's on the queue.
+
 ## Material model
 
 `RtMaterial` is the metallic roughness model of `CpuMaterial` (GGX with height correlated Smith masking, Schlick's

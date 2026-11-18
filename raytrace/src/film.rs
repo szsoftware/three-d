@@ -114,6 +114,23 @@ impl Film {
         self.samples
     }
 
+    ///
+    /// Adds sums of samples that were traced elsewhere, for example read back from a GPU: one sum per pixel, rows from the top,
+    /// and the number of samples each sum holds.
+    ///
+    /// # Panics
+    /// If the number of sums is not the number of pixels.
+    ///
+    pub fn accumulate(&mut self, sums: &[[f32; 3]], samples: u32) {
+        assert_eq!(sums.len(), self.sum.len(), "one sum per pixel");
+        for (s, a) in self.sum.iter_mut().zip(sums) {
+            s[0] += a[0];
+            s[1] += a[1];
+            s[2] += a[2];
+        }
+        self.samples += samples;
+    }
+
     /// Average luminance (linear sRGB, cd/m²) of a pixel, x from the left and y from the top.
     pub fn pixel(&self, x: u32, y: u32) -> Vec3 {
         let s = self.sum[(y * self.width + x) as usize];

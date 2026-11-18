@@ -121,6 +121,26 @@ impl Texture2D {
         ColorTarget::new_texture2d(&self.context, self, mip_level)
     }
 
+    ///
+    /// Returns the wgpu texture behind this texture if the context uses the wgpu backend, otherwise `None`.
+    ///
+    /// Everything three-d recorded before this call is submitted to the queue first, so work the caller submits afterwards
+    /// sees it, and three-d's later work sees what the caller submitted in between. The texture may be written, for example
+    /// with [wgpu::Queue::write_texture] or by a compute shader, and three-d keeps using the new content.
+    /// The rows are upside down compared to the data of three-d: the first row in wgpu is the row three-d samples at texture
+    /// coordinate v = 1, while the first row given to [Texture2D::fill] or returned when reading is at v = 0.
+    ///
+    /// The texture has the usages `TEXTURE_BINDING`, `COPY_SRC` and `COPY_DST`, `RENDER_ATTACHMENT` where the format allows it,
+    /// and `STORAGE_BINDING` for the formats RGBA8, RGBA16F, RGBA32F and R32F when the `wgsl` feature is enabled.
+    ///
+    #[cfg(feature = "wgpu")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "wgpu")))]
+    pub fn as_wgpu(&self) -> Option<wgpu::Texture> {
+        self.context
+            .as_wgpu()
+            .map(|_| self.context.wgpu_backend().external_texture(self.id))
+    }
+
     /// The width of this texture.
     pub fn width(&self) -> u32 {
         self.width
