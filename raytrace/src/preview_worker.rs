@@ -7,6 +7,10 @@ use crate::{
     Tracer,
 };
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+/// How often the worker hands over an image at most.
+const HAND_OVER: Duration = Duration::from_millis(50);
 
 /// What the worker traces.
 #[derive(Clone)]
@@ -117,6 +121,7 @@ fn run(shared: Arc<(Mutex<State>, Condvar)>, width: u32, height: u32) {
     let mut tracer = CpuReferenceTracer::new();
     let mut image = RenderImage::with_features(width, height);
     let mut traced = 0;
+    let mut hand_over = HAND_OVER;
     loop {
         // Wait for work: a new job, or more samples for the current one
         let (generation, job) = {
@@ -142,12 +147,28 @@ fn run(shared: Arc<(Mutex<State>, Condvar)>, width: u32, height: u32) {
             max_bounces: job.max_bounces,
             ..Default::default()
         };
-        let result = tracer
-            .trace(&job.scene, &job.camera, &mut image, &settings)
-            .and_then(|()| match job.denoiser {
-                Some(mut denoiser) => denoiser.denoise(&image),
-                None => Ok(image.clone()),
-            });
+        // Samples are added until the time for a hand over has come, so the threads trace instead of waiting for the
+        // denoiser and the copy, which take as long as several samples of a small image
+        let started = Instant::now();
+        let result = loop {
+            let result = tracer.trace(&job.scene, &job.camera, &mut image, &settings);
+            let first = image.sample_count() == 1;
+            if result.is_err()
+                || first
+                || image.sample_count() >= job.max_samples
+                || started.elapsed() >= hand_over
+                || is_replaced(lock, generation)
+            {
+                break result;
+            }
+        };
+        let denoising = Instant::now();
+        let result = result.and_then(|()| match job.denoiser {
+            Some(mut denoiser) => denoiser.denoise(&image),
+            None => Ok(image.clone()),
+        });
+        // Handing over costs no more than a fifth of the time
+        hand_over = (denoising.elapsed() * 4).max(HAND_OVER);
         let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
         match result {
             Ok(shown) if state.generation == generation => {
@@ -165,4 +186,10 @@ fn run(shared: Arc<(Mutex<State>, Condvar)>, width: u32, height: u32) {
             }
         }
     }
+}
+
+/// Whether a newer job waits.
+fn is_replaced(lock: &Mutex<State>, generation: u64) -> bool {
+    let state = lock.lock().unwrap_or_else(|e| e.into_inner());
+    state.stop || state.generation != generation
 }
