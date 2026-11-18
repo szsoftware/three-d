@@ -26,18 +26,18 @@ const TWILIGHT_END: f32 = -6.0;
 #[derive(Clone, Debug)]
 pub struct Sky {
     sun: SunPosition,
-    orientation: SceneOrientation,
+    pub(crate) orientation: SceneOrientation,
     turbidity: f32,
     ground_albedo: Vec3,
     // Derived values
     sun_direction: Vec3,
     sun_illuminance: f32,
     sun_color: Vec3,
-    perez: [[f32; 5]; 3],
-    zenith: [f32; 3],
-    norm: [f32; 3],
-    sky_scale: f32,
-    ground_luminance: Vec3,
+    pub(crate) perez: [[f32; 5]; 3],
+    pub(crate) zenith: [f32; 3],
+    pub(crate) norm: [f32; 3],
+    pub(crate) sky_scale: f32,
+    pub(crate) ground_luminance: Vec3,
 }
 
 impl Sky {

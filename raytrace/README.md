@@ -1,8 +1,8 @@
 # three-d-raytrace
 
-Path tracing for three-d scenes, part of the fork. Step 1 of the plan: the scene description, a two level bounding
-volume hierarchy and a reference path tracer on the CPU. GPU tracers on the wgpu backend come next and use the same
-scene, render image and material model.
+Path tracing for three-d scenes, part of the fork: the scene description, a two level bounding volume hierarchy, a
+reference path tracer on the CPU and the same path tracer in compute shaders of three-d's wgpu backend. Both use the
+same scene, render image and material model.
 
 ```rust
 use three_d_raytrace::*;
@@ -33,7 +33,7 @@ render_image.save_exr("garden.exr")?; // linear, cd/m²
 | --- | --- | --- |
 | Scene | `RtScene`, built from `CpuMesh`, `CpuMaterial`, `CpuModel` or `RtMesh`, `RtMaterial` | no, shared by all tracers |
 | Acceleration structure | `AccelBuilder`, now `CpuBvhBuilder` → `CpuAccel` | yes: GPU buffers, wgpu `Blas`/`Tlas` later |
-| Tracer | `Tracer`, now `CpuReferenceTracer` | yes: compute shader and ray query tracers later |
+| Tracer | `Tracer`: `CpuReferenceTracer`, `ComputeTracer` (feature `wgpu`) | yes: a ray query tracer later |
 | Render image | `RenderImage` with `ToneMapping`, PNG and OpenEXR export | no |
 | Sky and sun | `Sky` (Preetham), `SunPosition` (NOAA), `GeoLocation`, `LocalDateTime`, `SceneOrientation` | no |
 
@@ -45,10 +45,31 @@ a camera, about 15 for a sunny day and 7 for a lit room.
 | Feature | Gives |
 | --- | --- |
 | `three-d` | `RenderImage::to_three_d_texture` and `RenderImage::write_to_three_d_texture`: the render image as a three-d `Texture2D` (32 bit floats, upright), on any backend, to show it while samples are added |
-| `wgpu` | `RaytraceSupport::of(&context)`: `Cpu` (OpenGL, WebGL2), `Compute` (WebGPU, Vulkan, Metal, DirectX 12) or `HardwareRayQuery`; `GpuDevice::from_context` with the device and queue for GPU tracers |
+| `wgpu` | `RaytraceSupport::of(&context)`: `Cpu` (OpenGL, WebGL2), `Compute` (WebGPU, Vulkan, Metal, DirectX 12) or `HardwareRayQuery`; `GpuDevice::from_context` with the device and queue; `ComputeTracer` and `GpuRenderImage` |
 
 Textures are shared with wgpu through `Texture2D::as_wgpu` in three-d, which keeps the order of three-d's work and the
 tracer's on the queue.
+
+## On the GPU
+
+```rust
+let mut tracer = ComputeTracer::from_context(&context).expect("compute shaders");
+let mut image = GpuRenderImage::new(tracer.gpu(), width, height);
+let texture = image.to_three_d_texture(&context);
+// Every frame while the camera stands still
+tracer.trace_gpu(&scene, &camera, &mut image, &TraceSettings::default())?;
+image.write_to_three_d_texture(&texture); // average per pixel, on the GPU
+// When the camera or the scene changes
+image.reset();
+// For export: image.read() natively, image.read_async().await in the browser
+```
+
+`ComputeTracer` runs the same paths as the CPU tracer in a WGSL compute shader. The hierarchies are built on the CPU
+and uploaded as storage buffers, again only when the scene changed. The image is traced in tiles (256 × 256 pixels by
+default, `with_tile_size`), one dispatch per tile and sample, so no dispatch runs long enough for the system to reset
+the GPU. `ComputeTracer` also implements `Tracer` and then reads every call back into a `RenderImage`, which a browser
+can not wait for. Its random numbers differ from the CPU tracer's, so the images agree in their averages, not in their
+noise.
 
 ## Material model
 
@@ -75,4 +96,10 @@ reflects E/π, a point light falls off with the square of the distance, and a pa
 through. A reference image of the garden scene is compared in blocks of 4 × 4 pixels, write it again with
 `THREE_D_WRITE_REFERENCE=1 cargo test --release -p three-d-raytrace`.
 
-The example renders the same scene: `cargo run --release -p three-d-raytrace --example garden -- 256 960 600`.
+With the `wgpu` feature, `tests/gpu.rs` runs the same physical checks with the compute tracer and compares its garden
+image with the CPU tracer's in blocks of 6 × 6 pixels; set `THREE_D_REQUIRE_WGPU=1` to fail instead of skipping without
+an adapter.
+
+The examples render the same scene: `cargo run --release -p three-d-raytrace --example garden -- 256 960 600` on the
+CPU and `cargo run --release -p three-d-raytrace --features wgpu --example garden_gpu -- 256 960 600` with the compute
+tracer.

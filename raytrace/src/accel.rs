@@ -52,6 +52,7 @@ pub struct CpuAccel {
     mesh_bounds: Vec<Bounds>,
     instances: Bvh,
     instance_revision: u64,
+    scene: u64,
 }
 
 ///
@@ -81,6 +82,13 @@ impl AccelBuilder for CpuBvhBuilder {
     }
 
     fn refit_instances(&mut self, accel: &mut CpuAccel, scene: &RtScene) -> Result<(), RtError> {
+        if accel.scene != scene.id() {
+            // Another scene: nothing can be kept
+            *accel = CpuAccel {
+                scene: scene.id(),
+                ..Default::default()
+            };
+        }
         // Meshes never change once added, so only new ones are built
         for mesh in &scene.meshes()[accel.meshes.len()..] {
             let bounds: Vec<Bounds> = mesh
@@ -114,7 +122,8 @@ impl AccelBuilder for CpuBvhBuilder {
 impl CpuAccel {
     /// Whether the structure matches the instances of the scene.
     pub fn is_up_to_date(&self, scene: &RtScene) -> bool {
-        self.meshes.len() == scene.meshes().len()
+        self.scene == scene.id()
+            && self.meshes.len() == scene.meshes().len()
             && self.instance_revision == scene.instance_revision()
     }
 
@@ -360,6 +369,31 @@ mod tests {
         builder.refit_instances(&mut accel, &scene).unwrap();
         assert!(accel.is_up_to_date(&scene));
         assert!((accel.intersect(&scene, o, d, f32::INFINITY).unwrap().t - 6.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn another_scene_is_built_again() {
+        // Two scenes with the same number of changes and meshes must not share a structure
+        let scene_at = |z: f32| {
+            let mut scene = RtScene::new();
+            let material = scene.add_material(RtMaterial::default());
+            let mut mesh = three_d_asset::TriMesh::cube();
+            mesh.transform(Mat4::from_translation(vec3(0.0, 0.0, z)))
+                .unwrap();
+            let mesh = scene.add_mesh(&mesh).unwrap();
+            scene
+                .add_instance(mesh, material, Mat4::identity())
+                .unwrap();
+            scene
+        };
+        let (a, b) = (scene_at(0.0), scene_at(3.0));
+        let mut builder = CpuBvhBuilder::default();
+        let mut accel = builder.build(&a).unwrap();
+        assert!(!accel.is_up_to_date(&b));
+        builder.refit_instances(&mut accel, &b).unwrap();
+        let o = vec3(0.0, 0.0, 10.0);
+        let d = vec3(0.0, 0.0, -1.0);
+        assert!((accel.intersect(&b, o, d, f32::INFINITY).unwrap().t - 6.0).abs() < 1e-5);
     }
 
     #[test]

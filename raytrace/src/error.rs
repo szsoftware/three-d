@@ -15,6 +15,8 @@ pub enum RtError {
     EmptyImage,
     /// Writing the image failed, the text says why.
     Export(String),
+    /// The GPU can not do what was asked, the text says why.
+    Gpu(String),
 }
 
 impl std::fmt::Display for RtError {
@@ -26,6 +28,7 @@ impl std::fmt::Display for RtError {
             RtError::UnknownInstance(id) => write!(f, "unknown instance id {id}"),
             RtError::EmptyImage => write!(f, "the render image has no pixels"),
             RtError::Export(why) => write!(f, "export failed: {why}"),
+            RtError::Gpu(why) => write!(f, "GPU: {why}"),
         }
     }
 }
