@@ -48,15 +48,19 @@ struct Node {
 }
 
 struct Vertex {
+    // w: texture coordinate u
     position: vec4<f32>,
-    // w: 1 if the mesh has vertex normals
+    // Zero if the mesh has no vertex normals, w: texture coordinate v
     normal: vec4<f32>,
+    // Zero if the mesh has no tangents
+    tangent: vec4<f32>,
 }
 
 struct Instance {
     transform: mat4x4<f32>,
     inverse: mat4x4<f32>,
-    // x: first node of the mesh hierarchy, y: first triangle of the mesh, z: material, w: 1 if not cut out
+    // x: first node of the mesh hierarchy, y: first triangle of the mesh, z: material,
+    // w: 0 cut out everywhere, 1 there, 2 cut out where the alpha of the base color texture is too low
     info: vec4<u32>,
 }
 
@@ -67,8 +71,12 @@ struct Material {
     params: vec4<f32>,
     // rgb: emitted luminance, a: index of refraction
     emission: vec4<f32>,
-    // x: 1 if thin walled
+    // x: 1 if thin walled, y: normal scale, z: alpha cutout (negative without)
     flags: vec4<f32>,
+    // Textures (NONE without): base color, metallic and roughness, normals, emission
+    textures: vec4<u32>,
+    // x: transmission texture
+    more_textures: vec4<u32>,
 }
 
 struct Light {
@@ -87,6 +95,106 @@ struct Light {
 @group(0) @binding(6) var<storage, read> materials: array<Material>;
 @group(0) @binding(7) var<storage, read> lights: array<Light>;
 @group(0) @binding(8) var<storage, read_write> sums: array<vec4<f32>>;
+// Word 0: number of textures, then four words per texture (first texel, width, height, flags), then the texels with
+// four bytes each
+@group(0) @binding(9) var<storage, read> texels: array<u32>;
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Textures (texture.rs), the first row at v = 0
+
+const TEXTURE_LINEAR: u32 = 1u;
+const TEXTURE_NEAREST: u32 = 2u;
+
+fn wrap_texel(i: i32, size: i32, mode: u32) -> i32 {
+    if mode == 2u {
+        return clamp(i, 0, size - 1);
+    }
+    if mode == 1u {
+        let m = ((i % (2 * size)) + 2 * size) % (2 * size);
+        return select(2 * size - 1 - m, m, m < size);
+    }
+    return ((i % size) + size) % size;
+}
+
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        return c / 12.92;
+    }
+    return pow((c + 0.055) / 1.055, 2.4);
+}
+
+fn fetch_texel(first: u32, width: i32, height: i32, flags: u32, x: i32, y: i32, color: bool) -> vec4<f32> {
+    let xi = wrap_texel(x, width, (flags >> 2u) & 3u);
+    let yi = wrap_texel(y, height, (flags >> 4u) & 3u);
+    let t = unpack4x8unorm(texels[first + u32(yi * width + xi)]);
+    if color && (flags & TEXTURE_LINEAR) == 0u {
+        return vec4<f32>(srgb_to_linear(t.x), srgb_to_linear(t.y), srgb_to_linear(t.z), t.w);
+    }
+    return t;
+}
+
+// The texture at uv, colors decoded from sRGB when `color` is set, white for a texture that does not exist
+fn sample_texture(id: u32, uv: vec2<f32>, color: bool) -> vec4<f32> {
+    if id >= texels[0] {
+        return vec4<f32>(1.0);
+    }
+    let h = 4u + 4u * id;
+    let first = texels[h];
+    let width = i32(texels[h + 1u]);
+    let height = i32(texels[h + 2u]);
+    let flags = texels[h + 3u];
+    let x = uv.x * f32(width);
+    let y = uv.y * f32(height);
+    if (flags & TEXTURE_NEAREST) != 0u {
+        return fetch_texel(first, width, height, flags, i32(floor(x)), i32(floor(y)), color);
+    }
+    let fx0 = floor(x - 0.5);
+    let fy0 = floor(y - 0.5);
+    let fx = x - 0.5 - fx0;
+    let fy = y - 0.5 - fy0;
+    let x0 = i32(fx0);
+    let y0 = i32(fy0);
+    let top = mix(fetch_texel(first, width, height, flags, x0, y0, color), fetch_texel(first, width, height, flags, x0 + 1, y0, color), fx);
+    let bottom = mix(fetch_texel(first, width, height, flags, x0, y0 + 1, color), fetch_texel(first, width, height, flags, x0 + 1, y0 + 1, color), fx);
+    return mix(top, bottom, fy);
+}
+
+fn uv_at(tri: vec4<u32>, u: f32, v: f32) -> vec2<f32> {
+    let a = vertices[tri.x];
+    let b = vertices[tri.y];
+    let c = vertices[tri.z];
+    let w = 1.0 - u - v;
+    return vec2<f32>(a.position.w, a.normal.w) * w + vec2<f32>(b.position.w, b.normal.w) * u + vec2<f32>(c.position.w, c.normal.w) * v;
+}
+
+// The material with its textures applied at uv
+fn material_at(m: Material, uv: vec2<f32>) -> Material {
+    var r = m;
+    if m.textures.x != NONE {
+        let c = sample_texture(m.textures.x, uv, true);
+        r.base_color = m.base_color * c;
+    }
+    if m.textures.y != NONE {
+        let s = sample_texture(m.textures.y, uv, false);
+        r.params.y = m.params.y * s.y;
+        r.params.x = m.params.x * s.z;
+    }
+    if m.textures.w != NONE {
+        r.emission = vec4<f32>(m.emission.rgb * sample_texture(m.textures.w, uv, true).rgb, m.emission.w);
+    }
+    if m.more_textures.x != NONE {
+        r.params.w = m.params.w * sample_texture(m.more_textures.x, uv, false).x;
+    }
+    return r;
+}
+
+fn is_cut_out(m: Material, uv: vec2<f32>) -> bool {
+    var alpha = m.base_color.a;
+    if m.textures.x != NONE {
+        alpha *= sample_texture(m.textures.x, uv, false).w;
+    }
+    return alpha < m.flags.z;
+}
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Random numbers: PCG with 32 bit state (no 64 bit integers in WGSL), one stream per pixel sample
@@ -172,13 +280,14 @@ fn face_normal_in_world(instance: Instance, p0: vec3<f32>, p1: vec3<f32>, p2: ve
 }
 
 // A triangle hit on a shadow ray: true if nothing passes any more
-fn shadow_hit(instance: Instance, p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f32>) -> bool {
-    let m = materials[instance.info.z];
-    let transmission = m.params.w;
-    if transmission <= 0.0 {
+fn shadow_hit(instance: Instance, tri: vec4<u32>, u: f32, v: f32, p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f32>) -> bool {
+    let raw = materials[instance.info.z];
+    if raw.params.w <= 0.0 {
         transmittance = vec3<f32>(0.0);
         return true;
     }
+    let m = material_at(raw, uv_at(tri, u, v));
+    let transmission = m.params.w;
     let cos_i = clamp(abs(dot(face_normal_in_world(instance, p0, p1, p2), shadow_direction)), 0.0, 1.0);
     let f = fresnel_dielectric(cos_i, m.emission.w);
     transmittance = transmittance * m.base_color.rgb * (transmission * (1.0 - f));
@@ -208,9 +317,9 @@ fn walk_mesh(index: u32, o: vec3<f32>, d: vec3<f32>, t_max: ptr<function, f32>, 
                 let p1 = vertices[tri.y].position.xyz;
                 let p2 = vertices[tri.z].position.xyz;
                 let r = intersect_triangle(o, d, p0, p1, p2);
-                if r.x > 0.0 && r.x < *t_max {
+                if r.x > 0.0 && r.x < *t_max && !(instance.info.w == 2u && is_cut_out(materials[instance.info.z], uv_at(tri, r.y, r.z))) {
                     if shadow {
-                        if shadow_hit(instance, p0, p1, p2) {
+                        if shadow_hit(instance, tri, r.y, r.z, p0, p1, p2) {
                             return true;
                         }
                     } else {
@@ -343,7 +452,8 @@ struct Surface {
     // Interpolated normal on the same side
     shading_normal: vec3<f32>,
     front_face: bool,
-    material: u32,
+    // The material with its textures applied
+    material: Material,
 }
 
 fn surface_at(hit: Hit, d: vec3<f32>) -> Surface {
@@ -358,7 +468,7 @@ fn surface_at(hit: Hit, d: vec3<f32>) -> Surface {
     let normal_matrix = transpose(instance.inverse);
     let face = normalize((normal_matrix * vec4<f32>(cross(v1.position.xyz - v0.position.xyz, v2.position.xyz - v0.position.xyz), 0.0)).xyz);
     var shading = face;
-    if v0.normal.w > 0.0 {
+    if dot(v0.normal.xyz, v0.normal.xyz) > 0.0 {
         let n = v0.normal.xyz * w + v1.normal.xyz * hit.u + v2.normal.xyz * hit.v;
         if dot(n, n) > 0.0 {
             shading = normalize((normal_matrix * vec4<f32>(n, 0.0)).xyz);
@@ -368,9 +478,60 @@ fn surface_at(hit: Hit, d: vec3<f32>) -> Surface {
             }
         }
     }
+    let raw = materials[instance.info.z];
+    let uv = uv_at(tri, hit.u, hit.v);
+    let material = material_at(raw, uv);
+    if raw.textures.z != NONE {
+        let frame = tangent_frame(instance, v0, v1, v2, w, hit.u, hit.v, shading);
+        if frame.valid {
+            let s = sample_texture(raw.textures.z, uv, false);
+            let nt = normalize(vec3<f32>((2.0 * s.x - 1.0) * raw.flags.y, (2.0 * s.y - 1.0) * raw.flags.y, 2.0 * s.z - 1.0));
+            let n = frame.t * nt.x + frame.b * nt.y + shading * nt.z;
+            if dot(n, n) > 0.0 {
+                shading = normalize(n);
+            }
+        }
+    }
     let front_face = dot(face, d) < 0.0;
     let side = select(-1.0, 1.0, front_face);
-    return Surface(position, face * side, shading * side, front_face, instance.info.z);
+    return Surface(position, face * side, shading * side, front_face, material);
+}
+
+struct Frame {
+    t: vec3<f32>,
+    b: vec3<f32>,
+    valid: bool,
+}
+
+// Tangent and bitangent in world space around n, as three-d uses them (tracer.rs, tangent_frame)
+fn tangent_frame(instance: Instance, v0: Vertex, v1: Vertex, v2: Vertex, w: f32, u: f32, v: f32, n: vec3<f32>) -> Frame {
+    var frame = Frame(vec3<f32>(0.0), vec3<f32>(0.0), false);
+    var tangent: vec3<f32>;
+    var sign = 1.0;
+    if v0.tangent.w != 0.0 {
+        tangent = (instance.transform * vec4<f32>(v0.tangent.xyz * w + v1.tangent.xyz * u + v2.tangent.xyz * v, 0.0)).xyz;
+        sign = select(1.0, -1.0, v0.tangent.w < 0.0);
+    } else {
+        let dp1 = v1.position.xyz - v0.position.xyz;
+        let dp2 = v2.position.xyz - v0.position.xyz;
+        let du1 = vec2<f32>(v1.position.w, v1.normal.w) - vec2<f32>(v0.position.w, v0.normal.w);
+        let du2 = vec2<f32>(v2.position.w, v2.normal.w) - vec2<f32>(v0.position.w, v0.normal.w);
+        let det = du1.x * du2.y - du2.x * du1.y;
+        if abs(det) < 1e-20 {
+            return frame;
+        }
+        tangent = (instance.transform * vec4<f32>((dp1 * du2.y - dp2 * du1.y) / det, 0.0)).xyz;
+        let along_v = (instance.transform * vec4<f32>((dp2 * du1.x - dp1 * du2.x) / det, 0.0)).xyz;
+        sign = select(-1.0, 1.0, dot(cross(n, tangent), along_v) < 0.0);
+    }
+    let t = tangent - n * dot(n, tangent);
+    if dot(t, t) <= 0.0 {
+        return frame;
+    }
+    frame.t = normalize(t);
+    frame.b = cross(n, frame.t) * sign;
+    frame.valid = true;
+    return frame;
 }
 
 fn offset_point(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
@@ -705,7 +866,7 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
             break;
         }
         let s = surface_at(hit, direction);
-        let m = materials[s.material];
+        let m = s.material;
         result += clamped(bounce, throughput * m.emission.rgb);
         if bounce >= params.camera.w {
             break;

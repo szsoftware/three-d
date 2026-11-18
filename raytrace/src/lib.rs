@@ -36,6 +36,7 @@ mod sampling;
 mod scene;
 mod sky;
 mod sun;
+mod texture;
 mod tracer;
 
 pub use accel::*;
@@ -49,9 +50,11 @@ pub use render_image::*;
 pub use scene::*;
 pub use sky::*;
 pub use sun::*;
+pub use texture::*;
 pub use tracer::*;
 
 pub use three_d_asset::prelude::*;
 pub use three_d_asset::{
-    Camera, Model as CpuModel, PbrMaterial as CpuMaterial, TriMesh as CpuMesh, Viewport,
+    Camera, Model as CpuModel, PbrMaterial as CpuMaterial, Texture2D as CpuTexture, TextureData,
+    TriMesh as CpuMesh, Viewport,
 };

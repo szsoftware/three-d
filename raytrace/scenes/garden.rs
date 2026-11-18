@@ -48,8 +48,10 @@ pub fn scene() -> RtScene {
         roughness: 0.55,
         ..Default::default()
     });
+    let paving = scene.add_texture(paving());
     let stone = scene.add_material(RtMaterial {
         base_color: vec3(0.45, 0.43, 0.40),
+        base_color_texture: Some(paving),
         roughness: 0.7,
         ..Default::default()
     });
@@ -161,6 +163,27 @@ pub fn scene() -> RtScene {
 }
 
 /// A gable roof over [-1, 1] in x and z, from height 0 to 1, ridge along x.
+/// Square paving stones of slightly different brightness with dark joints, 8 × 4 stones.
+fn paving() -> RtTexture {
+    let (stones_x, stones_y, size) = (8u32, 4u32, 16u32);
+    let (width, height) = (stones_x * size, stones_y * size);
+    let mut texels = Vec::new();
+    for y in 0..height {
+        for x in 0..width {
+            let (sx, sy) = (x / size, y / size);
+            let joint = x % size == 0 || y % size == 0;
+            let shade = if joint {
+                110
+            } else {
+                // A fixed pattern instead of random numbers, so the image is the same everywhere
+                225 + ((sx * 7 + sy * 13) % 5) as u8 * 6
+            };
+            texels.push([shade, shade, shade, 255]);
+        }
+    }
+    RtTexture::new(width, height, texels)
+}
+
 fn gable_roof() -> CpuMesh {
     let p = [
         vec3(-1.0, 0.0, 1.0),
