@@ -158,6 +158,30 @@ impl PendingRead {
         }
     }
 
+    /// Blocks until the pixels are there and writes them to the bytes, without a copy in between if the channels are the ones asked for.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wait_into(self, bytes: &mut [u8]) {
+        self.device
+            .poll(w::PollType::wait_indefinitely())
+            .expect("failed to wait for the GPU");
+        if self
+            .convert
+            .is_some_and(|(_, channels, wanted)| channels != wanted)
+        {
+            bytes.copy_from_slice(&self.finish());
+            return;
+        }
+        let data = self.buffer.slice(..).get_mapped_range();
+        for (row, tight) in data
+            .chunks_exact(self.padded)
+            .zip(bytes.chunks_exact_mut(self.unpadded))
+        {
+            tight.copy_from_slice(&row[..self.unpadded]);
+        }
+        drop(data);
+        self.buffer.unmap();
+    }
+
     /// Blocks until the pixels are there, which is not possible in a browser.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     fn wait(self) -> Vec<u8> {
@@ -175,12 +199,11 @@ impl std::future::Future for PendingRead {
         self: std::pin::Pin<&mut Self>,
         context: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Vec<u8>> {
-        // A browser maps the buffer by itself and then calls the waker, everywhere else the device has to be asked to do it
+        // A browser maps the buffer by itself and then calls the waker, everywhere else the device has to be asked to do it.
+        // That is done without waiting, so the future does not block while the graphics card works.
         #[cfg(not(target_arch = "wasm32"))]
         if !self.mapped.lock().unwrap_or_else(|e| e.into_inner()).0 {
-            self.device
-                .poll(w::PollType::wait_indefinitely())
-                .expect("failed to wait for the GPU");
+            let _ = self.device.poll(w::PollType::Poll);
         }
         let mut mapped = self.mapped.lock().unwrap_or_else(|e| e.into_inner());
         if mapped.0 {
@@ -188,6 +211,14 @@ impl std::future::Future for PendingRead {
             std::task::Poll::Ready(self.finish())
         } else {
             mapped.1 = Some(context.waker().clone());
+            // Nothing asks the device again, so the future asks to be polled again.
+            // The thread makes room first, for when it is all the executor does (as in a blocking wait).
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                drop(mapped);
+                std::thread::yield_now();
+                context.waker().wake_by_ref();
+            }
             std::task::Poll::Pending
         }
     }
@@ -832,7 +863,10 @@ impl WgpuBackend {
         let mapped = Arc::new(Mutex::new((false, None::<std::task::Waker>)));
         let shared = mapped.clone();
         buffer.slice(..).map_async(w::MapMode::Read, move |result| {
-            result.expect("failed to map the buffer for reading pixels");
+            // An error means that the read was dropped before the pixels arrived, then nobody waits for them
+            if result.is_err() {
+                return;
+            }
             let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
             shared.0 = true;
             if let Some(waker) = shared.1.take() {
@@ -1998,6 +2032,18 @@ impl BackendApi for WgpuBackend {
             unsupported("reading pixels synchronously in the browser, use the asynchronous functions like RenderTarget::read_color_async or pick_async instead");
         }
         self.start_read_pixels(source, rect, format).wait()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_pixels_into(
+        &self,
+        source: &PassTarget,
+        rect: ScissorBox,
+        format: ReadFormat,
+        bytes: &mut [u8],
+    ) {
+        self.start_read_pixels(source, rect, format)
+            .wait_into(bytes)
     }
 
     fn read_pixels_async(

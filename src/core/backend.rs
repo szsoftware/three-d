@@ -510,6 +510,16 @@ pub(crate) trait BackendApi {
     fn copy_target(&self, source: &PassTarget, destination: &PassTarget, mask: CopyMask);
     /// Reads pixels inside the rectangle, bottom row first.
     fn read_pixels(&self, source: &PassTarget, rect: ScissorBox, format: ReadFormat) -> Vec<u8>;
+    /// The same as [BackendApi::read_pixels], but the pixels are written to the given bytes, which must have the right length.
+    fn read_pixels_into(
+        &self,
+        source: &PassTarget,
+        rect: ScissorBox,
+        format: ReadFormat,
+        bytes: &mut [u8],
+    ) {
+        bytes.copy_from_slice(&self.read_pixels(source, rect, format));
+    }
     /// The same as [BackendApi::read_pixels] for backends that cannot wait for the pixels on every platform.
     /// What is read is the content of the source at the time of the call, not at the time the future is awaited.
     fn read_pixels_async(

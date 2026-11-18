@@ -740,6 +740,63 @@ fn float_textures_are_targets() {
     });
 }
 
+/// The ways to read the same pixels: as a new vector, into a slice and as a future that does not block.
+#[test]
+fn reading_into_a_slice_and_as_a_future() {
+    compare(STEP, |context| {
+        // An odd height, so that a row stays in the middle when the rows are flipped
+        let (width, height) = (6, 5);
+        let texture = Texture2D::new(
+            context,
+            &CpuTexture {
+                data: TextureData::RgbaU8(pattern(width, height, 60)),
+                width,
+                height,
+                min_filter: Interpolation::Nearest,
+                mag_filter: Interpolation::Nearest,
+                mipmap: None,
+                ..Default::default()
+            },
+        );
+        let target = texture.as_color_target(None);
+        let pixels: Vec<[u8; 4]> = target.read();
+        assert_eq!(pixels, pattern(width, height, 60));
+
+        let mut bytes = vec![0u8; (width * height * 4) as usize];
+        target.read_into::<[u8; 4]>(bytes.as_chunks_mut::<4>().0);
+        assert_eq!(bytes, pixels.as_flattened());
+
+        let part = ScissorBox {
+            x: 1,
+            y: 2,
+            width: 4,
+            height: 3,
+        };
+        let mut pixels_part = vec![[0u8; 4]; 12];
+        target.read_partially_into(part, &mut pixels_part);
+        assert_eq!(pixels_part, target.read_partially::<[u8; 4]>(part));
+
+        // The future is polled by hand: it must get ready without anything else happening, and hand out the same pixels
+        let mut future = std::pin::pin!(target.read_async::<[u8; 4]>());
+        let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+        let start = std::time::Instant::now();
+        let from_future = loop {
+            match std::future::Future::poll(future.as_mut(), &mut task) {
+                std::task::Poll::Ready(pixels) => break pixels,
+                std::task::Poll::Pending => {
+                    assert!(start.elapsed().as_secs() < 20, "the pixels never arrive");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        };
+        assert_eq!(from_future, pixels);
+        // A future that is dropped before it is ready leaves nothing behind that breaks the next read
+        drop(target.read_async::<[u8; 4]>());
+        assert_eq!(pollster::block_on(target.read_async::<[u8; 4]>()), pixels);
+        floats(pixels)
+    });
+}
+
 #[test]
 fn texture_3d() {
     // Three steps, because the software adapter of Windows interpolates between the layers a bit less exactly
