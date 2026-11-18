@@ -63,7 +63,8 @@ pub struct PreviewSettings {
     ///
     /// Longest time between two updates while the GPU traces. When three frames in a row take longer, the preview
     /// halves the GPU's resolution (down to a quarter) and, if that is not enough, goes on with the CPU, which traces
-    /// beside the frames; [RaytracePreview::availability] then says why. Weak GPUs such as Intel HD 4000 trace no
+    /// beside the frames. A frame five times longer goes at once to the resolution that would be fast enough, or to the
+    /// CPU; [RaytracePreview::availability] then says why. Weak GPUs such as Intel HD 4000 trace no
     /// faster than four CPU cores and would hold up every frame. `None` keeps the GPU at `gpu_downscale`. Not in
     /// browsers, which have no clock for it here.
     ///
@@ -188,18 +189,30 @@ struct Pace {
     slow: u32,
 }
 
-/// Frames after a new engine that do not count, while shaders compile.
+/// Frames after a new engine that do not count, while its buffers are made.
 #[cfg_attr(
     not(all(feature = "wgpu", not(target_arch = "wasm32"))),
     allow(dead_code)
 )]
-const WARM_UP_FRAMES: u32 = 3;
+const WARM_UP_FRAMES: u32 = 1;
 /// Slow frames in a row before the preview gets lighter.
 #[cfg_attr(
     not(all(feature = "wgpu", not(target_arch = "wasm32"))),
     allow(dead_code)
 )]
 const SLOW_FRAMES: u32 = 3;
+/// A frame this many times slower than the limit makes the preview lighter at once.
+#[cfg_attr(
+    not(all(feature = "wgpu", not(target_arch = "wasm32"))),
+    allow(dead_code)
+)]
+const FAR_TOO_SLOW: u32 = 5;
+/// The lowest GPU resolution before the CPU, as a divisor of width and height.
+#[cfg_attr(
+    not(all(feature = "wgpu", not(target_arch = "wasm32"))),
+    allow(dead_code)
+)]
+const MAX_GPU_DOWNSCALE: u32 = 4;
 
 impl RaytracePreview {
     ///
@@ -592,7 +605,9 @@ impl RaytracePreview {
 
     ///
     /// Watches the time between frames while the GPU traces and makes the preview lighter after
-    /// [SLOW_FRAMES] slow frames in a row: half the resolution, down to a quarter, then the CPU. Returns whether it did.
+    /// [SLOW_FRAMES] slow frames in a row: half the resolution, down to a quarter, then the CPU. A frame [FAR_TOO_SLOW]
+    /// times slower than the limit goes at once to the resolution that would be fast enough, or to the CPU. Returns
+    /// whether it did.
     ///
     #[cfg(feature = "wgpu")]
     fn pace_gpu(&mut self) -> bool {
@@ -615,17 +630,32 @@ impl RaytracePreview {
                 Some(interval) if interval > limit => self.pace.slow += 1,
                 _ => self.pace.slow = 0,
             }
-            if self.pace.slow < SLOW_FRAMES {
+            let Some(interval) = interval.filter(|_| self.pace.slow > 0) else {
+                return false;
+            };
+            // Far too slow: at once to the resolution that would be fast enough, the time goes with the pixels
+            let far_too_slow = interval > limit * FAR_TOO_SLOW;
+            if self.pace.slow < SLOW_FRAMES && !far_too_slow {
                 return false;
             }
-            let interval = interval.expect("slow frames have an interval");
-            if self.gpu_scale < 4 {
-                self.gpu_scale *= 2;
+            let mut scale = self.gpu_scale * 2;
+            if far_too_slow {
+                let pixels = interval.as_secs_f32() / limit.as_secs_f32();
+                while scale <= MAX_GPU_DOWNSCALE
+                    && pixels * (self.gpu_scale as f32 / scale as f32).powi(2) > 1.0
+                {
+                    scale *= 2;
+                }
+            }
+            if scale <= MAX_GPU_DOWNSCALE {
+                self.gpu_scale = scale;
             } else {
                 self.availability = PreviewAvailability::CpuOnly(format!(
-                    "The GPU needs {} ms per frame even at a quarter of the resolution, so ray tracing runs on the \
-                     CPU beside the frames.",
-                    interval.as_millis()
+                    "The GPU needs {} ms per frame at 1/{} of the resolution, too slow even at 1/{}, so ray tracing \
+                     runs on the CPU beside the frames.",
+                    interval.as_millis(),
+                    self.gpu_scale,
+                    MAX_GPU_DOWNSCALE
                 ));
             }
             self.rebuild();

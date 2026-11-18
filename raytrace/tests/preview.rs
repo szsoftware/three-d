@@ -278,7 +278,7 @@ fn a_slow_gpu_gets_a_lighter_preview() {
     if preview.kind() != TracerKind::Compute {
         return;
     }
-    // Every frame is too slow for this limit: half, quarter resolution, then the CPU
+    // Every frame is far too slow for this limit: at once to the CPU
     preview.set_settings(PreviewSettings {
         gpu_frame_time: Some(std::time::Duration::from_nanos(1)),
         cpu_in_background: false,
@@ -297,13 +297,13 @@ fn a_slow_gpu_gets_a_lighter_preview() {
         }
     }
     finish(&context);
-    assert_eq!(scales, [1, 2, 4]);
+    assert_eq!(scales, [1]);
     // The texture is smaller than the viewport, resizing to the viewport keeps the CPU
     preview.resize(64, 32);
     assert_eq!(preview.kind(), TracerKind::CpuReference);
     assert_eq!(preview.kind(), TracerKind::CpuReference);
     assert!(
-        matches!(preview.availability(), PreviewAvailability::CpuOnly(why) if why.contains("quarter"))
+        matches!(preview.availability(), PreviewAvailability::CpuOnly(why) if why.contains("1/4"))
     );
 }
 
