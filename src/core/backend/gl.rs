@@ -630,17 +630,18 @@ struct PendingRead {
     context: Arc<crate::context::Context>,
     /// `None` when the pixels have been handed out.
     resources: Option<(crate::context::Buffer, crate::context::Fence)>,
-    size: usize,
+    /// Where the pixels go.
+    storage: Option<Box<dyn PixelStorage>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl std::future::Future for PendingRead {
-    type Output = Vec<u8>;
+    type Output = Box<dyn PixelStorage>;
 
     fn poll(
         mut self: std::pin::Pin<&mut Self>,
         task: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Vec<u8>> {
+    ) -> std::task::Poll<Self::Output> {
         let (buffer, fence) = self
             .resources
             .expect("the pixels have already been handed out");
@@ -655,23 +656,27 @@ impl std::future::Future for PendingRead {
                 return std::task::Poll::Pending;
             }
             // Also if waiting failed: reading the buffer then waits for the card itself
-            let mut bytes = vec![0u8; self.size];
+            let mut storage = self
+                .storage
+                .take()
+                .expect("the pixels have already been handed out");
+            let bytes = storage.bytes();
             context.bind_buffer(crate::context::PIXEL_PACK_BUFFER, Some(buffer));
             let mapped = context.map_buffer_range(
                 crate::context::PIXEL_PACK_BUFFER,
                 0,
-                self.size as i32,
+                bytes.len() as i32,
                 crate::context::MAP_READ_BIT,
             );
             if !mapped.is_null() {
-                std::ptr::copy_nonoverlapping(mapped, bytes.as_mut_ptr(), self.size);
+                std::ptr::copy_nonoverlapping(mapped, bytes.as_mut_ptr(), bytes.len());
             }
             context.unmap_buffer(crate::context::PIXEL_PACK_BUFFER);
             context.bind_buffer(crate::context::PIXEL_PACK_BUFFER, None);
             self.resources = None;
             context.delete_buffer(buffer);
             context.delete_sync(fence);
-            std::task::Poll::Ready(bytes)
+            std::task::Poll::Ready(storage)
         }
     }
 }
@@ -1203,6 +1208,29 @@ impl BackendApi for GlBackend {
         rect: ScissorBox,
         format: ReadFormat,
     ) -> PixelsFuture {
+        let pixels = self.read_pixels_async_into(
+            source,
+            rect,
+            format,
+            Box::new(vec![0u8; read_size(rect, format)]),
+        );
+        Box::pin(async move {
+            *pixels
+                .await
+                .into_any()
+                .downcast::<Vec<u8>>()
+                .expect("the memory that was handed in")
+        })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn read_pixels_async_into(
+        &self,
+        source: &PassTarget,
+        rect: ScissorBox,
+        format: ReadFormat,
+        mut storage: Box<dyn PixelStorage>,
+    ) -> StorageFuture {
         // The pixels are copied into a buffer of the graphics card, which does not wait for the card to finish drawing.
         // The fence tells when the card is done, then the buffer is read without waiting.
         let size = read_size(rect, format);
@@ -1229,10 +1257,11 @@ impl BackendApi for GlBackend {
                 .expect("Failed creating a fence for reading pixels");
             // Otherwise the card may not start before the future is polled
             context.flush();
+            assert_eq!(storage.bytes().len(), size);
             Box::pin(PendingRead {
                 context: self.context.clone(),
                 resources: Some((buffer, fence)),
-                size,
+                storage: Some(storage),
             })
         }
     }

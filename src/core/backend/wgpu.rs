@@ -158,12 +158,17 @@ impl PendingRead {
         }
     }
 
-    /// Blocks until the pixels are there and writes them to the bytes, without a copy in between if the channels are the ones asked for.
+    /// Blocks until the pixels are there and writes them to the bytes.
     #[cfg(not(target_arch = "wasm32"))]
     fn wait_into(self, bytes: &mut [u8]) {
         self.device
             .poll(w::PollType::wait_indefinitely())
             .expect("failed to wait for the GPU");
+        self.finish_into(bytes);
+    }
+
+    /// Writes the pixels to the bytes, without a copy in between if the channels are the ones asked for. The buffer must be mapped.
+    fn finish_into(&self, bytes: &mut [u8]) {
         if self
             .convert
             .is_some_and(|(_, channels, wanted)| channels != wanted)
@@ -192,13 +197,9 @@ impl PendingRead {
     }
 }
 
-impl std::future::Future for PendingRead {
-    type Output = Vec<u8>;
-
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        context: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Vec<u8>> {
+impl PendingRead {
+    /// Asks whether the pixels are there, without waiting for them.
+    fn poll_mapped(&self, context: &mut std::task::Context<'_>) -> std::task::Poll<()> {
         // A browser maps the buffer by itself and then calls the waker, everywhere else the device has to be asked to do it.
         // That is done without waiting, so the future does not block while the graphics card works.
         #[cfg(not(target_arch = "wasm32"))]
@@ -207,8 +208,7 @@ impl std::future::Future for PendingRead {
         }
         let mut mapped = self.mapped.lock().unwrap_or_else(|e| e.into_inner());
         if mapped.0 {
-            drop(mapped);
-            std::task::Poll::Ready(self.finish())
+            std::task::Poll::Ready(())
         } else {
             mapped.1 = Some(context.waker().clone());
             // Nothing asks the device again, so the future asks to be polled again.
@@ -221,6 +221,17 @@ impl std::future::Future for PendingRead {
             }
             std::task::Poll::Pending
         }
+    }
+}
+
+impl std::future::Future for PendingRead {
+    type Output = Vec<u8>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Vec<u8>> {
+        self.poll_mapped(context).map(|()| self.finish())
     }
 }
 
@@ -2044,6 +2055,26 @@ impl BackendApi for WgpuBackend {
     ) {
         self.start_read_pixels(source, rect, format)
             .wait_into(bytes)
+    }
+
+    fn read_pixels_async_into(
+        &self,
+        source: &PassTarget,
+        rect: ScissorBox,
+        format: ReadFormat,
+        storage: Box<dyn PixelStorage>,
+    ) -> StorageFuture {
+        let read = self.start_read_pixels(source, rect, format);
+        let mut storage = Some(storage);
+        Box::pin(std::future::poll_fn(move |context| {
+            read.poll_mapped(context).map(|()| {
+                let mut storage = storage
+                    .take()
+                    .expect("the pixels have already been handed out");
+                read.finish_into(storage.bytes());
+                storage
+            })
+        }))
     }
 
     fn read_pixels_async(

@@ -188,6 +188,30 @@ impl<'a> ColorTarget<'a> {
     }
 
     ///
+    /// Reads the colors of the pixels in this color target into the given vector and hands it back when the pixels are in it,
+    /// see [RenderTarget::read_color_into_async].
+    ///
+    pub fn read_into_async<T: TextureDataType + 'static>(
+        &self,
+        pixels: Vec<T>,
+    ) -> impl std::future::Future<Output = Vec<T>> + 'static {
+        self.read_partially_into_async(self.scissor_box(), pixels)
+    }
+
+    ///
+    /// Reads the colors of the pixels in this color target inside the given scissor box into the given vector
+    /// and hands it back when the pixels are in it, see [RenderTarget::read_color_into_async].
+    ///
+    pub fn read_partially_into_async<T: TextureDataType + 'static>(
+        &self,
+        scissor_box: ScissorBox,
+        pixels: Vec<T>,
+    ) -> impl std::future::Future<Output = Vec<T>> + 'static {
+        self.as_render_target()
+            .read_color_partially_into_async(scissor_box, pixels)
+    }
+
+    ///
     /// Returns the width of the color target in texels.
     /// If using the zero mip level of the underlying texture, then this is simply the width of that texture, otherwise it is the width of the given mip level.
     ///

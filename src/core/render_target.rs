@@ -290,6 +290,68 @@ impl<'a> RenderTarget<'a> {
     }
 
     ///
+    /// Reads the colors of the pixels in this render target into the given vector like [RenderTarget::read_color_into],
+    /// but as a future that hands the vector back when the pixels are in it, see [RenderTarget::read_color_async].
+    /// The vector is resized to the number of pixels, so with a vector that has been filled before, no memory is allocated.
+    /// To read every frame without waiting for the pixels, keep a few vectors and hand the one of a finished future to the next read.
+    ///
+    pub fn read_color_into_async<T: TextureDataType + 'static>(
+        &self,
+        pixels: Vec<T>,
+    ) -> impl std::future::Future<Output = Vec<T>> + 'static {
+        self.read_color_partially_into_async(self.scissor_box(), pixels)
+    }
+
+    ///
+    /// Reads the colors of the pixels in this render target inside the given scissor box into the given vector
+    /// like [RenderTarget::read_color_partially_into], but as a future, see [RenderTarget::read_color_into_async].
+    ///
+    pub fn read_color_partially_into_async<T: TextureDataType + 'static>(
+        &self,
+        scissor_box: ScissorBox,
+        mut pixels: Vec<T>,
+    ) -> impl std::future::Future<Output = Vec<T>> + 'static {
+        if self.id.is_some() && self.color.is_none() {
+            panic!("Cannot read color from a render target without a color target");
+        }
+        #[cfg(target_arch = "wasm32")]
+        if self.context.as_gl().is_some()
+            && (T::size() != 4
+                || !(T::primitive_type() == backend::PrimitiveType::U8
+                    || T::primitive_type() == backend::PrimitiveType::F32))
+        {
+            panic!("Only the texture data types `Vec4<T>` and `[T; 4]` where `T` is either `u8` or `f32` are supported when reading color from a render target on web.");
+        }
+        let count = scissor_box.width as usize * scissor_box.height as usize;
+        if pixels.len() != count {
+            pixels.clear();
+            pixels.extend_from_slice(from_byte_slice(&vec![
+                0u8;
+                count * std::mem::size_of::<T>()
+            ]));
+        }
+        let storage = self.context.backend().read_pixels_async_into(
+            &self.pass_target(),
+            scissor_box,
+            backend::ReadFormat::Color(backend::ColorFormat::of::<T>()),
+            Box::new(pixels),
+        );
+        async move {
+            let mut pixels = *storage
+                .await
+                .into_any()
+                .downcast::<Vec<T>>()
+                .expect("the vector that was handed in");
+            flip_y(
+                &mut pixels,
+                scissor_box.width as usize,
+                scissor_box.height as usize,
+            );
+            pixels
+        }
+    }
+
+    ///
     /// Returns the depth values in this render target.
     ///
     #[cfg(not(target_arch = "wasm32"))]

@@ -793,6 +793,19 @@ fn reading_into_a_slice_and_as_a_future() {
         // A future that is dropped before it is ready leaves nothing behind that breaks the next read
         drop(target.read_async::<[u8; 4]>());
         assert_eq!(pollster::block_on(target.read_async::<[u8; 4]>()), pixels);
+
+        // A future that fills a vector hands back the same memory, whether the vector has the right length or not
+        let reused = pollster::block_on(target.read_into_async(Vec::<[u8; 4]>::with_capacity(64)));
+        assert_eq!(reused, pixels);
+        let memory = reused.as_ptr();
+        // Two reads are on their way at the same time, as when every frame is read without waiting
+        let first = target.read_into_async(reused);
+        let second = target.read_partially_into_async(part, vec![[7u8; 4]; 3]);
+        drop(target.read_into_async(vec![[0u8; 4]; 30]));
+        let reused = pollster::block_on(first);
+        assert_eq!(reused, pixels);
+        assert_eq!(reused.as_ptr(), memory);
+        assert_eq!(pollster::block_on(second), pixels_part);
         floats(pixels)
     });
 }
