@@ -20,6 +20,15 @@ fn context() -> Option<Context> {
     }
 }
 
+/// Waits for the GPU, so dropping the context does not time out on slow adapters such as WARP.
+fn finish(context: &Context) {
+    if let Some(gpu) = GpuDevice::from_context(context) {
+        let _ = gpu
+            .device
+            .poll(three_d::wgpu::PollType::wait_indefinitely());
+    }
+}
+
 fn sky_only(luminance: f32) -> RtScene {
     let mut scene = RtScene::new();
     scene.set_environment(RtEnvironment::Uniform {
@@ -100,6 +109,7 @@ fn preview_gets_finer_and_starts_again() {
             TracerKind::Compute
         );
     }
+    finish(&context);
 }
 
 #[test]
@@ -137,4 +147,5 @@ fn preview_shows_the_tone_mapped_image() {
             }
         }
     }
+    finish(&context);
 }
