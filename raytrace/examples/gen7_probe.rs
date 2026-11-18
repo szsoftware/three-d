@@ -41,10 +41,17 @@ fn main() {
         ..Default::default()
     };
     let start = std::time::Instant::now();
-    for _ in 0..calls {
+    let sync = std::env::var("PROBE_SYNC").is_ok();
+    for call in 0..calls {
+        let t = std::time::Instant::now();
         tracer
             .trace_gpu(&scene, &camera, &mut image, &settings)
             .unwrap();
+        if sync {
+            // Waits for the GPU
+            let _ = image.read();
+            println!("call {call}: {:.2?}", t.elapsed());
+        }
     }
     let render_image = image.read();
     let elapsed = start.elapsed();

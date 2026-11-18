@@ -4,7 +4,7 @@
 # Every case runs in its own process with a time limit; a GPU hang only ends that process.
 # Scratch per thread on Ivy Bridge (Mesa 26.0.8): base 11 KB, nogather 10 KB, noshadow 4 KB, primary 2 KB.
 set -u
-cargo build --release -p three-d-raytrace --features wgpu --example gen7_probe || exit 1
+cargo build --release -p three-d-raytrace --features wgpu,three-d/wgpu-gl --example gen7_probe || exit 1
 bin=target/release/examples/gen7_probe
 dir=raytrace/examples/gen7
 hangs() { (dmesg 2>/dev/null || journalctl -k -b --no-pager 2>/dev/null) | grep -ciE "gpu hang|context reset"; }
