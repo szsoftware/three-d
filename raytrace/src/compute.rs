@@ -97,7 +97,7 @@ impl ComputeTracer {
         });
         let module = device.create_shader_module(w::ShaderModuleDescriptor {
             label: Some("ray tracing"),
-            source: w::ShaderSource::Wgsl(include_str!("compute/trace.wgsl").into()),
+            source: w::ShaderSource::Wgsl(trace_source()),
         });
         let pipeline_layout = device.create_pipeline_layout(&w::PipelineLayoutDescriptor {
             label: Some("ray tracing"),
@@ -1516,6 +1516,16 @@ fn params_bytes(
         None => (0..16).for_each(|_| p.f(0.0)),
     }
     p.bytes()
+}
+
+/// The tracer shader. DIAGNOSIS ONLY (experiment branch): THREE_D_RAYTRACE_TRACE_WGSL names a file to load instead.
+fn trace_source() -> std::borrow::Cow<'static, str> {
+    match std::env::var("THREE_D_RAYTRACE_TRACE_WGSL") {
+        Ok(path) => std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{path}: {e}"))
+            .into(),
+        Err(_) => include_str!("compute/trace.wgsl").into(),
+    }
 }
 
 #[cfg(test)]

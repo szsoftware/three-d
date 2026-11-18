@@ -33,3 +33,7 @@ three-d = { path = "..", default-features = false, features = ["headless-gl"] }
 [[example]]
 name = "garden_gpu"
 required-features = ["wgpu"]
+
+[[example]]
+name = "gen7_probe"
+required-features = ["wgpu"]
