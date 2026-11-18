@@ -19,7 +19,7 @@ pub enum RaytraceSupport {
     HardwareRayQuery,
 }
 
-/// Storage buffers a compute tracer binds at once: nodes and indices of both levels, triangles, instances, materials.
+/// Storage buffers the compute tracer binds at once: nodes, triangles, vertices, instances, materials, lights and sums.
 const STORAGE_BUFFERS_NEEDED: u32 = 7;
 
 impl RaytraceSupport {

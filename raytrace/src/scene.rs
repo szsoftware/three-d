@@ -252,8 +252,10 @@ impl Default for RtEnvironment {
 /// can share a mesh, which keeps vegetation and repeated parts small. Changing a transform only rebuilds the top level
 /// of the acceleration structure.
 ///
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct RtScene {
+    /// Tells scenes apart for the acceleration structures, a clone shares its meshes and keeps it
+    id: u64,
     meshes: Vec<RtMesh>,
     materials: Vec<RtMaterial>,
     instances: Vec<RtInstance>,
@@ -263,10 +265,36 @@ pub struct RtScene {
     revision: u64,
 }
 
+impl Default for RtScene {
+    fn default() -> Self {
+        Self {
+            id: next_revision(),
+            meshes: Vec::new(),
+            materials: Vec::new(),
+            instances: Vec::new(),
+            lights: Vec::new(),
+            environment: RtEnvironment::default(),
+            instance_revision: 0,
+            revision: 0,
+        }
+    }
+}
+
+/// Revisions and ids count across all scenes.
+fn next_revision() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl RtScene {
     /// An empty scene without light.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Meshes are only added, so a structure built for a scene with this id can be brought up to date.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
     ///
@@ -322,14 +350,14 @@ impl RtScene {
     /// Adds a mesh that is already in the tracer's own format.
     pub fn add_rt_mesh(&mut self, mesh: RtMesh) -> MeshId {
         self.meshes.push(mesh);
-        self.revision += 1;
+        self.revision = next_revision();
         MeshId(self.meshes.len() as u32 - 1)
     }
 
     /// Adds a material, either an [RtMaterial] or a [PbrMaterial](three_d_asset::PbrMaterial) (`CpuMaterial` in three-d).
     pub fn add_material(&mut self, material: impl Into<RtMaterial>) -> MaterialId {
         self.materials.push(material.into());
-        self.revision += 1;
+        self.revision = next_revision();
         MaterialId(self.materials.len() as u32 - 1)
     }
 
@@ -381,7 +409,7 @@ impl RtScene {
             .get_mut(id.0 as usize)
             .ok_or(RtError::UnknownInstance(id.0))?
             .material = material;
-        self.revision += 1;
+        self.revision = next_revision();
         Ok(())
     }
 
@@ -395,26 +423,26 @@ impl RtScene {
             .materials
             .get_mut(id.0 as usize)
             .ok_or(RtError::UnknownMaterial(id.0))? = material.into();
-        self.revision += 1;
+        self.revision = next_revision();
         Ok(())
     }
 
     /// Adds a light.
     pub fn add_light(&mut self, light: RtLight) {
         self.lights.push(light);
-        self.revision += 1;
+        self.revision = next_revision();
     }
 
     /// Removes all lights added with [RtScene::add_light].
     pub fn clear_lights(&mut self) {
         self.lights.clear();
-        self.revision += 1;
+        self.revision = next_revision();
     }
 
     /// Sets the light from outside the scene, for example a [Sky].
     pub fn set_environment(&mut self, environment: RtEnvironment) {
         self.environment = environment;
-        self.revision += 1;
+        self.revision = next_revision();
     }
 
     /// The meshes.
@@ -443,7 +471,8 @@ impl RtScene {
     }
 
     ///
-    /// Grows with every change of the scene. A render image showing the scene has to be reset when it changes.
+    /// Grows with every change of the scene, and no two scenes share a revision once they were changed, so a tracer
+    /// notices when it is given another scene. A render image showing the scene has to be reset when it changes.
     ///
     pub fn revision(&self) -> u64 {
         self.revision
@@ -455,8 +484,8 @@ impl RtScene {
     }
 
     fn touch_instances(&mut self) {
-        self.instance_revision += 1;
-        self.revision += 1;
+        self.instance_revision = next_revision();
+        self.revision = next_revision();
     }
 }
 

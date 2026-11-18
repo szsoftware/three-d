@@ -54,8 +54,9 @@ impl Default for TraceSettings {
 ///
 /// Adds samples of a scene, seen by a camera, to a render image.
 ///
-/// Implementations: [CpuReferenceTracer] now; compute shader and ray query tracers on the wgpu backend later. The
-/// shading is the same in all of them, they differ in how rays find the triangles they hit.
+/// Implementations: [CpuReferenceTracer] on any platform, `ComputeTracer` in compute shaders of the wgpu backend
+/// (feature `wgpu`), a ray query tracer later. The shading is the same in all of them, they differ in how rays find the
+/// triangles they hit.
 ///
 pub trait Tracer {
     /// What this tracer runs on.

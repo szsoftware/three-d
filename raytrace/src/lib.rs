@@ -9,7 +9,8 @@
 //! - [AccelBuilder] builds the acceleration structure, here a two level bounding volume hierarchy on the CPU
 //!   ([CpuBvhBuilder]): one hierarchy per mesh and one over the instances, so instanced vegetation stays small.
 //! - [Tracer] adds samples to a [RenderImage]. The [CpuReferenceTracer] runs on any platform without a GPU and is the reference
-//!   the GPU tracers of the wgpu backend are compared against.
+//!   the GPU tracers of the wgpu backend are compared against. With the `wgpu` feature, `ComputeTracer` traces in compute
+//!   shaders into a `GpuRenderImage` that stays on the GPU.
 //! - [RenderImage] collects the samples and turns them into an image with a [ToneMapping].
 //! - With the `three-d` feature, [RenderImage::to_three_d_texture] shows the render image with three-d on any backend. With the `wgpu`
 //!   feature, [RaytraceSupport] tells what a context can run and [GpuDevice] hands its device to GPU tracers.
@@ -23,6 +24,8 @@
 
 mod accel;
 mod bvh;
+#[cfg(feature = "wgpu")]
+mod compute;
 #[cfg(feature = "three-d")]
 mod display;
 mod error;
@@ -37,6 +40,8 @@ mod tracer;
 
 pub use accel::*;
 pub use bvh::{Bvh, BvhNode};
+#[cfg(feature = "wgpu")]
+pub use compute::*;
 pub use error::*;
 #[cfg(feature = "wgpu")]
 pub use gpu::*;
