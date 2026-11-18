@@ -56,6 +56,13 @@ jobs:
         with:
           command: clippy
 
+      # The ray tracing crate of the fork (raytrace/), its tests run on the CPU and need no graphics driver
+      - name: Clippy ray tracing
+        run: cargo clippy -p three-d-raytrace --all-targets
+
+      - name: Test ray tracing
+        run: cargo test -p three-d-raytrace
+
       # Software drivers for Vulkan and OpenGL (through EGL), so that the tests of the wgpu backend run without a GPU and compare it with the OpenGL backend
       - if: startsWith(matrix.os, 'ubuntu')
         run: sudo apt-get install -y mesa-vulkan-drivers libegl1 libegl-mesa0 libgl1-mesa-dri && echo "THREE_D_EXPECT_BACKEND=vulkan" >> $GITHUB_ENV
@@ -131,6 +138,9 @@ jobs:
           profile: minimal
           toolchain: stable
           override: true
+
+      - name: Check ray tracing for the web
+        run: rustup target add wasm32-unknown-unknown && cargo check -p three-d-raytrace --target wasm32-unknown-unknown
 
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh

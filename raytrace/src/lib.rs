@@ -1,0 +1,44 @@
+//!
+//! Path tracing for [three-d](https://github.com/asny/three-d) scenes.
+//!
+//! The crate is built from parts with their own interfaces, so that tracers for other hardware can replace each other
+//! without changing the scene or how the result is shown:
+//!
+//! - [RtScene] holds meshes, materials, instances, lights and the environment. It is built from the same CPU data as the
+//!   raster view ([CpuMesh], [CpuMaterial], [CpuModel]) and knows nothing about any backend.
+//! - [AccelBuilder] builds the acceleration structure, here a two level bounding volume hierarchy on the CPU
+//!   ([CpuBvhBuilder]): one hierarchy per mesh and one over the instances, so instanced vegetation stays small.
+//! - [Tracer] adds samples to a [Film]. The [CpuReferenceTracer] runs on any platform without a GPU and is the reference
+//!   the GPU tracers of the wgpu backend are compared against.
+//! - [Film] collects the samples and turns them into an image with a [ToneMapping].
+//! - [Sky] is a daylight sky with the sun at the position for a place, date and time ([GeoLocation], [LocalDateTime]).
+//!
+//! Units are photometric: luminance in cd/m², illuminance in lux and luminous intensity in cd. The exposure of the
+//! [ToneMapping] is given as EV100 like on a camera, about 15 for a sunny day and 7 for a lit room.
+//!
+
+#![warn(missing_docs)]
+
+mod accel;
+mod bvh;
+mod error;
+mod film;
+mod sampling;
+mod scene;
+mod sky;
+mod sun;
+mod tracer;
+
+pub use accel::*;
+pub use bvh::{Bvh, BvhNode};
+pub use error::*;
+pub use film::*;
+pub use scene::*;
+pub use sky::*;
+pub use sun::*;
+pub use tracer::*;
+
+pub use three_d_asset::prelude::*;
+pub use three_d_asset::{
+    Camera, Model as CpuModel, PbrMaterial as CpuMaterial, TriMesh as CpuMesh, Viewport,
+};
