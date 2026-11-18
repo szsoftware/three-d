@@ -48,10 +48,7 @@ impl RtMesh {
                         indices.len()
                     )));
                 }
-                indices
-                    .chunks_exact(3)
-                    .map(|t| [t[0], t[1], t[2]])
-                    .collect()
+                indices.as_chunks::<3>().0.to_vec()
             }
             None => {
                 if !count.is_multiple_of(3) {
