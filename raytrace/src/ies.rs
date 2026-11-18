@@ -235,6 +235,7 @@ impl IesProfile {
     }
 
     /// The table, rows of [VERTICAL_STEPS] values, and the number of rows.
+    #[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
     pub(crate) fn table(&self) -> (&[f32], usize) {
         (&self.table, self.horizontal_steps)
     }

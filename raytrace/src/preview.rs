@@ -58,6 +58,16 @@ impl PreviewAvailability {
 pub struct PreviewSettings {
     /// Samples added per call of [RaytracePreview::update] on the GPU.
     pub gpu_samples_per_frame: u32,
+    /// The GPU traces at width and height divided by this, at first; see `gpu_frame_time`.
+    pub gpu_downscale: u32,
+    ///
+    /// Longest time between two updates while the GPU traces. When three frames in a row take longer, the preview
+    /// halves the GPU's resolution (down to a quarter) and, if that is not enough, goes on with the CPU, which traces
+    /// beside the frames; [RaytracePreview::availability] then says why. Weak GPUs such as Intel HD 4000 trace no
+    /// faster than four CPU cores and would hold up every frame. `None` keeps the GPU at `gpu_downscale`. Not in
+    /// browsers, which have no clock for it here.
+    ///
+    pub gpu_frame_time: Option<std::time::Duration>,
     /// The CPU traces at width and height divided by this.
     pub cpu_downscale: u32,
     ///
@@ -89,6 +99,8 @@ impl Default for PreviewSettings {
     fn default() -> Self {
         Self {
             gpu_samples_per_frame: 1,
+            gpu_downscale: 1,
+            gpu_frame_time: Some(std::time::Duration::from_millis(40)),
             cpu_downscale: 4,
             cpu_in_background: true,
             max_samples: 1024,
@@ -148,7 +160,37 @@ pub struct RaytracePreview {
     /// What the samples were traced for: camera matrices and viewport, scene and revision
     traced_for: Option<(Vec<f32>, u64, u64)>,
     settings: PreviewSettings,
+    /// What the GPU's resolution is divided by now
+    gpu_scale: u32,
+    pace: Pace,
 }
+
+/// Times of the frames while the GPU traces.
+#[derive(Default)]
+#[cfg_attr(
+    not(all(feature = "wgpu", not(target_arch = "wasm32"))),
+    allow(dead_code)
+)]
+struct Pace {
+    #[cfg(not(target_arch = "wasm32"))]
+    last: Option<std::time::Instant>,
+    /// Frames since the engine was made; the first ones wait for shaders to compile
+    frames: u32,
+    slow: u32,
+}
+
+/// Frames after a new engine that do not count, while shaders compile.
+#[cfg_attr(
+    not(all(feature = "wgpu", not(target_arch = "wasm32"))),
+    allow(dead_code)
+)]
+const WARM_UP_FRAMES: u32 = 3;
+/// Slow frames in a row before the preview gets lighter.
+#[cfg_attr(
+    not(all(feature = "wgpu", not(target_arch = "wasm32"))),
+    allow(dead_code)
+)]
+const SLOW_FRAMES: u32 = 3;
 
 impl RaytracePreview {
     /// A preview of the given size, on the GPU where the context can, see [PreviewAvailability::of].
@@ -173,7 +215,9 @@ impl RaytracePreview {
         availability: PreviewAvailability,
     ) -> Self {
         let settings = PreviewSettings::default();
-        let (engine, texture) = Self::engine(context, &availability, width, height, &settings);
+        let gpu_scale = settings.gpu_downscale.max(1);
+        let (engine, texture) =
+            Self::engine(context, &availability, width, height, &settings, gpu_scale);
         Self {
             context: context.clone(),
             availability,
@@ -183,6 +227,8 @@ impl RaytracePreview {
             height,
             traced_for: None,
             settings,
+            gpu_scale,
+            pace: Pace::default(),
         }
     }
 
@@ -192,13 +238,14 @@ impl RaytracePreview {
         width: u32,
         height: u32,
         settings: &PreviewSettings,
+        #[allow(unused_variables)] gpu_scale: u32,
     ) -> (Engine, Texture2D) {
         #[cfg(feature = "wgpu")]
         if *availability == PreviewAvailability::Gpu {
             if let Some(tracer) = crate::ComputeTracer::from_context(context) {
-                let image =
-                    crate::GpuRenderImage::with_features(tracer.gpu(), width.max(1), height.max(1));
-                let texture = empty_texture(context, width.max(1), height.max(1));
+                let (w, h) = ((width / gpu_scale).max(1), (height / gpu_scale).max(1));
+                let image = crate::GpuRenderImage::with_features(tracer.gpu(), w, h);
+                let texture = empty_texture(context, w, h);
                 return (
                     Engine::Gpu {
                         tracer: Box::new(tracer),
@@ -260,9 +307,13 @@ impl RaytracePreview {
 
     /// Changes the settings. A new CPU resolution starts the preview again.
     pub fn set_settings(&mut self, settings: PreviewSettings) {
-        let rebuild = (settings.cpu_downscale != self.settings.cpu_downscale
+        let rebuild = ((settings.cpu_downscale != self.settings.cpu_downscale
             || settings.cpu_in_background != self.settings.cpu_in_background)
-            && self.on_cpu();
+            && self.on_cpu())
+            || (settings.gpu_downscale != self.settings.gpu_downscale && !self.on_cpu());
+        if settings.gpu_downscale != self.settings.gpu_downscale {
+            self.gpu_scale = settings.gpu_downscale.max(1);
+        }
         let restart = settings.max_bounces != self.settings.max_bounces
             || settings.cpu_caustic_photons != self.settings.cpu_caustic_photons
             || settings.gpu_caustic_photons != self.settings.gpu_caustic_photons
@@ -283,7 +334,9 @@ impl RaytracePreview {
             width,
             height,
             &self.settings,
+            self.gpu_scale,
         );
+        self.pace = Pace::default();
         self.engine = engine;
         self.texture = texture;
         self.width = width;
@@ -362,6 +415,11 @@ impl RaytracePreview {
                 None => false,
             });
         }
+        #[cfg(feature = "wgpu")]
+        if matches!(self.engine, Engine::Gpu { .. }) && self.pace_gpu() {
+            // Lighter now: the next update starts on the new engine
+            return self.update(scene, camera);
+        }
         if changed {
             match &mut self.engine {
                 #[cfg(feature = "wgpu")]
@@ -388,7 +446,12 @@ impl RaytracePreview {
                     caustic_photons: self.settings.gpu_caustic_photons,
                     ..settings
                 };
-                tracer.trace_gpu(scene, camera, image, &settings)?;
+                let mut small = camera.clone();
+                small.set_viewport(three_d_asset::Viewport::new_at_origo(
+                    image.width(),
+                    image.height(),
+                ));
+                tracer.trace_gpu(scene, &small, image, &settings)?;
                 match &self.settings.denoiser {
                     Some(denoiser) => {
                         image.write_denoised_to_three_d_texture(&self.texture, denoiser)
@@ -418,8 +481,57 @@ impl RaytracePreview {
     }
 
     ///
-    /// The average luminance of every pixel in cd/m² (linear, 32 bit floats), upright as three-d expects. On the CPU it
-    /// is smaller than the preview by [PreviewSettings::cpu_downscale].
+    /// Watches the time between frames while the GPU traces and makes the preview lighter after
+    /// [SLOW_FRAMES] slow frames in a row: half the resolution, down to a quarter, then the CPU. Returns whether it did.
+    ///
+    #[cfg(feature = "wgpu")]
+    fn pace_gpu(&mut self) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        return false;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let Some(limit) = self.settings.gpu_frame_time else {
+                return false;
+            };
+            let now = std::time::Instant::now();
+            let interval = self.pace.last.replace(now).map(|last| now - last);
+            self.pace.frames += 1;
+            // Only while tracing: a finished image costs the GPU nothing
+            if self.is_done() || self.pace.frames <= WARM_UP_FRAMES {
+                self.pace.slow = 0;
+                return false;
+            }
+            match interval {
+                Some(interval) if interval > limit => self.pace.slow += 1,
+                _ => self.pace.slow = 0,
+            }
+            if self.pace.slow < SLOW_FRAMES {
+                return false;
+            }
+            let interval = interval.expect("slow frames have an interval");
+            if self.gpu_scale < 4 {
+                self.gpu_scale *= 2;
+            } else {
+                self.availability = PreviewAvailability::CpuOnly(format!(
+                    "The GPU needs {} ms per frame even at a quarter of the resolution, so ray tracing runs on the \
+                     CPU beside the frames.",
+                    interval.as_millis()
+                ));
+            }
+            self.resize(self.width, self.height);
+            true
+        }
+    }
+
+    /// What the GPU's width and height are divided by now, raised by the preview on slow GPUs.
+    pub fn gpu_downscale(&self) -> u32 {
+        self.gpu_scale
+    }
+
+    ///
+    /// The average luminance of every pixel in cd/m² (linear, 32 bit floats), upright as three-d expects. It is
+    /// smaller than the preview by [PreviewSettings::cpu_downscale] on the CPU and by
+    /// [RaytracePreview::gpu_downscale] on the GPU.
     ///
     pub fn texture(&self) -> &Texture2D {
         &self.texture
