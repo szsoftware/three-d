@@ -52,6 +52,8 @@ impl Screen {
 pub(crate) enum AdapterPreference {
     /// Only a hardware adapter.
     Hardware,
+    /// Only a hardware adapter of an API other than OpenGL. For when the OpenGL backend is the alternative, which is better than wgpu on top of OpenGL.
+    HardwareNotGl,
     /// Whatever there is.
     Any,
     /// The software adapter.
@@ -75,10 +77,18 @@ impl WgpuBackend {
                 compatible_surface: surface,
             })
             .await
-            .map_err(|e| CoreError::ContextCreation(e.to_string()))?;
-        if preference == AdapterPreference::Hardware
-            && adapter.get_info().device_type == w::DeviceType::Cpu
-        {
+            .map_err(|e| CoreError::ContextCreation(e.to_string()));
+        #[cfg(all(feature = "wgpu-gl", not(target_arch = "wasm32")))]
+        let adapter = Self::prefer_hardware(instance, preference, surface, adapter).await;
+        let adapter = adapter?;
+        let info = adapter.get_info();
+        let hardware = info.device_type != w::DeviceType::Cpu;
+        let allowed = match preference {
+            AdapterPreference::Hardware => hardware,
+            AdapterPreference::HardwareNotGl => hardware && info.backend != w::Backend::Gl,
+            AdapterPreference::Any | AdapterPreference::Software => true,
+        };
+        if !allowed {
             return Err(CoreError::ContextCreation(
                 "there is no hardware accelerated wgpu adapter".to_string(),
             ));
@@ -104,7 +114,45 @@ impl WgpuBackend {
         }));
         let mut backend = Self::new(device, queue);
         backend.errors = Some(errors);
+        backend.float32_renderable = adapter
+            .get_texture_format_features(w::TextureFormat::Rgba32Float)
+            .allowed_usages
+            .contains(w::TextureUsages::RENDER_ATTACHMENT);
         Ok((backend, adapter))
+    }
+
+    ///
+    /// wgpu asks Vulkan, Metal and DirectX 12 first and takes what they offer, even if that is a software adapter (as on a graphics
+    /// card whose Vulkan driver wgpu does not accept). With OpenGL compiled in, a hardware adapter of OpenGL is better than that.
+    ///
+    #[cfg(all(feature = "wgpu-gl", not(target_arch = "wasm32")))]
+    async fn prefer_hardware(
+        instance: &w::Instance,
+        preference: AdapterPreference,
+        surface: Option<&w::Surface<'static>>,
+        chosen: Result<w::Adapter, CoreError>,
+    ) -> Result<w::Adapter, CoreError> {
+        let is_hardware =
+            |adapter: &w::Adapter| adapter.get_info().device_type != w::DeviceType::Cpu;
+        let wanted = match preference {
+            AdapterPreference::Hardware | AdapterPreference::Any => true,
+            AdapterPreference::HardwareNotGl | AdapterPreference::Software => false,
+        };
+        if !wanted || chosen.as_ref().is_ok_and(is_hardware) {
+            return chosen;
+        }
+        let hardware = instance
+            .enumerate_adapters(w::Backends::all())
+            .await
+            .into_iter()
+            .find(|adapter| {
+                is_hardware(adapter)
+                    && surface.is_none_or(|surface| adapter.is_surface_supported(surface))
+            });
+        match hardware {
+            Some(adapter) => Ok(adapter),
+            None => chosen,
+        }
     }
 
     ///
@@ -166,9 +214,13 @@ impl WgpuBackend {
                 sample_count: if multisample { 4 } else { 1 },
                 dimension: w::TextureDimension::D2,
                 format,
-                usage: w::TextureUsages::TEXTURE_BINDING
-                    | w::TextureUsages::COPY_SRC
-                    | w::TextureUsages::RENDER_ATTACHMENT,
+                usage: if multisample {
+                    self.multisample_usage()
+                } else {
+                    w::TextureUsages::TEXTURE_BINDING
+                        | w::TextureUsages::COPY_SRC
+                        | w::TextureUsages::RENDER_ATTACHMENT
+                },
                 view_formats: &[],
             })
         };

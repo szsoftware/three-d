@@ -412,7 +412,8 @@ fn errors_are_collected() {
 #[test]
 fn adapter_is_the_expected_one() {
     super::one_gpu_test_at_a_time();
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let adapter = match pollster::block_on(super::WgpuBackend::request(
         &instance,
         super::AdapterPreference::Any,

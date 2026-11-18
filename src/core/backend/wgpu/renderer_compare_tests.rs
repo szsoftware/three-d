@@ -5,7 +5,8 @@
 //!
 
 use super::compare_tests::{
-    color_texture, compare, compare_with_outliers, depth_texture, floats, pattern, STEP,
+    color_texture, compare, compare_with_outliers, depth_texture, filters_floats, floats, pattern,
+    STEP,
 };
 use crate::renderer::*;
 use std::sync::Arc;
@@ -61,7 +62,16 @@ fn environment() -> CpuTexture {
         })
         .collect();
     CpuTexture {
-        data: TextureData::RgbaF32(data),
+        // The environment is filtered. Where wgpu cannot filter 32 bit floats (on OpenGL), it would look different than on OpenGL itself
+        data: if filters_floats() {
+            TextureData::RgbaF32(data)
+        } else {
+            TextureData::RgbaF16(
+                data.into_iter()
+                    .map(|texel: [f32; 4]| texel.map(f16::from_f32))
+                    .collect(),
+            )
+        },
         width,
         height,
         ..Default::default()

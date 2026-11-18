@@ -173,10 +173,11 @@ impl Context {
 
     ///
     /// Creates a new context without a window, with a screen that is not shown anywhere, and chooses the backend by what the system has:
-    /// 1. wgpu with a hardware adapter (with the `wgpu` feature),
+    /// 1. wgpu with a hardware adapter of Vulkan, Metal or DirectX 12 (with the `wgpu` feature),
     /// 2. OpenGL with a hardware device (with the `headless-gl` feature, on Linux),
-    /// 3. wgpu with a software adapter,
-    /// 4. OpenGL with a software device.
+    /// 3. wgpu with a hardware adapter that draws with OpenGL (with the `wgpu-gl` feature),
+    /// 4. wgpu with a software adapter,
+    /// 5. OpenGL with a software device.
     ///
     /// See [Context::new_headless_wgpu_with_screen] and [Context::new_headless_gl_with_screen] for how to use it,
     /// [Context::as_wgpu] and [Context::as_gl] tell which backend was chosen.
@@ -195,14 +196,16 @@ impl Context {
         let mut result = Err(CoreError::ContextCreation(
             "no backend without a window is compiled in".to_string(),
         ));
-        for hardware in [true, false] {
+        // 0 and 1: hardware, 2: software
+        for step in 0..3 {
             #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
             {
                 use backend::wgpu::AdapterPreference;
-                let preference = if hardware {
-                    AdapterPreference::Hardware
-                } else {
-                    AdapterPreference::Any
+                let preference = match step {
+                    // With the `wgpu-gl` feature, wgpu has adapters that draw with OpenGL. The OpenGL backend does that with less effort
+                    0 => AdapterPreference::HardwareNotGl,
+                    1 => AdapterPreference::Hardware,
+                    _ => AdapterPreference::Any,
                 };
                 result =
                     Self::headless_wgpu_with_screen(width, height, depth, multisample, preference);
@@ -211,8 +214,9 @@ impl Context {
                 }
             }
             #[cfg(all(feature = "headless-gl", target_os = "linux"))]
-            {
-                result = Self::headless_gl_with_screen(width, height, depth, multisample, hardware);
+            if step != 1 {
+                result =
+                    Self::headless_gl_with_screen(width, height, depth, multisample, step == 0);
                 if result.is_ok() {
                     return result;
                 }

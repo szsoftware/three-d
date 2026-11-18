@@ -36,7 +36,7 @@ mod wgpu_context {
             HardwareAcceleration::Required => AdapterPreference::Hardware,
             // With the choice between the backends, OpenGL on hardware is better than wgpu in software
             HardwareAcceleration::Preferred if preference == BackendPreference::Auto => {
-                AdapterPreference::Hardware
+                AdapterPreference::HardwareNotGl
             }
             HardwareAcceleration::Preferred => AdapterPreference::Any,
         };

@@ -55,6 +55,17 @@ pub(crate) fn release(context: &Context) {
 }
 
 ///
+/// Whether the wgpu device of the tests filters textures of 32 bit floats linearly. Without a device, the tests are skipped anyway.
+///
+pub(super) fn filters_floats() -> bool {
+    static FILTERS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FILTERS.get_or_init(|| {
+        super::one_gpu_test_at_a_time();
+        Context::new_headless_wgpu().is_ok_and(|context| context.wgpu_backend().float32_filterable)
+    })
+}
+
+///
 /// Runs the scenario on both backends and checks that the values it returns differ by at most the tolerance.
 ///
 pub(super) fn compare(tolerance: f32, scenario: impl Fn(&Context) -> Vec<f32>) {
@@ -79,6 +90,8 @@ pub(super) fn compare_with_outliers(
     };
     // All tests share one EGL display, which is initialized and terminated with the contexts
     super::one_gpu_test_at_a_time();
+    // Asked now, because the answer needs a device, which must not be created while the scenario runs on OpenGL
+    filters_floats();
     let reference = reference_file();
     #[cfg(target_os = "linux")]
     let expected = {
@@ -549,6 +562,179 @@ fn texture_array_and_several_color_targets() {
         let mut values = Vec::new();
         for layer in [0, 2] {
             values.extend(floats(target.as_color_target(&[layer], None).read()));
+        }
+        values
+    });
+}
+
+/// Arrays that wgpu on OpenGL would take for something else: six square layers look like a cube map, one layer like a plain texture.
+#[test]
+fn texture_arrays_with_six_layers_and_one_layer() {
+    compare(2.0 * STEP, |context| {
+        let layers: Vec<CpuTexture> = (0..6)
+            .map(|layer| cpu_texture(8, 40 + layer, Some(Mipmap::default())))
+            .collect();
+        let six = Texture2DArray::new(context, &layers.iter().collect::<Vec<_>>());
+        let one = Texture2DArray::new(context, &[&layers[3]]);
+        let program = screen_program(
+            context,
+            "
+            uniform sampler2DArray tex;
+            uniform float layer;
+            uniform float lod;
+            in vec2 uvs;
+            layout (location = 0) out vec4 outColor;
+            void main() { outColor = textureLod(tex, vec3(uvs, layer), lod); }
+        ",
+        );
+        let mut values = Vec::new();
+        for (layer, lod) in [(0.0, 0.0), (4.0, 0.0), (5.0, 1.0), (2.0, 2.0)] {
+            values.extend(draw_screen(context, 8, &program, || {
+                program.use_uniform("layer", layer);
+                program.use_uniform("lod", lod);
+                program.use_texture_array("tex", &six);
+            }));
+        }
+        values.extend(draw_screen(context, 8, &program, || {
+            program.use_uniform("layer", 0.0);
+            program.use_uniform("lod", 1.0);
+            program.use_texture_array("tex", &one);
+        }));
+        // Rendering into a layer and reading it
+        let target = Texture2DArray::new_empty::<[u8; 4]>(
+            context,
+            4,
+            4,
+            6,
+            Interpolation::Nearest,
+            Interpolation::Nearest,
+            None,
+            Wrapping::ClampToEdge,
+            Wrapping::ClampToEdge,
+        );
+        target
+            .as_color_target(&[5], None)
+            .clear(ClearState::color(0.0, 0.0, 0.0, 1.0))
+            .write::<CoreError>(|| {
+                program.use_uniform("layer", 1.0);
+                program.use_uniform("lod", 0.0);
+                program.use_texture_array("tex", &six);
+                full_screen_draw(
+                    context,
+                    &program,
+                    RenderStates::default(),
+                    Viewport::new_at_origo(4, 4),
+                );
+                Ok(())
+            })
+            .unwrap();
+        values.extend(floats(target.as_color_target(&[5], None).read()));
+        values
+    });
+}
+
+/// Textures of 32 bit floats as targets: uploaded, rendered into, with mipmaps, sampled and read. Not every device can render into them directly.
+#[test]
+fn float_textures_are_targets() {
+    compare(1.0e-4, |context| {
+        let data: Vec<[f32; 4]> = pattern(8, 8, 50)
+            .into_iter()
+            .map(|texel| texel.map(|v| v as f32 * 0.5 - 20.0))
+            .collect();
+        let texture = Texture2D::new(
+            context,
+            &CpuTexture {
+                data: TextureData::RgbaF32(data),
+                width: 8,
+                height: 8,
+                min_filter: Interpolation::Nearest,
+                mag_filter: Interpolation::Nearest,
+                mipmap: Some(Mipmap {
+                    filter: Interpolation::Nearest,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        // The uploaded texels and their mipmaps
+        let mut values: Vec<f32> = Vec::new();
+        for level in 0..3 {
+            let texels: Vec<[f32; 4]> = texture.as_color_target(Some(level)).read();
+            values.extend(texels.into_iter().flatten());
+        }
+        // A part is drawn over, with values that only floats can hold
+        let program = Program::from_source(context, POSITION_VERTEX, COLOR_FRAGMENT).unwrap();
+        let positions = quad(context, 0.5);
+        texture
+            .as_color_target(None)
+            .write::<CoreError>(|| {
+                program.use_uniform("color", vec4(-3.5, 1000.25, 1.0e-3, 7.0));
+                program.use_uniform("placement", vec4(0.25, -0.25, 0.5, 0.5));
+                program.use_vertex_attribute("position", &positions);
+                program.draw_arrays(RenderStates::default(), Viewport::new_at_origo(8, 8), 6);
+                Ok(())
+            })
+            .unwrap();
+        // and a corner is cleared
+        texture.as_color_target(None).clear_partially(
+            ScissorBox {
+                x: 0,
+                y: 0,
+                width: 3,
+                height: 2,
+            },
+            ClearState::color(0.5, -0.25, 64.0, 1.0),
+        );
+        for level in 0..3 {
+            let texels: Vec<[f32; 4]> = texture.as_color_target(Some(level)).read();
+            values.extend(texels.into_iter().flatten());
+        }
+        // What was drawn is there when the texture is sampled
+        let sample = screen_program(
+            context,
+            "
+            uniform sampler2D tex;
+            uniform float lod;
+            in vec2 uvs;
+            layout (location = 0) out vec4 outColor;
+            void main() { outColor = textureLod(tex, uvs, lod) * 0.001 + 0.5; }
+        ",
+        );
+        for lod in [0.0, 1.0] {
+            values.extend(draw_screen(context, 8, &sample, || {
+                sample.use_uniform("lod", lod);
+                sample.use_texture("tex", &texture);
+            }));
+        }
+        // A cube map of floats
+        let cube = TextureCubeMap::new_empty::<[f32; 4]>(
+            context,
+            4,
+            4,
+            Interpolation::Nearest,
+            Interpolation::Nearest,
+            Some(Mipmap {
+                filter: Interpolation::Nearest,
+                ..Default::default()
+            }),
+            Wrapping::ClampToEdge,
+            Wrapping::ClampToEdge,
+            Wrapping::ClampToEdge,
+        );
+        for (index, side) in [CubeMapSide::Top, CubeMapSide::Back]
+            .into_iter()
+            .enumerate()
+        {
+            cube.as_color_target(&[side], None).clear(ClearState::color(
+                index as f32 * 300.0,
+                -1.5,
+                0.125,
+                1.0,
+            ));
+        }
+        for (side, level) in [(CubeMapSide::Top, 0), (CubeMapSide::Back, 1)] {
+            let texels: Vec<[f32; 4]> = cube.as_color_target(&[side], Some(level)).read();
+            values.extend(texels.into_iter().flatten());
         }
         values
     });
