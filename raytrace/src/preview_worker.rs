@@ -20,6 +20,7 @@ pub(crate) struct Job {
     pub camera: Camera,
     pub max_bounces: u32,
     pub caustic_photons: u32,
+    pub depth_of_field: Option<crate::DepthOfField>,
     pub max_samples: u32,
     pub denoiser: Option<AtrousDenoiser>,
 }
@@ -147,6 +148,7 @@ fn run(shared: Arc<(Mutex<State>, Condvar)>, width: u32, height: u32) {
         let settings = TraceSettings {
             max_bounces: job.max_bounces,
             caustic_photons: job.caustic_photons,
+            depth_of_field: job.depth_of_field,
             ..Default::default()
         };
         // Samples are added until the time for a hand over has come, so the threads trace instead of waiting for the

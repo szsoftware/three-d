@@ -1184,6 +1184,14 @@ fn params_bytes(
         }
         None => (0..4 * 11).for_each(|_| p.f(0.0)),
     }
+    match crate::lens::Lens::of(camera, settings.depth_of_field) {
+        Some(lens) => {
+            p.v3(lens.u, lens.focus_distance);
+            p.v3(lens.v, 1.0);
+            p.v3(lens.view, 0.0);
+        }
+        None => (0..12).for_each(|_| p.f(0.0)),
+    }
     p.bytes()
 }
 

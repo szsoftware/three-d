@@ -75,6 +75,8 @@ pub struct PreviewSettings {
     /// time only in scenes with such glass; 0 lets light pass the glass straight. The GPU has no caustics yet.
     ///
     pub cpu_caustic_photons: u32,
+    /// Blur in front of and behind the focus distance, `None` for everything sharp.
+    pub depth_of_field: Option<crate::DepthOfField>,
     /// Exposure and curve of [RaytracePreview::render].
     pub tone_mapping: ToneMapping,
     /// Smooths the noise of the first samples with this filter, `None` to show the samples as they are.
@@ -90,6 +92,7 @@ impl Default for PreviewSettings {
             max_samples: 1024,
             max_bounces: 6,
             cpu_caustic_photons: 20_000,
+            depth_of_field: None,
             tone_mapping: ToneMapping::default(),
             denoiser: Some(crate::AtrousDenoiser::default()),
         }
@@ -258,7 +261,8 @@ impl RaytracePreview {
             || settings.cpu_in_background != self.settings.cpu_in_background)
             && self.on_cpu();
         let restart = settings.max_bounces != self.settings.max_bounces
-            || settings.cpu_caustic_photons != self.settings.cpu_caustic_photons;
+            || settings.cpu_caustic_photons != self.settings.cpu_caustic_photons
+            || settings.depth_of_field != self.settings.depth_of_field;
         self.settings = settings;
         if rebuild {
             self.resize(self.width, self.height);
@@ -336,6 +340,7 @@ impl RaytracePreview {
                     camera: small,
                     max_bounces: self.settings.max_bounces,
                     caustic_photons: self.settings.cpu_caustic_photons,
+                    depth_of_field: self.settings.depth_of_field,
                     max_samples: self.settings.max_samples,
                     denoiser: self.settings.denoiser,
                 });
@@ -368,6 +373,7 @@ impl RaytracePreview {
         let settings = TraceSettings {
             max_bounces: self.settings.max_bounces,
             caustic_photons: self.settings.cpu_caustic_photons,
+            depth_of_field: self.settings.depth_of_field,
             ..Default::default()
         };
         match &mut self.engine {

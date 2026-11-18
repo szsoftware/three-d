@@ -31,6 +31,11 @@ struct Params {
     zenith: vec4<f32>,
     norm: vec4<f32>,
     ground: vec4<f32>,
+    // Depth of field: right and up of the camera as long as the aperture's radius, w of lens_u the focus distance,
+    // w of lens_v 1 if on; the view direction
+    lens_u: vec4<f32>,
+    lens_v: vec4<f32>,
+    lens_view: vec4<f32>,
 }
 
 struct Tile {
@@ -1291,6 +1296,22 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
     return result;
 }
 
+// A point on the unit disc, uniform in area (sampling.rs concentric_disc)
+fn concentric_disc(u1: f32, u2: f32) -> vec2<f32> {
+    let a = 2.0 * u1 - 1.0;
+    let b = 2.0 * u2 - 1.0;
+    if a == 0.0 && b == 0.0 {
+        return vec2<f32>(0.0);
+    }
+    var r = b;
+    var phi = PI / 2.0 - PI / 4.0 * (a / b);
+    if abs(a) > abs(b) {
+        r = a;
+        phi = PI / 4.0 * (b / a);
+    }
+    return vec2<f32>(r * cos(phi), r * sin(phi));
+}
+
 fn camera_ray_origin(u: f32, v: f32) -> vec3<f32> {
     if params.camera.x == 1u {
         return params.camera_position.xyz;
@@ -1335,8 +1356,16 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation
         dimension = 0u;
         let u = (f32(x) + next_f32()) / f32(width);
         let v = 1.0 - (f32(y) + next_f32()) / f32(height);
-        let direction = camera_ray_direction(u, v);
-        let l = radiance(camera_ray_origin(u, v), direction);
+        var direction = camera_ray_direction(u, v);
+        var origin = camera_ray_origin(u, v);
+        if params.lens_v.w > 0.0 {
+            // Through a point of the lens towards where the pinhole ray meets the focus plane (lens.rs)
+            let focus = origin + direction * (params.lens_u.w / dot(direction, params.lens_view.xyz));
+            let disc = concentric_disc(next_f32(), next_f32());
+            origin = origin + params.lens_u.xyz * disc.x + params.lens_v.xyz * disc.y;
+            direction = normalize(focus - origin);
+        }
+        let l = radiance(origin, direction);
         // A broken sample must not spoil the pixel for good (comparisons with NaN are false)
         if all(abs(l) < vec3<f32>(BIG)) {
             sum += l;
