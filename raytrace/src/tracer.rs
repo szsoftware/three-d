@@ -2,13 +2,14 @@
 //! Tracers add samples of the scene to a render image. Every tracer uses the same scene, render image and material model.
 //!
 
+use crate::lens::Lens;
 use crate::light::*;
 use crate::photons::*;
 use crate::render_image::FEATURE_WORDS;
 use crate::sampling::*;
 use crate::{
-    AccelBuilder, Camera, CpuAccel, CpuBvhBuilder, Hit, RenderImage, RtEnvironment, RtError,
-    RtLight, RtMaterial, RtScene,
+    AccelBuilder, Camera, CpuAccel, CpuBvhBuilder, DepthOfField, Hit, RenderImage, RtEnvironment,
+    RtError, RtLight, RtMaterial, RtScene,
 };
 use std::f32::consts::PI;
 use three_d_asset::prelude::*;
@@ -53,6 +54,9 @@ pub struct TraceSettings {
     /// (progressive photon mapping), so caustics get sharp and the image converges to the right result.
     ///
     pub caustic_radius: f32,
+    /// Blur in front of and behind the focus distance of a perspective camera, `None` for a pinhole camera that
+    /// shows everything sharp.
+    pub depth_of_field: Option<DepthOfField>,
 }
 
 impl Default for TraceSettings {
@@ -64,6 +68,7 @@ impl Default for TraceSettings {
             indirect_clamp: None,
             caustic_photons: 0,
             caustic_radius: 0.02,
+            depth_of_field: None,
         }
     }
 }
@@ -169,7 +174,7 @@ impl Tracer for CpuReferenceTracer {
         let context = PathContext {
             scene,
             accel,
-            rays: CameraRays::new(camera),
+            rays: CameraRays::new(camera, settings.depth_of_field),
             settings: *settings,
             width: render_image.width(),
             height: render_image.height(),
@@ -229,10 +234,11 @@ struct CameraRays {
     camera: Camera,
     /// For perspective cameras: from normalized device coordinates to a direction in world space.
     screen_to_direction: Option<Mat4>,
+    lens: Option<Lens>,
 }
 
 impl CameraRays {
-    fn new(camera: &Camera) -> Self {
+    fn new(camera: &Camera, depth_of_field: Option<DepthOfField>) -> Self {
         let screen_to_direction = match camera.projection_type() {
             ProjectionType::Perspective { .. } => {
                 let mut view = camera.view();
@@ -244,6 +250,7 @@ impl CameraRays {
         Self {
             camera: camera.clone(),
             screen_to_direction,
+            lens: Lens::of(camera, depth_of_field),
         }
     }
 
@@ -344,7 +351,11 @@ impl PathContext<'_> {
                 let mut rng = Rng::for_pixel(self.settings.seed, x as u32, y, sample);
                 let u = (x as f32 + rng.next_f32()) / self.width as f32;
                 let v = 1.0 - (y as f32 + rng.next_f32()) / self.height as f32;
-                let (origin, direction) = self.rays.ray(u, v);
+                let (mut origin, mut direction) = self.rays.ray(u, v);
+                if let Some(lens) = &self.rays.lens {
+                    (origin, direction) =
+                        lens.ray(origin, direction, rng.next_f32(), rng.next_f32());
+                }
                 let mut first = FirstHit::sky(direction);
                 let mut l = self.radiance(origin, direction, &mut rng, &mut first);
                 // A broken sample must not spoil the pixel for good

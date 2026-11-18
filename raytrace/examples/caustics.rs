@@ -1,6 +1,7 @@
 //!
 //! A glass ball and a glass block on a stone terrace in the afternoon sun, rendered with the CPU reference tracer
-//! twice: without caustics (shadow rays pass the glass straight) and with caustic photons.
+//! three times: without caustics (shadow rays pass the glass straight), with caustic photons, and with caustics and
+//! depth of field focused on the ball at f/1.4.
 //!
 //! cargo run --release -p three-d-raytrace --example caustics -- [samples] [width] [height] [photons per call]
 //!
@@ -28,13 +29,19 @@ fn main() {
         exposure_ev100: 14.5,
         ..Default::default()
     };
-    for (name, caustic_photons) in [("caustics_off", 0), ("caustics_on", photons)] {
+    let focused = DepthOfField::focused_on(&camera, vec3(0.0, 0.25, 0.0), 1.4);
+    for (name, caustic_photons, depth_of_field) in [
+        ("caustics_off", 0, None),
+        ("caustics_on", photons, None),
+        ("caustics_dof", photons, Some(focused)),
+    ] {
         let mut tracer = CpuReferenceTracer::new();
         let mut image = RenderImage::with_features(width, height);
         let settings = TraceSettings {
             samples_per_call: 1,
             caustic_photons,
             caustic_radius: 0.03,
+            depth_of_field,
             ..Default::default()
         };
         let start = std::time::Instant::now();

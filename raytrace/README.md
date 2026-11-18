@@ -149,6 +149,11 @@ binds (128 MB guaranteed by WebGPU), the largest ones are halved in size until t
   the compute tracer has no caustics yet and lets the light pass straight. A glass face lying exactly on another
   surface sends its light below it; leave a millimetre between them.
 - Not included: caustics of mirrors and of the light of area lights and the sky.
+- Depth of field with `TraceSettings::depth_of_field` (also `PreviewSettings::depth_of_field`), on CPU and GPU:
+  `DepthOfField { f_number, focus_distance }` behaves like a photo camera with the same field of view on a full frame
+  sensor (24 mm high), so f/2.8 at 45° is a 29 mm lens with an aperture of 10 mm. Scenes have to be in meters.
+  `DepthOfField::focused_on(&camera, point, f_number)` focuses on a point. Rays start on the aperture (concentric
+  mapping of two Sobol dimensions) and meet at the focus plane; orthographic cameras stay sharp.
 - Deterministic: the same seed gives the same image with any number of threads.
 
 ## Tests
@@ -158,7 +163,9 @@ noon at the solstices and equinox, the material model for energy conservation, a
 from physics: a white sphere disappears in a uniform environment (white furnace), a white ground under the sky
 reflects E/π, a point light falls off with the square of the distance, and a pane of glass lets 96 % of the light
 through. `tests/caustics.rs` checks that photons through a glass slab light the floor as brightly as the straight
-shadow rays and that a glass ball gathers the light of its shadow into a bright focus without making light. A reference image of the garden scene is compared in blocks of 4 × 4 pixels, write it again with
+shadow rays and that a glass ball gathers the light of its shadow into a bright focus without making light.
+`tests/depth_of_field.rs` checks on CPU and GPU that an edge in the focus plane stays sharp and an edge behind it is
+blurred by the thin lens's circle of confusion, without losing light. A reference image of the garden scene is compared in blocks of 4 × 4 pixels, write it again with
 `THREE_D_WRITE_REFERENCE=1 cargo test --release -p three-d-raytrace`.
 
 With the `wgpu` feature, `tests/gpu.rs` runs the same physical checks with the compute tracer and compares its garden
@@ -169,5 +176,5 @@ The examples render the same scene: `cargo run --release -p three-d-raytrace --e
 CPU and `cargo run --release -p three-d-raytrace --features wgpu --example garden_gpu -- 256 960 600` with the compute
 tracer.
 `cargo run --release -p three-d-raytrace --example caustics -- 64 640 400` renders a glass ball and a glass block on a
-terrace in the sun, without and with caustics (64 samples at 640 × 400 take 5 s and 23 s with 200 000 photons per
+terrace in the sun, without and with caustics and with depth of field (64 samples at 640 × 400 take 5 s and 23 s with 200 000 photons per
 sample on four cores).

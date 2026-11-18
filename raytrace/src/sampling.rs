@@ -133,6 +133,21 @@ pub(crate) fn cosine_hemisphere(u1: f32, u2: f32) -> Vec3 {
     vec3(r * phi.cos(), r * phi.sin(), (1.0 - u1).max(0.0).sqrt())
 }
 
+/// A point on the unit disc, uniform in area, mapping squares to rings so strata stay compact (Shirley and Chiu).
+pub(crate) fn concentric_disc(u1: f32, u2: f32) -> (f32, f32) {
+    let a = 2.0 * u1 - 1.0;
+    let b = 2.0 * u2 - 1.0;
+    if a == 0.0 && b == 0.0 {
+        return (0.0, 0.0);
+    }
+    let (r, phi) = if a.abs() > b.abs() {
+        (a, PI / 4.0 * (b / a))
+    } else {
+        (b, PI / 2.0 - PI / 4.0 * (a / b))
+    };
+    (r * phi.cos(), r * phi.sin())
+}
+
 /// A direction in the cone around +z with the given cosine of the half angle, uniform in solid angle.
 pub(crate) fn uniform_cone(u1: f32, u2: f32, cos_max: f32) -> Vec3 {
     let cos_theta = 1.0 - u1 * (1.0 - cos_max);
