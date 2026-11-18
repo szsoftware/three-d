@@ -216,5 +216,6 @@ fn finish(@builtin(global_invocation_id) id: vec3<u32>) {
     if params.info.y > 0u {
         color = finish_light[i].rgb * finish_albedo_gradient[i].rgb;
     }
-    averages[id.y * params.size.z + id.x] = vec4<f32>(color, 1.0);
+    // three-d keeps the bottom row of the image first in the memory of a texture
+    averages[(params.size.y - 1u - id.y) * params.size.z + id.x] = vec4<f32>(color, 1.0);
 }

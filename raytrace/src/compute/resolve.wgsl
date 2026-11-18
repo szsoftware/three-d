@@ -18,5 +18,6 @@ fn resolve(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let sum = sums[(id.y * size.x + id.x) * size.w];
-    averages[id.y * size.z + id.x] = vec4<f32>(sum.rgb * resolve_params.scale.x, 1.0);
+    // three-d keeps the bottom row of the image first in the memory of a texture
+    averages[(size.y - 1u - id.y) * size.z + id.x] = vec4<f32>(sum.rgb * resolve_params.scale.x, 1.0);
 }

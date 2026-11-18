@@ -674,8 +674,8 @@ impl GpuRenderImage {
     }
 }
 
-/// Copies rows of RGBA floats with `pitch` pixels each into a texture. Rows of wgpu textures start at the top like the
-/// render image, which three-d shows upright.
+/// Copies rows of RGBA floats with `pitch` pixels each into a texture, in the order of its memory: three-d keeps the
+/// bottom row of an image first there, as OpenGL does.
 fn copy_rows_to_texture(
     encoder: &mut w::CommandEncoder,
     buffer: &w::Buffer,

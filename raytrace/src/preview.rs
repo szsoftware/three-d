@@ -29,6 +29,9 @@ impl PreviewAvailability {
         #[cfg(feature = "wgpu")]
         {
             use crate::RaytraceSupport;
+            if let Some(problem) = crate::driver_problem(context) {
+                return Self::CpuOnly(problem);
+            }
             if RaytraceSupport::of(context) >= RaytraceSupport::Compute {
                 return Self::Gpu;
             }
@@ -55,8 +58,14 @@ impl PreviewAvailability {
 pub struct PreviewSettings {
     /// Samples added per call of [RaytracePreview::update] on the GPU.
     pub gpu_samples_per_frame: u32,
-    /// The CPU traces at width and height divided by this, one sample per call.
+    /// The CPU traces at width and height divided by this.
     pub cpu_downscale: u32,
+    ///
+    /// The CPU traces on a thread of its own, one sample after the other, and [RaytracePreview::update] shows the
+    /// newest image, so the frames do not wait for the tracer. Otherwise every update traces one sample and waits.
+    /// Browsers have no threads, there the update always traces.
+    ///
+    pub cpu_in_background: bool,
     /// No more samples are added after this many, the image stays as it is.
     pub max_samples: u32,
     /// Most bounces of a path.
@@ -72,6 +81,7 @@ impl Default for PreviewSettings {
         Self {
             gpu_samples_per_frame: 1,
             cpu_downscale: 4,
+            cpu_in_background: true,
             max_samples: 1024,
             max_bounces: 6,
             tone_mapping: ToneMapping::default(),
@@ -89,6 +99,16 @@ enum Engine {
     Cpu {
         tracer: CpuReferenceTracer,
         image: RenderImage,
+    },
+    #[cfg(not(target_arch = "wasm32"))]
+    CpuWorker {
+        worker: crate::preview_worker::CpuWorker,
+        width: u32,
+        height: u32,
+        /// Samples of the image in the texture.
+        shown: u32,
+        /// The scene handed to the worker, kept while id and revision stay the same.
+        scene: Option<std::sync::Arc<RtScene>>,
     },
 }
 
@@ -179,6 +199,19 @@ impl RaytracePreview {
         let scale = settings.cpu_downscale.max(1);
         let (w, h) = ((width / scale).max(1), (height / scale).max(1));
         let texture = empty_texture(context, w, h);
+        #[cfg(not(target_arch = "wasm32"))]
+        if settings.cpu_in_background {
+            return (
+                Engine::CpuWorker {
+                    worker: crate::preview_worker::CpuWorker::new(w, h),
+                    width: w,
+                    height: h,
+                    shown: 0,
+                    scene: None,
+                },
+                texture,
+            );
+        }
         (
             Engine::Cpu {
                 tracer: CpuReferenceTracer::new(),
@@ -199,7 +232,13 @@ impl RaytracePreview {
             #[cfg(feature = "wgpu")]
             Engine::Gpu { .. } => TracerKind::Compute,
             Engine::Cpu { .. } => TracerKind::CpuReference,
+            #[cfg(not(target_arch = "wasm32"))]
+            Engine::CpuWorker { .. } => TracerKind::CpuReference,
         }
+    }
+
+    fn on_cpu(&self) -> bool {
+        self.kind() == TracerKind::CpuReference
     }
 
     /// The settings.
@@ -209,8 +248,9 @@ impl RaytracePreview {
 
     /// Changes the settings. A new CPU resolution starts the preview again.
     pub fn set_settings(&mut self, settings: PreviewSettings) {
-        let rebuild = settings.cpu_downscale != self.settings.cpu_downscale
-            && matches!(self.engine, Engine::Cpu { .. });
+        let rebuild = (settings.cpu_downscale != self.settings.cpu_downscale
+            || settings.cpu_in_background != self.settings.cpu_in_background)
+            && self.on_cpu();
         let restart = settings.max_bounces != self.settings.max_bounces;
         self.settings = settings;
         if rebuild {
@@ -247,6 +287,8 @@ impl RaytracePreview {
             #[cfg(feature = "wgpu")]
             Engine::Gpu { image, .. } => image.sample_count(),
             Engine::Cpu { image, .. } => image.sample_count(),
+            #[cfg(not(target_arch = "wasm32"))]
+            Engine::CpuWorker { shown, .. } => *shown,
         }
     }
 
@@ -257,16 +299,59 @@ impl RaytracePreview {
 
     ///
     /// Adds samples for the scene seen by the camera, after starting again if either changed, and writes the average
-    /// into [RaytracePreview::texture]. Returns whether the image changed.
+    /// into [RaytracePreview::texture]. Returns whether the image changed. With [PreviewSettings::cpu_in_background]
+    /// the samples are added on another thread and this shows the newest image; the scene is copied for that thread
+    /// whenever it changed.
     ///
     pub fn update(&mut self, scene: &RtScene, camera: &Camera) -> Result<bool, crate::RtError> {
         let key = (camera_key(camera), scene.id(), scene.revision());
         let changed = self.traced_for.as_ref() != Some(&key);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Engine::CpuWorker {
+            worker,
+            width,
+            height,
+            shown,
+            scene: handed,
+        } = &mut self.engine
+        {
+            if changed {
+                let same_scene = handed
+                    .as_ref()
+                    .is_some_and(|s| s.id() == scene.id() && s.revision() == scene.revision());
+                if !same_scene {
+                    *handed = Some(std::sync::Arc::new(scene.clone()));
+                }
+                let mut small = camera.clone();
+                small.set_viewport(three_d_asset::Viewport::new_at_origo(*width, *height));
+                worker.start(crate::preview_worker::Job {
+                    scene: handed.clone().expect("handed over"),
+                    camera: small,
+                    max_bounces: self.settings.max_bounces,
+                    max_samples: self.settings.max_samples,
+                    denoiser: self.settings.denoiser,
+                });
+                *shown = 0;
+                self.traced_for = Some(key);
+            } else {
+                worker.adjust(self.settings.max_samples, self.settings.denoiser);
+            }
+            return Ok(match worker.take()? {
+                Some(finished) => {
+                    self.texture.fill(&finished.rgba);
+                    *shown = finished.samples;
+                    true
+                }
+                None => false,
+            });
+        }
         if changed {
             match &mut self.engine {
                 #[cfg(feature = "wgpu")]
                 Engine::Gpu { image, .. } => image.reset(),
                 Engine::Cpu { image, .. } => image.reset(),
+                #[cfg(not(target_arch = "wasm32"))]
+                Engine::CpuWorker { .. } => unreachable!("handled above"),
             }
             self.traced_for = Some(key);
         } else if self.sample_count() >= self.settings.max_samples {
@@ -306,6 +391,8 @@ impl RaytracePreview {
                     None => image.write_to_three_d_texture(&self.texture),
                 }
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            Engine::CpuWorker { .. } => unreachable!("handled above"),
         }
         Ok(true)
     }

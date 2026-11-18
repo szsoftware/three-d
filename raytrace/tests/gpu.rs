@@ -44,10 +44,10 @@ fn render_image_shows_upright_in_three_d() {
     let Some(context) = context() else { return };
     let render_image = numbered_image(3, 2);
     let texture = render_image.to_three_d_texture(&context);
-    // Reading a texture returns the bottom row first (texture coordinate v = 0), the render image starts at the top
+    // Reading a texture returns the rows in the order they were filled, top first like the render image
     let pixels: Vec<[f32; 4]> = texture.as_color_target(None).read();
     let numbers: Vec<f32> = pixels.iter().map(|p| p[0]).collect();
-    assert_eq!(numbers, vec![3.0, 4.0, 5.0, 0.0, 1.0, 2.0]);
+    assert_eq!(numbers, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
 }
 
 #[test]
@@ -363,11 +363,11 @@ fn gpu_render_image_shows_in_three_d_without_the_cpu() {
     assert_eq!(image.sample_count(), 8);
     let on_cpu = image.read();
     let texture = image.to_three_d_texture(&context);
-    // Reading returns the bottom row first
+    // Reading returns the top row first, as the render image
     let pixels: Vec<[f32; 4]> = texture.as_color_target(None).read();
     for y in 0..12 {
         for x in 0..20 {
-            let p = pixels[((11 - y) * 20 + x) as usize];
+            let p = pixels[(y * 20 + x) as usize];
             let e = on_cpu.pixel(x, y);
             let close = |a: f32, b: f32| (a - b).abs() <= 1e-3 * b.abs().max(1.0);
             assert!(

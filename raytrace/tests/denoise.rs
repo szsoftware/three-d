@@ -199,10 +199,10 @@ fn the_gpu_denoises_like_the_cpu() {
         let texture = image.to_three_d_texture(&context);
         image.write_denoised_to_three_d_texture(&texture, &AtrousDenoiser::default());
         let got: Vec<[f32; 4]> = texture.as_color_target(None).read();
-        // three-d reads the bottom row first
+        // three-d reads the top row first
         for y in 0..HEIGHT {
             for x in 0..WIDTH {
-                let g = got[((HEIGHT - 1 - y) * WIDTH + x) as usize];
+                let g = got[(y * WIDTH + x) as usize];
                 let e = expected.pixel(x, y);
                 for c in 0..3 {
                     assert!(

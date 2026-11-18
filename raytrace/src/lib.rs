@@ -35,6 +35,8 @@ mod gpu;
 mod light;
 #[cfg(feature = "three-d")]
 mod preview;
+#[cfg(all(feature = "three-d", not(target_arch = "wasm32")))]
+mod preview_worker;
 mod render_image;
 mod sampling;
 mod scene;

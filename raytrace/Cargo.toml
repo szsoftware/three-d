@@ -26,6 +26,10 @@ wgpu = { version = "29", default-features = false, features = ["wgsl"], optional
 image = { version = "0.25", default-features = false, features = ["png"] }
 naga = { version = "29", features = ["wgsl-in"] }
 
+# The preview tests also run on an OpenGL context without a window
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+three-d = { path = "..", default-features = false, features = ["headless-gl"] }
+
 [[example]]
 name = "garden_gpu"
 required-features = ["wgpu"]
