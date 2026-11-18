@@ -15,6 +15,36 @@ use std::sync::Arc;
 pub(crate) struct GlBackend {
     pub context: Arc<crate::context::Context>,
     vao: crate::context::VertexArray,
+    /// What stands in for the default framebuffer if the context has no window, see [GlBackend::set_offscreen_screen].
+    screen: std::sync::Mutex<Option<OffscreenScreen>>,
+    /// What has to live as long as the context if this backend created it.
+    #[allow(dead_code)]
+    pub(super) keep_alive: Option<KeepAlive>,
+}
+
+///
+/// The context and display of a context that this crate created. They are only kept, never used, so they can move between
+/// threads with the backend. As for every OpenGL context, the calls have to come from the thread where the context is current.
+///
+pub(crate) struct KeepAlive(#[allow(dead_code)] pub Box<dyn std::any::Any>);
+
+unsafe impl Send for KeepAlive {}
+unsafe impl Sync for KeepAlive {}
+impl std::panic::UnwindSafe for KeepAlive {}
+impl std::panic::RefUnwindSafe for KeepAlive {}
+
+///
+/// A framebuffer that is used wherever the screen is asked for.
+///
+struct OffscreenScreen {
+    width: u32,
+    height: u32,
+    depth: bool,
+    multisample: bool,
+    framebuffer: crate::context::Framebuffer,
+    renderbuffers: Vec<crate::context::Renderbuffer>,
+    /// With multisampling, the framebuffer with one sample per pixel that is read from.
+    resolved: Option<crate::context::Framebuffer>,
 }
 
 impl GlBackend {
@@ -32,9 +62,210 @@ impl GlBackend {
             let vao = context
                 .create_vertex_array()
                 .map_err(CoreError::ContextCreation)?;
-            Self { context, vao }
+            Self {
+                context,
+                vao,
+                screen: std::sync::Mutex::new(None),
+                keep_alive: None,
+            }
         };
         Ok(backend)
+    }
+
+    ///
+    /// Creates a framebuffer that is used as the screen from now on, for a context without a window.
+    /// The former one is deleted with its content.
+    ///
+    #[allow(dead_code)]
+    pub fn set_offscreen_screen(
+        &self,
+        width: u32,
+        height: u32,
+        depth: bool,
+        multisample: bool,
+    ) -> Result<(), CoreError> {
+        use crate::context as gl;
+        let context = &self.context;
+        let (width, height) = (width.max(1), height.max(1));
+        let mut renderbuffers = Vec::new();
+        let framebuffer = |samples: i32,
+                           renderbuffers: &mut Vec<gl::Renderbuffer>|
+         -> Result<gl::Framebuffer, CoreError> {
+            unsafe {
+                let framebuffer = context
+                    .create_framebuffer()
+                    .map_err(CoreError::ContextCreation)?;
+                context.bind_framebuffer(gl::FRAMEBUFFER, Some(framebuffer));
+                let mut attach = |attachment, format| -> Result<(), CoreError> {
+                    let renderbuffer = context
+                        .create_renderbuffer()
+                        .map_err(CoreError::ContextCreation)?;
+                    context.bind_renderbuffer(gl::RENDERBUFFER, Some(renderbuffer));
+                    context.renderbuffer_storage_multisample(
+                        gl::RENDERBUFFER,
+                        samples,
+                        format,
+                        width as i32,
+                        height as i32,
+                    );
+                    context.framebuffer_renderbuffer(
+                        gl::FRAMEBUFFER,
+                        attachment,
+                        gl::RENDERBUFFER,
+                        Some(renderbuffer),
+                    );
+                    renderbuffers.push(renderbuffer);
+                    Ok(())
+                };
+                attach(gl::COLOR_ATTACHMENT0, gl::RGBA8)?;
+                if depth {
+                    attach(gl::DEPTH_ATTACHMENT, gl::DEPTH_COMPONENT32F)?;
+                }
+                context.bind_renderbuffer(gl::RENDERBUFFER, None);
+                context.draw_buffers(&[gl::COLOR_ATTACHMENT0]);
+                context.read_buffer(gl::COLOR_ATTACHMENT0);
+                let status = context.check_framebuffer_status(gl::FRAMEBUFFER);
+                if status != gl::FRAMEBUFFER_COMPLETE {
+                    return Err(CoreError::ContextCreation(format!(
+                        "the framebuffer of the offscreen screen is not complete (status {status:#x})"
+                    )));
+                }
+                Ok(framebuffer)
+            }
+        };
+        let created = (|| {
+            let main = framebuffer(if multisample { 4 } else { 0 }, &mut renderbuffers)?;
+            let resolved = if multisample {
+                Some(framebuffer(0, &mut renderbuffers)?)
+            } else {
+                None
+            };
+            Ok((main, resolved))
+        })();
+        let former = {
+            let mut screen = self.screen.lock().unwrap_or_else(|e| e.into_inner());
+            match created {
+                Ok((framebuffer, resolved)) => screen.replace(OffscreenScreen {
+                    width,
+                    height,
+                    depth,
+                    multisample,
+                    framebuffer,
+                    renderbuffers,
+                    resolved,
+                }),
+                Err(error) => {
+                    unsafe {
+                        context.bind_framebuffer(gl::FRAMEBUFFER, None);
+                        for renderbuffer in renderbuffers {
+                            context.delete_renderbuffer(renderbuffer);
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        };
+        unsafe {
+            if let Some(former) = former {
+                context.delete_framebuffer(former.framebuffer);
+                if let Some(resolved) = former.resolved {
+                    context.delete_framebuffer(resolved);
+                }
+                for renderbuffer in former.renderbuffers {
+                    context.delete_renderbuffer(renderbuffer);
+                }
+            }
+            context.bind_framebuffer(gl::FRAMEBUFFER, self.screen_framebuffer());
+        }
+        Ok(())
+    }
+
+    ///
+    /// Changes the size of the offscreen screen. Returns whether there is one.
+    ///
+    #[allow(dead_code)]
+    pub fn resize_offscreen_screen(&self, width: u32, height: u32) -> Result<bool, CoreError> {
+        let settings = {
+            let screen = self.screen.lock().unwrap_or_else(|e| e.into_inner());
+            screen
+                .as_ref()
+                .map(|s| (s.width, s.height, s.depth, s.multisample))
+        };
+        match settings {
+            Some((old_width, old_height, depth, multisample)) => {
+                if (old_width, old_height) != (width.max(1), height.max(1)) {
+                    self.set_offscreen_screen(width, height, depth, multisample)?;
+                }
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn has_offscreen_screen(&self) -> bool {
+        self.screen_framebuffer().is_some()
+    }
+
+    /// The framebuffer that is the screen: the offscreen screen if there is one, otherwise the default framebuffer.
+    fn screen_framebuffer(&self) -> Option<crate::context::Framebuffer> {
+        self.screen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|screen| screen.framebuffer)
+    }
+
+    fn framebuffer(&self, target: &PassTarget) -> Option<crate::context::Framebuffer> {
+        match target.framebuffer {
+            Some(framebuffer) => Some(framebuffer.gl()),
+            None => self.screen_framebuffer(),
+        }
+    }
+
+    ///
+    /// A multisampled offscreen screen cannot be read from directly. This copies it to its framebuffer with one sample per pixel
+    /// and binds that one for reading.
+    ///
+    fn resolve_offscreen_screen(&self, source: &PassTarget) {
+        if source.framebuffer.is_some() {
+            return;
+        }
+        let screen = self.screen.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((screen, resolved)) = screen
+            .as_ref()
+            .and_then(|screen| Some((screen, screen.resolved?)))
+        {
+            use crate::context as gl;
+            let (width, height) = (screen.width as i32, screen.height as i32);
+            self.set_scissor(ScissorBox::new_at_origo(screen.width, screen.height));
+            unsafe {
+                self.context
+                    .bind_framebuffer(gl::READ_FRAMEBUFFER, Some(screen.framebuffer));
+                self.context
+                    .bind_framebuffer(gl::DRAW_FRAMEBUFFER, Some(resolved));
+                let mut mask = gl::COLOR_BUFFER_BIT;
+                if screen.depth {
+                    mask |= gl::DEPTH_BUFFER_BIT;
+                }
+                self.context.blit_framebuffer(
+                    0,
+                    0,
+                    width,
+                    height,
+                    0,
+                    0,
+                    width,
+                    height,
+                    mask,
+                    gl::NEAREST,
+                );
+                self.context
+                    .bind_framebuffer(gl::DRAW_FRAMEBUFFER, Some(screen.framebuffer));
+                self.context
+                    .bind_framebuffer(gl::READ_FRAMEBUFFER, Some(resolved));
+            }
+        }
     }
 
     ///
@@ -98,7 +329,7 @@ impl GlBackend {
     fn bind_target(&self, target: &PassTarget, binding: u32) {
         unsafe {
             self.context
-                .bind_framebuffer(binding, target.framebuffer.map(|f| f.gl()));
+                .bind_framebuffer(binding, self.framebuffer(target));
         }
         if let Some(ref color) = target.color {
             self.attach_color(color);
@@ -814,10 +1045,8 @@ impl BackendApi for GlBackend {
             destination.height,
         ));
         unsafe {
-            self.context.bind_framebuffer(
-                crate::context::READ_FRAMEBUFFER,
-                source.framebuffer.map(|f| f.gl()),
-            );
+            self.context
+                .bind_framebuffer(crate::context::READ_FRAMEBUFFER, self.framebuffer(source));
 
             self.context.blit_framebuffer(
                 0,
@@ -837,6 +1066,7 @@ impl BackendApi for GlBackend {
     fn read_pixels(&self, source: &PassTarget, rect: ScissorBox, format: ReadFormat) -> Vec<u8> {
         self.bind_target(source, crate::context::DRAW_FRAMEBUFFER);
         self.bind_target(source, crate::context::READ_FRAMEBUFFER);
+        self.resolve_offscreen_screen(source);
         let (gl_format, gl_data_type, pixel_size) = match format {
             ReadFormat::Color(format) => (
                 format_from_channels(format.channels),
