@@ -58,8 +58,8 @@ preview.render(&target); // exposed, tone mapped and sRGB encoded
 
 On the CPU the preview traces on a thread of its own (`PreviewSettings::cpu_in_background`, not in the browser), so
 the frame rate of the application does not depend on the tracer; `update` shows the newest image. `driver_problem`
-names devices whose drivers crash compiling the tracer (Intel graphics of the 7th generation with Mesa's crocus or
-hasvk); `RaytraceSupport::of` reports `Cpu` for them and the preview says why.
+names devices whose drivers crash with the tracer (none known at the moment); `RaytraceSupport::of` reports `Cpu` for
+them and the preview says why.
 
 Textures are shared with wgpu through `Texture2D::as_wgpu` in three-d, which keeps the order of three-d's work and the
 tracer's on the queue.
