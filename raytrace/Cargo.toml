@@ -10,9 +10,14 @@ publish = false
 default = ["export"]
 # Writing the image as PNG (tone mapped) or OpenEXR (linear HDR)
 export = ["dep:image"]
+# Showing the render image with three-d: as a texture with any backend
+three-d = ["dep:three-d"]
+# The wgpu backend of three-d: device access and what the GPU tracers need
+wgpu = ["three-d", "three-d/wgsl"]
 
 [dependencies]
 three-d-asset = "0.10"
+three-d = { path = "..", default-features = false, optional = true }
 image = { version = "0.25", default-features = false, features = ["png", "exr"], optional = true }
 
 [dev-dependencies]

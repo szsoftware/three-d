@@ -440,3 +440,103 @@ fn adapter_is_the_expected_one() {
         );
     }
 }
+
+#[test]
+fn texture_written_outside_three_d() {
+    // Work recorded before as_wgpu comes first, a write through the queue after it, and three-d sees the result
+    let Some(context) = context() else { return };
+    let texture = target_texture(&context, 4, 2);
+    texture
+        .as_color_target(None)
+        .clear(ClearState::color(1.0, 0.0, 0.0, 1.0));
+    let raw = texture.as_wgpu().unwrap();
+    let (_, queue) = context.as_wgpu().unwrap();
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &raw,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &[0, 255, 0, 255],
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4),
+            rows_per_image: None,
+        },
+        wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+    // three-d's rows start at the bottom (v = 0) and reading returns them in that order, wgpu's rows start at the top
+    let pixels: Vec<[u8; 4]> = texture.as_color_target(None).read();
+    for (i, p) in pixels.iter().enumerate() {
+        let expected = if i == 4 {
+            [0, 255, 0, 255]
+        } else {
+            [255, 0, 0, 255]
+        };
+        assert_eq!(*p, expected, "pixel {i}");
+    }
+}
+
+#[test]
+fn float_texture_written_outside_three_d() {
+    // 32 bit floats are rendered through an integer twin on OpenGL, which has to pick up the new content
+    let Some(context) = context() else { return };
+    let texture = Texture2D::new_empty::<[f32; 4]>(
+        &context,
+        4,
+        2,
+        Interpolation::Nearest,
+        Interpolation::Nearest,
+        None,
+        Wrapping::ClampToEdge,
+        Wrapping::ClampToEdge,
+    );
+    texture
+        .as_color_target(None)
+        .clear(ClearState::color(0.25, 0.25, 0.25, 1.0));
+    let raw = texture.as_wgpu().unwrap();
+    let (_, queue) = context.as_wgpu().unwrap();
+    let texel: Vec<u8> = [2.0f32, 2.0, 2.0, 1.0]
+        .iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &raw,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &texel,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(16),
+            rows_per_image: None,
+        },
+        wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+    // Render into the right half afterwards, the written texel on the left must stay
+    texture.as_color_target(None).clear_partially(
+        ScissorBox {
+            x: 2,
+            y: 0,
+            width: 2,
+            height: 2,
+        },
+        ClearState::color(0.75, 0.75, 0.75, 1.0),
+    );
+    let pixels: Vec<[f32; 4]> = texture.as_color_target(None).read();
+    let expected = [0.25, 0.25, 0.75, 0.75, 2.0, 0.25, 0.75, 0.75];
+    for (i, p) in pixels.iter().enumerate() {
+        assert_eq!(p[0], expected[i], "pixel {i}: {pixels:?}");
+    }
+}

@@ -1,11 +1,11 @@
 //!
-//! Tracers add samples of the scene to a film. Every tracer uses the same scene, film and material model.
+//! Tracers add samples of the scene to a render image. Every tracer uses the same scene, render image and material model.
 //!
 
 use crate::sampling::*;
 use crate::{
-    AccelBuilder, Camera, CpuAccel, CpuBvhBuilder, Film, Hit, RtEnvironment, RtError, RtLight,
-    RtMaterial, RtScene,
+    AccelBuilder, Camera, CpuAccel, CpuBvhBuilder, Hit, RenderImage, RtEnvironment, RtError,
+    RtLight, RtMaterial, RtScene,
 };
 use std::f32::consts::PI;
 use three_d_asset::prelude::*;
@@ -52,7 +52,7 @@ impl Default for TraceSettings {
 }
 
 ///
-/// Adds samples of a scene, seen by a camera, to a film.
+/// Adds samples of a scene, seen by a camera, to a render image.
 ///
 /// Implementations: [CpuReferenceTracer] now; compute shader and ray query tracers on the wgpu backend later. The
 /// shading is the same in all of them, they differ in how rays find the triangles they hit.
@@ -65,14 +65,14 @@ pub trait Tracer {
     fn prepare(&mut self, scene: &RtScene) -> Result<(), RtError>;
 
     ///
-    /// Adds [TraceSettings::samples_per_call] samples to every pixel of the film. The film's samples have to be from
+    /// Adds [TraceSettings::samples_per_call] samples to every pixel of the render image. The render image's samples have to be from
     /// the same scene and camera, reset it when they change.
     ///
     fn trace(
         &mut self,
         scene: &RtScene,
         camera: &Camera,
-        film: &mut Film,
+        render_image: &mut RenderImage,
         settings: &TraceSettings,
     ) -> Result<(), RtError>;
 }
@@ -141,10 +141,10 @@ impl Tracer for CpuReferenceTracer {
         &mut self,
         scene: &RtScene,
         camera: &Camera,
-        film: &mut Film,
+        render_image: &mut RenderImage,
         settings: &TraceSettings,
     ) -> Result<(), RtError> {
-        film.check_not_empty()?;
+        render_image.check_not_empty()?;
         self.prepare(scene)?;
         let accel = self.accel.as_ref().expect("prepared");
         let context = PathContext {
@@ -152,13 +152,16 @@ impl Tracer for CpuReferenceTracer {
             accel,
             rays: CameraRays::new(camera),
             settings: *settings,
-            width: film.width(),
-            height: film.height(),
-            first_sample: film.sample_count(),
+            width: render_image.width(),
+            height: render_image.height(),
+            first_sample: render_image.sample_count(),
         };
-        let width = film.width() as usize;
-        let threads = self.thread_count().min(film.height() as usize).max(1);
-        let rows = film.rows_mut();
+        let width = render_image.width() as usize;
+        let threads = self
+            .thread_count()
+            .min(render_image.height() as usize)
+            .max(1);
+        let rows = render_image.rows_mut();
         if threads == 1 {
             for (y, row) in rows.chunks_mut(width).enumerate() {
                 context.render_row(y as u32, row);
@@ -181,7 +184,7 @@ impl Tracer for CpuReferenceTracer {
                 }
             });
         }
-        film.add_samples(settings.samples_per_call);
+        render_image.add_samples(settings.samples_per_call);
         Ok(())
     }
 }

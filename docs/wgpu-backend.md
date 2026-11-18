@@ -30,7 +30,7 @@ Without the feature, wgpu is not compiled and the dependencies are the same as u
 `BackendPreference::Auto` takes wgpu if there is a hardware adapter and OpenGL/WebGL otherwise.
 A browser cannot wait for WebGPU, so only `Window::new_async` can give you WebGPU there. `Window::new_with_backend` with `Auto` means WebGL2 in a browser.
 
-`context.as_gl()` and `context.as_wgpu()` tell which backend a context uses and give access to the low-level API of that backend.
+`context.as_gl()` and `context.as_wgpu()` tell which backend a context uses and give access to the low-level API of that backend. `texture.as_wgpu()` gives the wgpu texture of a `Texture2D`, for example to write it from your own compute shader; it submits what three-d recorded so far, so the order of your work and three-d's is kept. Its rows are upside down compared to three-d's data: the first wgpu row is the top of the image (texture coordinate v = 1).
 
 ```rust
 let window = Window::new_with_backend(WindowSettings::default(), BackendPreference::Auto)?;

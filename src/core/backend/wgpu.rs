@@ -469,6 +469,22 @@ impl WgpuBackend {
     }
 
     ///
+    /// The wgpu texture of a texture for use outside three-d, see [crate::Texture2D::as_wgpu]. Submits everything recorded so far,
+    /// and forgets the integer twin of a 32 bit float texture (see [bits]), which is made again from the texture when it is rendered into,
+    /// because the caller may change the texture.
+    ///
+    pub(crate) fn external_texture(&self, texture: TextureId) -> w::Texture {
+        let state = &mut *self.lock();
+        let id = texture.wgpu();
+        self.synchronize_bits(state, id);
+        self.flush(state);
+        let entry = state.textures.get_mut(&id).unwrap();
+        entry.has_content = true;
+        entry.bits = None;
+        entry.texture.clone()
+    }
+
+    ///
     /// Submits everything that is recorded. Must be called before data is written through the queue into a resource that recorded commands may use,
     /// because such writes take effect before the commands of an encoder that is submitted later.
     ///
