@@ -340,6 +340,77 @@ pub enum RtLight {
         /// Luminous intensity in cd, about 80 for a 1000 lm bulb.
         intensity: f32,
     },
+    ///
+    /// A glowing parallelogram, for example a ceiling panel or a window seen as a light, with soft shadows. It shines
+    /// from the side `edge_u × edge_v` points to, and from both sides if `two_sided`. Every point emits the same
+    /// luminance in every direction, so a one sided light of area A sends out π·A·luminance lumen.
+    ///
+    /// Area lights are seen by camera rays and reflections but do not cast shadows themselves.
+    ///
+    Rect {
+        /// One corner in world coordinates.
+        corner: Vec3,
+        /// The edge from the corner along the first side.
+        edge_u: Vec3,
+        /// The edge from the corner along the second side.
+        edge_v: Vec3,
+        /// Linear color, scaled by the luminance.
+        color: Vec3,
+        /// Luminance in cd/m².
+        luminance: f32,
+        /// Shines from both sides.
+        two_sided: bool,
+    },
+    ///
+    /// A glowing ball, for example a bulb, with soft shadows. A sphere of radius r sends out 4π²·r²·luminance lumen.
+    /// Like [RtLight::Rect] it is seen but casts no shadows.
+    ///
+    Sphere {
+        /// Center in world coordinates.
+        center: Vec3,
+        /// Radius in meters.
+        radius: f32,
+        /// Linear color, scaled by the luminance.
+        color: Vec3,
+        /// Luminance in cd/m².
+        luminance: f32,
+    },
+}
+
+impl RtLight {
+    /// A ball of the given radius that sends out `flux` lumen, like a bulb of that many lumen.
+    pub fn sphere_with_flux(center: Vec3, radius: f32, color: Vec3, flux: f32) -> Self {
+        Self::Sphere {
+            center,
+            radius,
+            color,
+            luminance: flux / (4.0 * std::f32::consts::PI.powi(2) * radius * radius),
+        }
+    }
+
+    /// A one sided panel that sends out `flux` lumen.
+    pub fn rect_with_flux(
+        corner: Vec3,
+        edge_u: Vec3,
+        edge_v: Vec3,
+        color: Vec3,
+        flux: f32,
+    ) -> Self {
+        let area = edge_u.cross(edge_v).magnitude();
+        Self::Rect {
+            corner,
+            edge_u,
+            edge_v,
+            color,
+            luminance: flux / (std::f32::consts::PI * area.max(1e-12)),
+            two_sided: false,
+        }
+    }
+
+    /// Whether the light has an area, so it is sampled and can be hit by rays.
+    pub fn is_area(&self) -> bool {
+        matches!(self, Self::Rect { .. } | Self::Sphere { .. })
+    }
 }
 
 ///

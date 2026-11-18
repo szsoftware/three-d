@@ -80,10 +80,14 @@ struct Material {
 }
 
 struct Light {
-    // xyz: direction the light shines (w = 0) or position (w = 1)
+    // xyz: direction the light shines (w = 0), position (w = 1), corner of a panel (w = 2) or center of a ball (w = 3)
     position: vec4<f32>,
-    // rgb: color times illuminance or intensity
+    // rgb: color times illuminance, intensity or luminance
     color: vec4<f32>,
+    // Panel: first edge, w = 1 if two sided. Ball: x = radius
+    a: vec4<f32>,
+    // Panel: second edge
+    b: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -207,11 +211,53 @@ fn pcg_hash(v: u32) -> u32 {
     return (w >> 22u) ^ w;
 }
 
+// The first numbers of a pixel sample come from an Owen scrambled Sobol sequence over the samples (sampling.rs)
+const SOBOL_DIMENSIONS: u32 = 16u;
+var<private> pixel_seed: u32;
+var<private> sample_index: u32;
+var<private> dimension: u32;
+
+fn nested_uniform_scramble(x_in: u32, seed: u32) -> u32 {
+    var x = reverseBits(x_in);
+    x += seed;
+    x ^= x * 0x6c50b47cu;
+    x ^= x * 0xb82f1e52u;
+    x ^= x * 0xc7afe638u;
+    x ^= x * 0x8d22f6e6u;
+    return reverseBits(x);
+}
+
+fn sobol_pair(index: u32, seed: u32) -> vec2<u32> {
+    let i = nested_uniform_scramble(index, seed);
+    var y = 0u;
+    var v = 1u << 31u;
+    var bits = i;
+    while bits != 0u {
+        if (bits & 1u) != 0u {
+            y ^= v;
+        }
+        bits >>= 1u;
+        v ^= v >> 1u;
+    }
+    return vec2<u32>(
+        nested_uniform_scramble(reverseBits(i), pcg_hash(seed ^ 0x5bd1e995u)),
+        nested_uniform_scramble(y, pcg_hash(seed ^ 0x68e31da4u)),
+    );
+}
+
 fn next_f32() -> f32 {
-    rng = rng * 747796405u + 2891336453u;
-    let s = rng;
-    let w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
-    return f32(((w >> 22u) ^ w) >> 8u) * (1.0 / 16777216.0);
+    let d = dimension;
+    dimension += 1u;
+    var bits: u32;
+    if d < SOBOL_DIMENSIONS {
+        bits = sobol_pair(sample_index, pcg_hash(pixel_seed ^ pcg_hash(d / 2u)))[d % 2u];
+    } else {
+        rng = rng * 747796405u + 2891336453u;
+        let s = rng;
+        let w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+        bits = (w >> 22u) ^ w;
+    }
+    return f32(bits >> 8u) * (1.0 / 16777216.0);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -703,11 +749,12 @@ struct MaterialSample {
     direction: vec3<f32>,
     // f cos / pdf
     weight: vec3<f32>,
+    pdf: f32,
     valid: bool,
 }
 
 fn sample_material(m: Material, v: vec3<f32>, n: vec3<f32>) -> MaterialSample {
-    var result = MaterialSample(vec3<f32>(0.0), vec3<f32>(0.0), false);
+    var result = MaterialSample(vec3<f32>(0.0), vec3<f32>(0.0), 0.0, false);
     let n_dot_v = dot(n, v);
     if n_dot_v <= 0.0 {
         return result;
@@ -738,6 +785,7 @@ fn sample_material(m: Material, v: vec3<f32>, n: vec3<f32>) -> MaterialSample {
     }
     result.direction = l;
     result.weight = evaluate_material(m, v, l, n) * (n_dot_l / pdf);
+    result.pdf = pdf;
     result.valid = true;
     return result;
 }
@@ -825,16 +873,159 @@ fn direct_light(p: vec3<f32>, v: vec3<f32>, n: vec3<f32>, ng: vec3<f32>, m: Mate
         let light = lights[i];
         if light.position.w == 0.0 {
             result += light_from(p, v, n, ng, m, -normalize(light.position.xyz), BIG, light.color.rgb);
-        } else {
+        } else if light.position.w == 1.0 {
             let to_light = light.position.xyz - p;
             let d2 = dot(to_light, to_light);
             if d2 > 0.0 {
                 let d = sqrt(d2);
                 result += light_from(p, v, n, ng, m, to_light / d, d * (1.0 - 1e-4), light.color.rgb / d2);
             }
+        } else {
+            let u1 = next_f32();
+            let u2 = next_f32();
+            let ls = sample_area_light(light, p, u1, u2);
+            if ls.pdf > 0.0 {
+                // Shared with the material's own samples that hit the light
+                let weight = power_heuristic(ls.pdf, material_pdf(m, v, ls.direction, n)) / ls.pdf;
+                result += light_from(p, v, n, ng, m, ls.direction, ls.distance * (1.0 - 1e-4), light.color.rgb * weight);
+            }
         }
     }
     return result;
+}
+
+// Area lights (light.rs)
+
+struct LightSample {
+    direction: vec3<f32>,
+    distance: f32,
+    // Per solid angle, 0 if there is no sample
+    pdf: f32,
+}
+
+fn sphere_distance(center: vec3<f32>, radius: f32, origin: vec3<f32>, direction: vec3<f32>) -> f32 {
+    let oc = origin - center;
+    let b = dot(oc, direction);
+    let c = dot(oc, oc) - radius * radius;
+    let disc = b * b - c;
+    if disc < 0.0 {
+        return BIG;
+    }
+    let t = -b - sqrt(disc);
+    return select(BIG, t, t > 1e-4);
+}
+
+fn cone_pdf(cos_max: f32) -> f32 {
+    return 1.0 / (2.0 * PI * max(1.0 - cos_max, 1e-7));
+}
+
+fn sample_area_light(light: Light, p: vec3<f32>, u1: f32, u2: f32) -> LightSample {
+    var result = LightSample(vec3<f32>(0.0), 0.0, 0.0);
+    if light.position.w == 2.0 {
+        let normal_scaled = cross(light.a.xyz, light.b.xyz);
+        let area = length(normal_scaled);
+        if area <= 0.0 {
+            return result;
+        }
+        let normal = normal_scaled / area;
+        let q = light.position.xyz + light.a.xyz * u1 + light.b.xyz * u2;
+        let d = q - p;
+        let d2 = dot(d, d);
+        if d2 <= 0.0 {
+            return result;
+        }
+        let distance = sqrt(d2);
+        let direction = d / distance;
+        var c = -dot(normal, direction);
+        if light.a.w > 0.0 {
+            c = abs(c);
+        }
+        if c <= 1e-6 {
+            return result;
+        }
+        return LightSample(direction, distance, d2 / (area * c));
+    }
+    let center = light.position.xyz;
+    let radius = light.a.x;
+    let d = center - p;
+    let d2 = dot(d, d);
+    let r2 = radius * radius;
+    if d2 <= r2 {
+        return result;
+    }
+    let axis = d / sqrt(d2);
+    let cos_max = sqrt(max(1.0 - r2 / d2, 0.0));
+    let t = orthonormal_t(axis);
+    let b = orthonormal_b(axis);
+    let c = uniform_cone(u1, u2, cos_max);
+    let direction = normalize(t * c.x + b * c.y + axis * c.z);
+    var distance = sphere_distance(center, radius, p, direction);
+    if distance >= BIG {
+        distance = sqrt(d2);
+    }
+    return LightSample(direction, distance, cone_pdf(cos_max));
+}
+
+// Distance to the light along the ray, BIG if it is missed
+fn hit_area_light(light: Light, origin: vec3<f32>, direction: vec3<f32>) -> f32 {
+    if light.position.w == 2.0 {
+        let normal = cross(light.a.xyz, light.b.xyz);
+        let n2 = dot(normal, normal);
+        let facing = dot(normal, direction);
+        if n2 <= 0.0 || facing == 0.0 || (light.a.w == 0.0 && facing > 0.0) {
+            return BIG;
+        }
+        let t = dot(normal, light.position.xyz - origin) / facing;
+        if t <= 1e-4 {
+            return BIG;
+        }
+        let q = origin + direction * t - light.position.xyz;
+        let u = dot(cross(q, light.b.xyz), normal) / n2;
+        let v = dot(cross(light.a.xyz, q), normal) / n2;
+        if u < 0.0 || u > 1.0 || v < 0.0 || v > 1.0 {
+            return BIG;
+        }
+        return t;
+    }
+    if light.position.w == 3.0 {
+        let oc = origin - light.position.xyz;
+        if dot(oc, oc) <= light.a.x * light.a.x {
+            return BIG;
+        }
+        return sphere_distance(light.position.xyz, light.a.x, origin, direction);
+    }
+    return BIG;
+}
+
+fn area_light_pdf(light: Light, p: vec3<f32>, direction: vec3<f32>, distance: f32) -> f32 {
+    if light.position.w == 2.0 {
+        let normal = cross(light.a.xyz, light.b.xyz);
+        let area = length(normal);
+        if area <= 0.0 {
+            return 0.0;
+        }
+        let c = abs(dot(normal, direction) / area);
+        if c <= 1e-6 {
+            return 0.0;
+        }
+        return distance * distance / (area * c);
+    }
+    let d = light.position.xyz - p;
+    let d2 = dot(d, d);
+    let r2 = light.a.x * light.a.x;
+    if d2 <= r2 {
+        return 0.0;
+    }
+    return cone_pdf(sqrt(max(1.0 - r2 / d2, 0.0)));
+}
+
+fn power_heuristic(pdf: f32, other: f32) -> f32 {
+    let a = pdf * pdf;
+    let b = other * other;
+    if a + b <= 0.0 {
+        return 0.0;
+    }
+    return a / (a + b);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -858,9 +1049,33 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
     var throughput = vec3<f32>(1.0);
     // Lights that can not be hit by chance (the sun disc) are seen directly only after camera rays and mirrors
     var last_was_delta = true;
+    // Density of the last direction drawn from a material, for weighting area lights hit by chance
+    var last_pdf = 0.0;
     var bounce = 0u;
     loop {
-        let hit = walk(origin, direction, BIG, false);
+        // The nearest area light, ignoring the scene
+        var light_distance = BIG;
+        var light_index = NONE;
+        for (var i = 0u; i < params.settings.y; i++) {
+            if lights[i].position.w >= 2.0 {
+                let t = hit_area_light(lights[i], origin, direction);
+                if t < light_distance {
+                    light_distance = t;
+                    light_index = i;
+                }
+            }
+        }
+        let hit = walk(origin, direction, light_distance, false);
+        if hit.instance == NONE && light_index != NONE {
+            // Area lights end the path; their light was also sampled directly, so both share it
+            let light = lights[light_index];
+            var weight = 1.0;
+            if !last_was_delta {
+                weight = power_heuristic(last_pdf, area_light_pdf(light, origin, direction, light_distance));
+            }
+            result += clamped(bounce, throughput * light.color.rgb * weight);
+            break;
+        }
         if hit.instance == NONE {
             result += clamped(bounce, throughput * environment(direction, last_was_delta));
             break;
@@ -906,6 +1121,7 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
                 break;
             }
             throughput = throughput * next.weight;
+            last_pdf = next.pdf;
             direction = next.direction;
             origin = p;
             last_was_delta = false;
@@ -951,6 +1167,9 @@ fn trace(@builtin(global_invocation_id) id: vec3<u32>) {
     for (var s = 0u; s < tile.samples.y; s++) {
         let sample = tile.samples.x + s;
         rng = pcg_hash(params.settings.x ^ pcg_hash(x ^ pcg_hash(y ^ pcg_hash(sample))));
+        pixel_seed = pcg_hash(params.settings.x ^ pcg_hash(x ^ pcg_hash(y)));
+        sample_index = sample;
+        dimension = 0u;
         let u = (f32(x) + next_f32()) / f32(width);
         let v = 1.0 - (f32(y) + next_f32()) / f32(height);
         let l = radiance(camera_ray_origin(u, v), camera_ray_direction(u, v));

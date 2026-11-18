@@ -2,6 +2,7 @@
 //! Tracers add samples of the scene to a render image. Every tracer uses the same scene, render image and material model.
 //!
 
+use crate::light::*;
 use crate::sampling::*;
 use crate::{
     AccelBuilder, Camera, CpuAccel, CpuBvhBuilder, Hit, RenderImage, RtEnvironment, RtError,
@@ -280,12 +281,31 @@ impl PathContext<'_> {
         let mut throughput = vec3(1.0, 1.0, 1.0);
         // Lights that can not be hit by chance (the sun disc) are seen directly only after camera rays and mirrors
         let mut last_was_delta = true;
+        // Density of the last direction drawn from a material, for weighting area lights hit by chance
+        let mut last_pdf = 0.0;
         let mut bounce = 0;
         loop {
+            let light_hit = self.nearest_area_light(origin, direction);
+            let max_distance = light_hit
+                .as_ref()
+                .map_or(f32::INFINITY, |(_, h)| h.distance);
             let Some(hit) = self
                 .accel
-                .intersect(self.scene, origin, direction, f32::INFINITY)
+                .intersect(self.scene, origin, direction, max_distance)
             else {
+                if let Some((light, light_hit)) = light_hit {
+                    // Area lights end the path; their light was also sampled directly, so both share it
+                    let weight = if last_was_delta {
+                        1.0
+                    } else {
+                        power_heuristic(
+                            last_pdf,
+                            area_light_pdf(light, origin, direction, light_hit.distance),
+                        )
+                    };
+                    result += self.add(bounce, mul(throughput, light_hit.radiance) * weight);
+                    break;
+                }
                 result += self.add(
                     bounce,
                     mul(throughput, self.environment(direction, last_was_delta)),
@@ -332,9 +352,10 @@ impl PathContext<'_> {
                     mul(throughput, self.direct_light(p, v, n, ng, m, rng)),
                 );
 
-                let Some((l, weight)) = sample_material(m, v, n, rng) else {
+                let Some((l, weight, pdf)) = sample_material(m, v, n, rng) else {
                     break;
                 };
+                last_pdf = pdf;
                 if l.dot(ng) <= 0.0 {
                     break;
                 }
@@ -515,9 +536,39 @@ impl PathContext<'_> {
                         );
                     }
                 }
+                RtLight::Rect { .. } | RtLight::Sphere { .. } => {
+                    let (u1, u2) = (rng.next_f32(), rng.next_f32());
+                    if let Some(s) = sample_area_light(light, p, u1, u2) {
+                        // Shared with the material's own samples that hit the light
+                        let weight =
+                            power_heuristic(s.pdf, material_pdf(m, v, s.direction, n)) / s.pdf;
+                        result += self.light_from(
+                            p,
+                            v,
+                            n,
+                            ng,
+                            m,
+                            s.direction,
+                            s.distance * (1.0 - 1e-4),
+                            s.radiance * weight,
+                        );
+                    }
+                }
             }
         }
         result
+    }
+
+    /// The nearest area light along a ray, ignoring the scene.
+    fn nearest_area_light(&self, origin: Vec3, direction: Vec3) -> Option<(&RtLight, LightHit)> {
+        let mut nearest: Option<(&RtLight, LightHit)> = None;
+        for light in self.scene.lights().iter().filter(|l| l.is_area()) {
+            let max = nearest.as_ref().map_or(f32::INFINITY, |(_, h)| h.distance);
+            if let Some(hit) = hit_area_light(light, origin, direction, max) {
+                nearest = Some((light, hit));
+            }
+        }
+        nearest
     }
 
     /// Reflected luminance for illuminance `e` (lux, on a surface facing the light) from direction `l`.
@@ -711,7 +762,7 @@ fn material_pdf(m: &RtMaterial, v: Vec3, l: Vec3, n: Vec3) -> f32 {
 }
 
 ///
-/// A new direction from the material and the weight f·cos/pdf, sampling the glossy part by its visible normals and the
+/// A new direction from the material, the weight f·cos/pdf and the pdf, sampling the glossy part by its visible normals and the
 /// diffuse part by the cosine, combined by their probabilities.
 ///
 pub(crate) fn sample_material(
@@ -719,7 +770,7 @@ pub(crate) fn sample_material(
     v: Vec3,
     n: Vec3,
     rng: &mut Rng,
-) -> Option<(Vec3, Vec3)> {
+) -> Option<(Vec3, Vec3, f32)> {
     let n_dot_v = n.dot(v);
     if n_dot_v <= 0.0 {
         return None;
@@ -744,7 +795,7 @@ pub(crate) fn sample_material(
     if pdf <= 0.0 {
         return None;
     }
-    Some((l, evaluate_material(m, v, l, n) * (n_dot_l / pdf)))
+    Some((l, evaluate_material(m, v, l, n) * (n_dot_l / pdf), pdf))
 }
 
 #[cfg(test)]
@@ -759,7 +810,7 @@ mod tests {
         let count = 200_000;
         let mut sum = 0.0;
         for _ in 0..count {
-            if let Some((_, w)) = sample_material(m, v, n, &mut rng) {
+            if let Some((_, w, _)) = sample_material(m, v, n, &mut rng) {
                 sum += luminance(w);
             }
         }

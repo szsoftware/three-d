@@ -865,6 +865,8 @@ impl SceneBuffers {
                 } => {
                     lights.v3(*direction, 0.0);
                     lights.v3(*color * *illuminance, 0.0);
+                    lights.v3(Vec3::zero(), 0.0);
+                    lights.v3(Vec3::zero(), 0.0);
                 }
                 RtLight::Point {
                     position,
@@ -873,6 +875,32 @@ impl SceneBuffers {
                 } => {
                     lights.v3(*position, 1.0);
                     lights.v3(*color * *intensity, 0.0);
+                    lights.v3(Vec3::zero(), 0.0);
+                    lights.v3(Vec3::zero(), 0.0);
+                }
+                RtLight::Rect {
+                    corner,
+                    edge_u,
+                    edge_v,
+                    color,
+                    luminance,
+                    two_sided,
+                } => {
+                    lights.v3(*corner, 2.0);
+                    lights.v3(*color * *luminance, 0.0);
+                    lights.v3(*edge_u, if *two_sided { 1.0 } else { 0.0 });
+                    lights.v3(*edge_v, 0.0);
+                }
+                RtLight::Sphere {
+                    center,
+                    radius,
+                    color,
+                    luminance,
+                } => {
+                    lights.v3(*center, 3.0);
+                    lights.v3(*color * *luminance, 0.0);
+                    lights.v3(vec3(*radius, 0.0, 0.0), 0.0);
+                    lights.v3(Vec3::zero(), 0.0);
                 }
             }
         }

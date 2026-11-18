@@ -102,8 +102,15 @@ binds (128 MB guaranteed by WebGPU), the largest ones are halved in size until t
 
 ## What the reference tracer does and does not do
 
-- Paths sample the sun disc, directional and point lights at every diffuse or glossy bounce, the sky by the material,
-  and end by Russian roulette.
+- Paths sample the sun disc, directional, point and area lights at every diffuse or glossy bounce, the sky by the
+  material, and end by Russian roulette.
+- Area lights (`RtLight::Rect` for panels and windows, `RtLight::Sphere` for bulbs, both with soft shadows) are sampled
+  directly and also found by the material's own directions; both are weighted by multiple importance sampling (power
+  heuristic), so small bright lights and glossy surfaces both stay calm. `RtLight::sphere_with_flux` and
+  `rect_with_flux` take lumen. Area lights are seen but cast no shadows.
+- The first 16 random numbers of every pixel sample come from an Owen scrambled Sobol sequence (Burley 2020), the rest
+  from PCG. In the garden this lowers the noise at equal samples by about a quarter, so about 1.7 times fewer samples
+  give the same image.
 - Shadow rays pass through transmissive surfaces with their transmission and Fresnel term, so sunlight falls through
   windows into rooms.
 - Not included: caustics (light focused by glass or mirrors onto a surface) and refraction on the way to a light.

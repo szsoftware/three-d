@@ -31,6 +31,7 @@ mod display;
 mod error;
 #[cfg(feature = "wgpu")]
 mod gpu;
+mod light;
 #[cfg(feature = "three-d")]
 mod preview;
 mod render_image;
