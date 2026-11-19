@@ -82,8 +82,9 @@ pub struct PreviewSettings {
     /// halves the GPU's resolution (down to a quarter) and, if that is not enough, goes on with the CPU, which traces
     /// beside the frames. A frame five times longer goes at once to the resolution that would be fast enough, or to the
     /// CPU; [RaytracePreview::availability] then says why. Weak GPUs such as Intel HD 4000 trace no
-    /// faster than four CPU cores and would hold up every frame. `None` keeps the GPU at `gpu_downscale`. Not in
-    /// browsers, which have no clock for it here.
+    /// faster than four CPU cores and would hold up every frame. `None` keeps the GPU at `gpu_downscale`. The frames of
+    /// a browser do not wait for the GPU; there it is the time the GPU takes for the work of one update, from when the
+    /// browser says it is done.
     ///
     pub gpu_frame_time: Option<std::time::Duration>,
     /// The CPU traces at width and height divided by this, 4 by default and 8 in browsers.
@@ -337,41 +338,29 @@ type GpuTracer = Option<std::convert::Infallible>;
 
 /// Times of the frames while the GPU traces.
 #[derive(Default)]
-#[cfg_attr(
-    not(all(feature = "wgpu", not(target_arch = "wasm32"))),
-    allow(dead_code)
-)]
+#[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
 struct Pace {
     #[cfg(not(target_arch = "wasm32"))]
     last: Option<std::time::Instant>,
+    /// In the browser: whether the times of the tracer's calls before this engine were dropped
+    #[cfg(target_arch = "wasm32")]
+    started: bool,
     /// Frames since the engine was made; the first ones wait for shaders to compile
     frames: u32,
     slow: u32,
 }
 
 /// Frames after a new engine that do not count, while its buffers are made.
-#[cfg_attr(
-    not(all(feature = "wgpu", not(target_arch = "wasm32"))),
-    allow(dead_code)
-)]
+#[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
 const WARM_UP_FRAMES: u32 = 1;
 /// Slow frames in a row before the preview gets lighter.
-#[cfg_attr(
-    not(all(feature = "wgpu", not(target_arch = "wasm32"))),
-    allow(dead_code)
-)]
+#[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
 const SLOW_FRAMES: u32 = 3;
 /// A frame this many times slower than the limit makes the preview lighter at once.
-#[cfg_attr(
-    not(all(feature = "wgpu", not(target_arch = "wasm32"))),
-    allow(dead_code)
-)]
+#[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
 const FAR_TOO_SLOW: u32 = 5;
 /// The lowest GPU resolution before the CPU, as a divisor of width and height.
-#[cfg_attr(
-    not(all(feature = "wgpu", not(target_arch = "wasm32"))),
-    allow(dead_code)
-)]
+#[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
 const MAX_GPU_DOWNSCALE: u32 = 4;
 
 impl RaytracePreview {
@@ -550,11 +539,13 @@ impl RaytracePreview {
             }
             _ => None,
         };
-        self.rebuild_with(tracer);
+        // The engine is the placeholder now, which must not be parked over the CPU's samples
+        self.rebuild_with(tracer, false);
     }
 
-    /// Makes the engine with the tracer, on the CPU without one, and starts again.
-    fn rebuild_with(&mut self, tracer: GpuTracer) {
+    /// Makes the engine with the tracer, on the CPU without one, and starts again. From the CPU to the GPU, with
+    /// `park`, the CPU engine waits with its samples.
+    fn rebuild_with(&mut self, tracer: GpuTracer, #[allow(unused_variables)] park: bool) {
         // Back to the CPU: with the samples it had
         #[cfg(feature = "wgpu")]
         if tracer.is_none() {
@@ -607,7 +598,7 @@ impl RaytracePreview {
         let old_traced_for = self.traced_for.take();
         // From the CPU to the GPU: the CPU's samples wait, the worker stops after the sample it traces
         #[cfg(feature = "wgpu")]
-        if !self.on_cpu() && !matches!(old_engine, Engine::Gpu { .. }) {
+        if park && !self.on_cpu() && !matches!(old_engine, Engine::Gpu { .. }) {
             #[cfg(not(target_arch = "wasm32"))]
             if let Engine::CpuWorker { worker, shown, .. } = &old_engine {
                 worker.adjust(*shown, self.settings.denoiser, self.settings.cpu_threads);
@@ -666,7 +657,7 @@ impl RaytracePreview {
             );
         }
         if self.availability == PreviewAvailability::Gpu {
-            self.rebuild_with(tracer);
+            self.rebuild_with(tracer, true);
         }
     }
 
@@ -903,61 +894,93 @@ impl RaytracePreview {
     ///
     /// Watches the time between frames while the GPU traces and makes the preview lighter after
     /// [SLOW_FRAMES] slow frames in a row: half the resolution, down to a quarter, then the CPU. A frame [FAR_TOO_SLOW]
-    /// times slower than the limit goes at once to the resolution that would be fast enough, or to the CPU. Returns
-    /// whether it did.
+    /// times slower than the limit goes at once to the resolution that would be fast enough, or to the CPU. In the
+    /// browser, whose frames do not wait for the GPU, the time the GPU took for each call counts instead, and a far too
+    /// slow call also waits for [SLOW_FRAMES] in a row. Returns whether it did.
     ///
     #[cfg(feature = "wgpu")]
     fn pace_gpu(&mut self) -> bool {
-        #[cfg(target_arch = "wasm32")]
-        return false;
+        let Some(limit) = self.settings.gpu_frame_time else {
+            return false;
+        };
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let Some(limit) = self.settings.gpu_frame_time else {
-                return false;
-            };
             let now = std::time::Instant::now();
             let interval = self.pace.last.replace(now).map(|last| now - last);
-            self.pace.frames += 1;
-            // Only while tracing: a finished image costs the GPU nothing
-            if self.is_done() || self.pace.frames <= WARM_UP_FRAMES {
-                self.pace.slow = 0;
-                return false;
-            }
-            match interval {
-                Some(interval) if interval > limit => self.pace.slow += 1,
-                _ => self.pace.slow = 0,
-            }
-            let Some(interval) = interval.filter(|_| self.pace.slow > 0) else {
+            self.pace_step(interval, limit, true)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let Engine::Gpu { tracer, .. } = &self.engine else {
                 return false;
             };
-            // Far too slow: at once to the resolution that would be fast enough, the time goes with the pixels
-            let far_too_slow = interval > limit * FAR_TOO_SLOW;
-            if self.pace.slow < SLOW_FRAMES && !far_too_slow {
+            if !self.pace.started {
+                // Calls for the engine before, at another resolution, do not count
+                tracer.restart_call_times();
+                self.pace.started = true;
                 return false;
             }
-            let mut scale = self.gpu_scale * 2;
-            if far_too_slow {
-                let pixels = interval.as_secs_f32() / limit.as_secs_f32();
-                while scale <= MAX_GPU_DOWNSCALE
-                    && pixels * (self.gpu_scale as f32 / scale as f32).powi(2) > 1.0
-                {
-                    scale *= 2;
+            for busy in tracer.take_call_times() {
+                let busy = std::time::Duration::from_secs_f64(busy / 1000.0);
+                // Not at once on one slow call: a hidden page stops its frames, and the browser may tell late about
+                // the at most two calls it still had
+                if self.pace_step(Some(busy), limit, false) {
+                    return true;
                 }
             }
-            if scale <= MAX_GPU_DOWNSCALE {
-                self.gpu_scale = scale;
-            } else {
-                self.availability = PreviewAvailability::CpuOnly(format!(
-                    "The GPU needs {} ms per frame at 1/{} of the resolution, too slow even at 1/{}, so ray tracing \
-                     runs on the CPU beside the frames.",
-                    interval.as_millis(),
-                    self.gpu_scale,
-                    MAX_GPU_DOWNSCALE
-                ));
-            }
-            self.rebuild();
-            true
+            false
         }
+    }
+
+    /// One frame (in the browser one call of the GPU) that took `interval` after the one before; see
+    /// [RaytracePreview::pace_gpu]. Without `at_once` a far too slow frame also waits for [SLOW_FRAMES] in a row.
+    #[cfg(feature = "wgpu")]
+    fn pace_step(
+        &mut self,
+        interval: Option<std::time::Duration>,
+        limit: std::time::Duration,
+        at_once: bool,
+    ) -> bool {
+        self.pace.frames += 1;
+        // Only while tracing: a finished image costs the GPU nothing
+        if self.is_done() || self.pace.frames <= WARM_UP_FRAMES {
+            self.pace.slow = 0;
+            return false;
+        }
+        match interval {
+            Some(interval) if interval > limit => self.pace.slow += 1,
+            _ => self.pace.slow = 0,
+        }
+        let Some(interval) = interval.filter(|_| self.pace.slow > 0) else {
+            return false;
+        };
+        // Far too slow: at once to the resolution that would be fast enough, the time goes with the pixels
+        let far_too_slow = interval > limit * FAR_TOO_SLOW;
+        if self.pace.slow < SLOW_FRAMES && !(far_too_slow && at_once) {
+            return false;
+        }
+        let mut scale = self.gpu_scale * 2;
+        if far_too_slow {
+            let pixels = interval.as_secs_f32() / limit.as_secs_f32();
+            while scale <= MAX_GPU_DOWNSCALE
+                && pixels * (self.gpu_scale as f32 / scale as f32).powi(2) > 1.0
+            {
+                scale *= 2;
+            }
+        }
+        if scale <= MAX_GPU_DOWNSCALE {
+            self.gpu_scale = scale;
+        } else {
+            self.availability = PreviewAvailability::CpuOnly(format!(
+                "The GPU needs {} ms per frame at 1/{} of the resolution, too slow even at 1/{}, so ray tracing \
+                 runs on the CPU beside the frames.",
+                interval.as_millis(),
+                self.gpu_scale,
+                MAX_GPU_DOWNSCALE
+            ));
+        }
+        self.rebuild();
+        true
     }
 
     /// What the GPU's width and height are divided by now, raised by the preview on slow GPUs.

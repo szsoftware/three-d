@@ -146,8 +146,24 @@ pub struct ComputeTracer {
     /// [ComputeTracer::unfinished_calls]
     #[cfg(target_arch = "wasm32")]
     unfinished: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// How long the browser's GPU took for the calls of [ComputeTracer::trace_gpu] it finished
+    #[cfg(target_arch = "wasm32")]
+    call_times: std::sync::Arc<std::sync::Mutex<CallTimes>>,
     /// Calls of [ComputeTracer::trace_gpu] logged so far, see [set_gpu_timing_log]
     timed_calls: u32,
+}
+
+/// How long the browser's GPU took for the calls of [ComputeTracer::trace_gpu], see
+/// [ComputeTracer::take_call_times].
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug, Default)]
+struct CallTimes {
+    /// Counted up by [ComputeTracer::restart_call_times]; calls queued before then are not kept
+    round: u64,
+    /// When the GPU finished the last call, in milliseconds of `timing::now`
+    last_done: f64,
+    /// Milliseconds the GPU took for each call finished since the last take
+    finished: Vec<f64>,
 }
 
 /// The first calls of [ComputeTracer::trace_gpu] that [set_gpu_timing_log] logs.
@@ -269,6 +285,8 @@ impl ComputeTracer {
             warm: None,
             #[cfg(target_arch = "wasm32")]
             unfinished: Default::default(),
+            #[cfg(target_arch = "wasm32")]
+            call_times: Default::default(),
             timed_calls: 0,
         }
     }
@@ -779,8 +797,20 @@ impl ComputeTracer {
             use std::sync::atomic::Ordering;
             self.unfinished.fetch_add(1, Ordering::Relaxed);
             let unfinished = self.unfinished.clone();
+            let times = self.call_times.clone();
+            let round = times.lock().map(|times| times.round).unwrap_or_default();
             self.gpu.queue.on_submitted_work_done(move || {
                 unfinished.fetch_sub(1, Ordering::Relaxed);
+                let done = timing::now();
+                if let Ok(mut times) = times.lock() {
+                    // The GPU worked on the call from its start or, if it was busy then, from the end of the call
+                    // before; that includes what the application queued in between, such as the denoiser
+                    let busy = done - start.max(times.last_done);
+                    times.last_done = done;
+                    if times.round == round {
+                        times.finished.push(busy.max(0.0));
+                    }
+                }
             });
         }
         Ok(())
@@ -853,6 +883,28 @@ impl ComputeTracer {
         return self.unfinished.load(std::sync::atomic::Ordering::Relaxed);
         #[cfg(not(target_arch = "wasm32"))]
         0
+    }
+
+    ///
+    /// In the browser: milliseconds the GPU took for each call of [ComputeTracer::trace_gpu] finished since the last
+    /// take, oldest first, from when the browser said the work was done. The frames of a browser do not wait for the
+    /// GPU, so the time between them does not tell.
+    ///
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn take_call_times(&self) -> Vec<f64> {
+        self.call_times
+            .lock()
+            .map(|mut times| std::mem::take(&mut times.finished))
+            .unwrap_or_default()
+    }
+
+    /// In the browser: forgets the times of the calls so far, also of those the GPU has not finished yet.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn restart_call_times(&self) {
+        if let Ok(mut times) = self.call_times.lock() {
+            times.round += 1;
+            times.finished.clear();
+        }
     }
 }
 

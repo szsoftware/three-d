@@ -308,6 +308,40 @@ fn a_slow_gpu_gets_a_lighter_preview() {
 }
 
 #[test]
+fn the_cpu_goes_on_after_the_gpu_changed_its_resolution() {
+    let Some(context) = context() else { return };
+    let mut preview = RaytracePreview::new(&context, 64, 32);
+    preview.wait_for_gpu();
+    if preview.kind() != TracerKind::Compute {
+        return;
+    }
+    let scene = sky_only(1000.0);
+    let camera = camera(64, 32, vec3(0.0, 0.0, 0.0));
+    preview.update(&scene, &camera).unwrap();
+    // Half the resolution on the GPU (as a slow GPU gets it), then far too slow for the GPU at all
+    preview.set_settings(PreviewSettings {
+        gpu_downscale: 2,
+        ..*preview.settings()
+    });
+    preview.update(&scene, &camera).unwrap();
+    assert_eq!(preview.texture().width(), 32);
+    preview.set_settings(PreviewSettings {
+        gpu_frame_time: Some(std::time::Duration::from_nanos(1)),
+        ..*preview.settings()
+    });
+    for _ in 0..10 {
+        preview.update(&scene, &camera).unwrap();
+    }
+    finish(&context);
+    // On the CPU engine from before the GPU, at the CPU's resolution
+    assert_eq!(preview.kind(), TracerKind::CpuReference);
+    assert_eq!(
+        preview.texture().width(),
+        64 / preview.settings().cpu_downscale
+    );
+}
+
+#[test]
 fn the_cpu_traces_while_the_gpu_compiles() {
     let Some(context) = context() else { return };
     let mut preview = RaytracePreview::new(&context, 16, 8);
