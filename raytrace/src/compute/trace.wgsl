@@ -51,6 +51,8 @@ struct Params {
     fog_absorption: vec4<f32>,
     fog_scattering: vec4<f32>,
     fog_shape: vec4<f32>,
+    // The instances of the solids the camera is in, NONE for none (nesting.rs)
+    camera_nest: vec4<u32>,
 }
 
 struct Tile {
@@ -92,7 +94,7 @@ struct Material {
     params: vec4<f32>,
     // rgb: emitted luminance, a: index of refraction
     emission: vec4<f32>,
-    // x: 1 if thin walled, y: normal scale, z: alpha cutout (negative without)
+    // x: 1 if thin walled, y: normal scale, z: alpha cutout (negative without), w: priority of the medium
     flags: vec4<f32>,
     // Textures (NONE without): base color, metallic and roughness, normals, emission
     textures: vec4<u32>,
@@ -137,8 +139,155 @@ fn light_at(i: u32) -> Light {
 // Participating media (medium.rs). Only the pipeline for scenes with media sets MEDIA: in the other one the compiler
 // drops all of it, so the shader stays as small as before for the compilers of small GPUs.
 override MEDIA: bool = false;
+// Surfaces touching the solid a path just left are hit, not jumped over (a pane of glass on the floor); off for the
+// compilers of Intel graphics of the 7th generation, for which the tracer is just small enough without
+override CONTACT: bool = true;
+// The solid a path just left and up to where its surfaces are passed by, NONE for none (tracer.rs past)
+var<private> skip_instance: u32 = 0xffffffffu;
+var<private> skip_until: f32;
 
-// The material of the solid the path is in, NONE in the air with the fog
+// Solids inside solids (nesting.rs): the instances a path is in, in the order it entered them, with their index of
+// refraction (that of the solid around for media without refraction)
+const MAX_NESTED: u32 = 4u;
+struct Nest {
+    solids: array<u32, 4>,
+    iors: array<f32, 4>,
+    count: u32,
+}
+var<private> path_nest: Nest;
+
+fn nest_priority(instance: u32) -> f32 {
+    return materials[instances[instance].info.z].flags.w;
+}
+
+// The entry whose medium the path is in: the highest priority, at equal priority the last; NONE in the air
+fn nest_top(n: Nest) -> u32 {
+    var top = NONE;
+    var best = -1.0;
+    for (var i = 0u; i < n.count; i++) {
+        let p = nest_priority(n.solids[i]);
+        if p >= best {
+            best = p;
+            top = i;
+        }
+    }
+    return top;
+}
+
+fn nest_ior(n: Nest) -> f32 {
+    let top = nest_top(n);
+    if top == NONE {
+        return 1.0;
+    }
+    return n.iors[top];
+}
+
+// The material of the solid whose medium the path is in, NONE in the air
+fn nest_material(n: Nest) -> u32 {
+    let top = nest_top(n);
+    if top == NONE {
+        return NONE;
+    }
+    return instances[n.solids[top]].info.z;
+}
+
+fn nest_contains(n: Nest, instance: u32) -> bool {
+    for (var i = 0u; i < n.count; i++) {
+        if n.solids[i] == instance {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn nest_with(n_in: Nest, instance: u32) -> Nest {
+    var n = n_in;
+    var ior = materials[instances[instance].info.z].emission.w;
+    if ior == 1.0 {
+        ior = nest_ior(n);
+    }
+    if n.count == MAX_NESTED {
+        // The oldest of the lowest priority goes
+        var lowest = 0u;
+        for (var i = 1u; i < n.count; i++) {
+            if nest_priority(n.solids[i]) < nest_priority(n.solids[lowest]) {
+                lowest = i;
+            }
+        }
+        for (var i = lowest; i + 1u < n.count; i++) {
+            n.solids[i] = n.solids[i + 1u];
+            n.iors[i] = n.iors[i + 1u];
+        }
+        n.count -= 1u;
+    }
+    n.solids[n.count] = instance;
+    n.iors[n.count] = ior;
+    n.count += 1u;
+    return n;
+}
+
+fn nest_without(n_in: Nest, instance: u32) -> Nest {
+    var n = n_in;
+    var j = 0u;
+    for (var i = 0u; i < n_in.count; i++) {
+        if n_in.solids[i] != instance {
+            n.solids[j] = n_in.solids[i];
+            n.iors[j] = n_in.iors[i];
+            j += 1u;
+        }
+    }
+    n.count = j;
+    return n;
+}
+
+struct Crossing {
+    after: Nest,
+    seen: bool,
+    // Index of refraction after over before
+    eta: f32,
+}
+
+// Through a surface of the solid, into it on its front (Inside::cross)
+fn nest_cross(n: Nest, instance: u32, front_face: bool) -> Crossing {
+    if front_face == nest_contains(n, instance) {
+        return Crossing(n, false, 1.0);
+    }
+    var after = nest_without(n, instance);
+    var seen = false;
+    if front_face {
+        after = nest_with(n, instance);
+        let top = nest_top(after);
+        seen = after.solids[top] == instance;
+    } else {
+        seen = n.solids[nest_top(n)] == instance;
+    }
+    var eta = 1.0;
+    if seen {
+        eta = nest_ior(after) / nest_ior(n);
+    }
+    return Crossing(after, seen, eta);
+}
+
+fn camera_nest() -> Nest {
+    var n = Nest(array<u32, 4>(NONE, NONE, NONE, NONE), array<f32, 4>(1.0, 1.0, 1.0, 1.0), 0u);
+    for (var i = 0u; i < 4u; i++) {
+        if params.camera_nest[i] != NONE {
+            n = nest_with(n, params.camera_nest[i]);
+        }
+    }
+    return n;
+}
+
+// The surfaces of solids along a shadow ray in a scene with media, in the order they are hit
+const MAX_CROSSINGS: u32 = 8u;
+var<private> crossing_t: array<f32, 8>;
+// The instance, with the top bit set where the ray hits the front
+var<private> crossing_info: array<u32, 8>;
+// The cosine of the angle, base color times transmission
+var<private> crossing_color: array<vec4<f32>, 8>;
+var<private> crossing_count: u32;
+
+// The material of the solid whose medium the path is in (the top of path_nest), NONE in the air with the fog
 var<private> path_medium: u32;
 // Whether the shadow rays are for a point in a medium, and its anisotropy
 var<private> medium_event: bool;
@@ -281,8 +430,82 @@ fn sample_medium(o: vec3<f32>, d: vec3<f32>, end: f32) -> MediumStep {
     return MediumStep(tr / p, -1.0, 0.0);
 }
 
-// What the media along a shadow ray let through, from the sums of shadow_hit
+// The light a shadow ray loses between two distances in the solid or the air
+fn segment_depth(n: Nest, o: vec3<f32>, d: vec3<f32>, t0: f32, t1: f32) -> vec3<f32> {
+    let material = nest_material(n);
+    if material == NONE {
+        if params.fog_shape.y == 0.0 {
+            return vec3<f32>(0.0);
+        }
+        let depth = max(fog_depth(o, d, t1) - fog_depth(o, d, t0), 0.0);
+        return (params.fog_absorption.rgb + params.fog_scattering.rgb) * depth;
+    }
+    return material_extinction(materials[material]) * max(t1 - t0, 0.0);
+}
+
+// What the solids and media along a shadow ray let through, the surfaces of solids taken in their order
+// (tracer.rs transmittance); the sums of shadow_hit where there are too many surfaces
 fn crossed_transmittance(o: vec3<f32>, d: vec3<f32>, distance: f32) -> vec3<f32> {
+    if crossing_count > MAX_CROSSINGS {
+        return summed_transmittance(o, d, distance);
+    }
+    // Sorted by distance
+    for (var i = 1u; i < crossing_count; i++) {
+        var j = i;
+        while j > 0u && crossing_t[j - 1u] > crossing_t[j] {
+            let t = crossing_t[j];
+            crossing_t[j] = crossing_t[j - 1u];
+            crossing_t[j - 1u] = t;
+            let info = crossing_info[j];
+            crossing_info[j] = crossing_info[j - 1u];
+            crossing_info[j - 1u] = info;
+            let color = crossing_color[j];
+            crossing_color[j] = crossing_color[j - 1u];
+            crossing_color[j - 1u] = color;
+            j -= 1u;
+        }
+    }
+    var n = path_nest;
+    var start = 0.0;
+    var depth = vec3<f32>(0.0);
+    var through = vec3<f32>(1.0);
+    for (var i = 0u; i < crossing_count; i++) {
+        depth += segment_depth(n, o, d, start, crossing_t[i]);
+        let c = nest_cross(n, crossing_info[i] & 0x7fffffffu, (crossing_info[i] & 0x80000000u) != 0u);
+        if c.seen {
+            // Straight through, so the reflection is the same both ways
+            var eta = c.eta;
+            if eta < 1.0 {
+                eta = 1.0 / eta;
+            }
+            through *= crossing_color[i].rgb * (1.0 - fresnel_dielectric(crossing_color[i].w, eta));
+        }
+        n = c.after;
+        start = crossing_t[i];
+    }
+    if distance >= 0.5 * BIG {
+        // Open meshes and fog that does not thin out: the medium does not end
+        var sigma = vec3<f32>(0.0);
+        let material = nest_material(n);
+        if material != NONE {
+            sigma = material_extinction(materials[material]);
+        } else if params.fog_shape.y > 0.0 && fog_depth(o, d, BIG) >= 0.5 * BIG {
+            sigma = params.fog_absorption.rgb + params.fog_scattering.rgb;
+        }
+        if any(sigma > vec3<f32>(0.0)) {
+            return select(through, vec3<f32>(0.0), sigma > vec3<f32>(0.0));
+        }
+        if material == NONE && params.fog_shape.y > 0.0 {
+            depth += (params.fog_absorption.rgb + params.fog_scattering.rgb) * max(fog_depth(o, d, BIG) - fog_depth(o, d, start), 0.0);
+        }
+        return through * exp(-max(depth, vec3<f32>(0.0)));
+    }
+    depth += segment_depth(n, o, d, start, distance);
+    return through * exp(-max(depth, vec3<f32>(0.0)));
+}
+
+// What the media along a shadow ray let through, from the sums of shadow_hit, which do not know the order
+fn summed_transmittance(o: vec3<f32>, d: vec3<f32>, distance: f32) -> vec3<f32> {
     let finite = distance < 0.5 * BIG;
     var start = vec3<f32>(0.0);
     if path_medium != NONE {
@@ -562,8 +785,26 @@ fn shadow_hit(index: u32, m: Material, p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f3
     let transmission = m.params.w;
     let face = face_normal_in_world(index, p0, p1, p2);
     let cos_i = clamp(abs(dot(face, shadow_direction)), 0.0, 1.0);
-    let f = fresnel_dielectric(cos_i, m.emission.w);
-    transmittance = transmittance * m.base_color.rgb * (transmission * (1.0 - f));
+    if MEDIA && m.flags.x == 0.0 {
+        // Solids in their order in crossed_transmittance, with the Fresnel term from the media on both sides
+        if crossing_count < MAX_CROSSINGS {
+            crossing_t[crossing_count] = t;
+            crossing_info[crossing_count] = index | select(0u, 0x80000000u, dot(face, shadow_direction) < 0.0);
+            crossing_color[crossing_count] = vec4<f32>(m.base_color.rgb * transmission, cos_i);
+        } else if crossing_count == MAX_CROSSINGS {
+            // From now on the sums
+            for (var i = 0u; i < MAX_CROSSINGS; i++) {
+                transmittance *= crossing_color[i].rgb * (1.0 - fresnel_dielectric(crossing_color[i].w, materials[instances[crossing_info[i] & 0x7fffffffu].info.z].emission.w));
+            }
+        }
+        crossing_count += 1u;
+        if crossing_count > MAX_CROSSINGS {
+            transmittance = transmittance * m.base_color.rgb * (transmission * (1.0 - fresnel_dielectric(cos_i, m.emission.w)));
+        }
+    } else {
+        let f = fresnel_dielectric(cos_i, m.emission.w);
+        transmittance = transmittance * m.base_color.rgb * (transmission * (1.0 - f));
+    }
     if MEDIA && m.flags.x == 0.0 {
         let sign = select(-1.0, 1.0, dot(face, shadow_direction) > 0.0);
         let extinction = material_extinction(m);
@@ -603,6 +844,9 @@ fn walk_mesh(index: u32, o: vec3<f32>, d: vec3<f32>, t_max: ptr<function, f32>, 
                 let p2 = vertices[tri.z].position.xyz;
                 let r = intersect_triangle(o, d, p0, p1, p2);
                 if r.x > 0.0 && r.x < *t_max {
+                    if CONTACT && !shadow && index == skip_instance && r.x < skip_until {
+                        continue;
+                    }
                     // Textures for cut-outs (alpha of the base color) and for glass on shadow rays, with one lookup
                     let raw = materials[info.z];
                     let glass = shadow && raw.params.w > 0.0;
@@ -827,6 +1071,18 @@ fn tangent_frame(instance: Instance, v0: Vertex, v1: Vertex, v2: Vertex, w: f32,
     frame.b = cross(n, frame.t) * sign;
     frame.valid = true;
     return frame;
+}
+
+// The distance by which rays leave surfaces (offset_point), tracer.rs past
+fn contact_gap(p: vec3<f32>) -> f32 {
+    return 1e-4 * max(1.0, max(max(abs(p.x), abs(p.y)), abs(p.z)));
+}
+
+// After passing a surface of the instance at p: the next ray starts a little before it, with the instance's surfaces
+// passed by there
+fn pass_surface(p: vec3<f32>, instance: u32) {
+    skip_instance = instance;
+    skip_until = 2.0 * contact_gap(p);
 }
 
 fn offset_point(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
@@ -1409,8 +1665,12 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
     // Boundaries of media passed, which are no bounce
     var passes = 0u;
     if MEDIA {
-        path_medium = NONE;
+        path_nest = camera_nest();
+        path_medium = nest_material(path_nest);
         medium_event = false;
+    }
+    if CONTACT {
+        skip_instance = NONE;
     }
     loop {
         // The only traversal in the shader: a shadow ray while lights of a surface are tested, else the path's next ray
@@ -1435,6 +1695,7 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
                 crossed_extinction = vec3<f32>(0.0);
                 crossed_fog = 0.0;
                 crossed_count = 0.0;
+                crossing_count = 0u;
                 shadow_origin = origin;
             }
         } else {
@@ -1449,6 +1710,9 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
             }
         }
         let hit = walk(ray_origin, ray_direction, light_distance, shadow);
+        if CONTACT && !shadow {
+            skip_instance = NONE;
+        }
         // A diffuse or glossy surface whose lights are all tested: continue the path with a direction from its material
         var lit = false;
         if shadow {
@@ -1523,10 +1787,31 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
                 break;
             } else {
             let s = surface_at(hit, direction);
+            let m = s.material;
+            let solid = m.params.w > 0.0 && m.flags.x == 0.0;
+            var crossing = Crossing(path_nest, true, 1.0);
+            if MEDIA && solid {
+                crossing = nest_cross(path_nest, hit.instance, s.front_face);
+            }
+            if MEDIA && !crossing.seen {
+                // Inside a solid of higher priority, or touching another: not there for light
+                path_nest = crossing.after;
+                path_medium = nest_material(path_nest);
+                if CONTACT {
+                    pass_surface(s.position, hit.instance);
+                    origin = s.position - direction * contact_gap(s.position);
+                } else {
+                    origin = offset_point(s.position, -s.geometric_normal);
+                }
+                passes += 1u;
+                if passes > 64u {
+                    break;
+                }
+                continue;
+            }
             if bounce == 0u && (!MEDIA || passes == 0u) {
                 add_features(feature_albedo(s.material), s.shading_normal, hit.t);
             }
-            let m = s.material;
             result += clamped(bounce, throughput * m.emission.rgb);
             if bounce >= params.camera.w {
                 break;
@@ -1543,7 +1828,10 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
             if transmission > 0.0 && next_f32() < transmission {
                 // Smooth glass: reflect or pass, chosen by the Fresnel term
                 let ior = m.emission.w;
-                let eta = select(1.0 / ior, ior, thin_walled || s.front_face);
+                var eta = select(1.0 / ior, ior, thin_walled || s.front_face);
+                if MEDIA && solid {
+                    eta = crossing.eta;
+                }
                 let cos_i = clamp(dot(n, v), 0.0, 1.0);
                 var refracted = vec4<f32>(direction, 1.0);
                 if !thin_walled {
@@ -1552,16 +1840,21 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
                 var invisible = false;
                 if refracted.w > 0.0 && next_f32() >= fresnel_dielectric(cos_i, eta) {
                     throughput = throughput * m.base_color.rgb;
+                    origin = offset_point(s.position, -ng);
                     if !thin_walled {
                         direction = refracted.xyz;
-                        glass_bent = glass_bent || ior != 1.0;
+                        glass_bent = glass_bent || eta != 1.0;
                         if MEDIA {
-                            path_medium = select(NONE, instances[hit.instance].info.z, s.front_face);
+                            path_nest = crossing.after;
+                            path_medium = nest_material(path_nest);
                             // The boundary of a medium is no bounce, it is not seen
-                            invisible = ior == 1.0;
+                            invisible = eta == 1.0;
+                        }
+                        if CONTACT {
+                            pass_surface(s.position, hit.instance);
+                            origin = s.position - direction * contact_gap(s.position);
                         }
                     }
-                    origin = offset_point(s.position, -ng);
                 } else {
                     // Reflected, also all of it inside the glass
                     direction = reflect_about(v, n);

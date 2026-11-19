@@ -23,9 +23,9 @@ const COMPILE: &str = "
     const traceLayout = layoutOf(trace);
     const photonLayout = layoutOf(photons);
     const stage = (entryPoint, constants) => constants ? { module, entryPoint, constants } : { module, entryPoint };
-    const jobs = [device.createComputePipelineAsync({ layout: traceLayout, compute: stage('trace') })];
+    const jobs = [device.createComputePipelineAsync({ layout: traceLayout, compute: stage('trace', constants) })];
     if (media) jobs.push(device.createComputePipelineAsync({ layout: traceLayout, compute: stage('trace', media) }));
-    for (const entry of entries) jobs.push(device.createComputePipelineAsync({ layout: photonLayout, compute: stage(entry) }));
+    for (const entry of entries) jobs.push(device.createComputePipelineAsync({ layout: photonLayout, compute: stage(entry, constants) }));
     return Promise.all(jobs);
 ";
 
@@ -53,21 +53,35 @@ fn spec(slots: &[(u32, Slot)]) -> Array {
 /// Compiles the pipelines of the tracer on the browser's device, with the one for participating media if `media`.
 /// Resolves to the pipelines, which have to be kept until wgpu made its own, or to the browser's error.
 ///
-pub(super) async fn compile(device: &JsValue, media: bool) -> Result<JsValue, JsValue> {
-    let function = Function::new_with_args("device, code, trace, photons, entries, media", COMPILE);
-    let media = if media {
-        let constants = js_sys::Object::new();
-        for (name, value) in MEDIA_CONSTANTS {
+pub(super) async fn compile(
+    device: &JsValue,
+    media: bool,
+    constants: &[(&str, f64)],
+) -> Result<JsValue, JsValue> {
+    let function = Function::new_with_args(
+        "device, code, trace, photons, entries, media, constants",
+        COMPILE,
+    );
+    let object = |pairs: &[(&str, f64)]| -> Result<JsValue, JsValue> {
+        if pairs.is_empty() {
+            return Ok(JsValue::NULL);
+        }
+        let object = js_sys::Object::new();
+        for (name, value) in pairs {
             js_sys::Reflect::set(
-                &constants,
+                &object,
                 &JsValue::from_str(name),
-                &JsValue::from_f64(value),
+                &JsValue::from_f64(*value),
             )?;
         }
-        constants.into()
+        Ok(object.into())
+    };
+    let media = if media {
+        object(&MEDIA_CONSTANTS)?
     } else {
         JsValue::NULL
     };
+    let constants = object(constants)?;
     let entries: Array = PHOTON_ENTRIES
         .iter()
         .map(|e| JsValue::from_str(e))
@@ -79,6 +93,7 @@ pub(super) async fn compile(device: &JsValue, media: bool) -> Result<JsValue, Js
         spec(&PHOTON_SLOTS).into(),
         entries.into(),
         media,
+        constants,
     ]
     .into_iter()
     .collect();

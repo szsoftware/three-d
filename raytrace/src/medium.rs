@@ -65,8 +65,8 @@ impl RtMedium {
 /// `height` (meters, y up), with its density falling by e every `scale_height` meters above it and rising below it.
 /// The air of a clear day has a scale height of about 1200 m for haze; ground fog has a few meters.
 ///
-/// Outside of closed meshes with their own [RtMaterial::medium](crate::RtMaterial::medium). The camera must be in the
-/// fog, not in such a mesh.
+/// Outside of closed meshes with their own [RtMaterial::medium](crate::RtMaterial::medium); the camera may be in the
+/// fog or in such a mesh.
 ///
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RtFog {

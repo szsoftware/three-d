@@ -804,24 +804,9 @@ impl PathContext<'_> {
         }
     }
 
-    ///
-    /// The solids that contain a point, such as the camera in smoke or under water: from the surfaces of solids a ray
-    /// from it to infinity hits.
-    ///
+    /// The solids that contain a point, see [solids_containing].
     fn inside_at(&self, p: Vec3) -> Inside {
-        let direction = vec3(0.267, 0.873, 0.408).normalize();
-        let mut hits = Vec::new();
-        self.accel
-            .for_each_hit(self.scene, p, direction, f32::INFINITY, |hit| {
-                let instance = &self.scene.instances()[hit.instance as usize];
-                let m = &self.scene.materials()[instance.material.0 as usize];
-                if let Some(solid) = Solid::of(hit.instance, m) {
-                    hits.push((hit.t, solid, self.surface(hit, direction).front_face));
-                }
-                false
-            });
-        hits.sort_by(|a, b| a.0.total_cmp(&b.0));
-        Inside::of_point(hits.into_iter().map(|(_, s, front)| (s, front)))
+        solids_containing(self.scene, self.accel, p)
     }
 
     ///
@@ -1424,6 +1409,34 @@ fn tangent_frame(
 fn offset(p: Vec3, n: Vec3) -> Vec3 {
     let scale = 1.0f32.max(p.x.abs()).max(p.y.abs()).max(p.z.abs());
     p + n * (1e-4 * scale)
+}
+
+///
+/// The solids that contain a point, such as the camera in smoke or under water: from the surfaces of solids a ray from
+/// it to infinity hits.
+///
+pub(crate) fn solids_containing(scene: &RtScene, accel: &CpuAccel, p: Vec3) -> Inside {
+    let direction = vec3(0.267, 0.873, 0.408).normalize();
+    let mut hits = Vec::new();
+    accel.for_each_hit(scene, p, direction, f32::INFINITY, |hit| {
+        let instance = &scene.instances()[hit.instance as usize];
+        let m = &scene.materials()[instance.material.0 as usize];
+        if let Some(solid) = Solid::of(hit.instance, m) {
+            let mesh = &scene.meshes()[instance.mesh.0 as usize];
+            let [a, b, c] = mesh.triangles[hit.triangle as usize];
+            let (p0, p1, p2) = (
+                mesh.positions[a as usize],
+                mesh.positions[b as usize],
+                mesh.positions[c as usize],
+            );
+            let face =
+                (instance.inverse.transpose() * (p1 - p0).cross(p2 - p0).extend(0.0)).truncate();
+            hits.push((hit.t, solid, face.dot(direction) < 0.0));
+        }
+        false
+    });
+    hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Inside::of_point(hits.into_iter().map(|(_, s, front)| (s, front)))
 }
 
 ///

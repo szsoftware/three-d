@@ -242,9 +242,7 @@ impl Compiling {
             let (send, receiver) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 crate::priority::lower_this_thread(crate::priority::COMPILING);
-                let _ = send.send(Box::new(
-                    crate::ComputeTracer::new(&gpu).with_adapter_info(info),
-                ));
+                let _ = send.send(Box::new(crate::ComputeTracer::for_adapter(&gpu, info)));
             });
             Some(Self { receiver })
         }

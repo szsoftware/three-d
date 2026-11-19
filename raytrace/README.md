@@ -198,9 +198,14 @@ binds (128 MB guaranteed by WebGPU), the largest ones are halved in size until t
   left. Paths draw where they scatter from the extinction of a random color channel, sample the lights there with the
   phase function and go on in a direction drawn from it; shadow rays sum the lengths inside solids from their signed
   boundary hits, which needs no order of the hits. Purely absorbing media are applied without noise. Photons are
-  attenuated along their way, the light they lose by scattering reaches surfaces by the paths. Not included: media
-  inside other media (an ice cube in a glass of water), a camera inside a closed mesh with a medium (use the fog
-  there), media whose density varies other than the fog with height. The compute tracer builds a second pipeline for
+  attenuated along their way, the light they lose by scattering reaches surfaces by the paths. Media inside media:
+  where closed meshes overlap, the one with the higher `RtMaterial::medium_priority` fills the space (glass over ice
+  over water), the surfaces of the others are not seen and refraction goes by the index on both sides; paths keep up to
+  four solids, shadow rays take the surfaces in their order (on the GPU up to eight per shadow ray, beyond that the
+  signed sums). The camera may be inside a solid (smoke, under water): the solids containing it are found from a ray to
+  infinity. A surface touching the solid a path just left (a pane of glass lying on the floor) is hit and not jumped
+  over. Not included: media whose density varies other than the fog with height, nesting for the photons of caustics
+  on the GPU. `examples/nested_media.rs` renders a glass tank of water with ice cubes and a pane on the floor. The compute tracer builds a second pipeline for
   scenes with media (the override constant `MEDIA` in trace.wgsl), so the tracer of scenes without stays as small as
   before for the compilers of small GPUs. On Intel graphics of the 7th generation (Ivy Bridge, Haswell, Bay Trail) that
   pipeline is too large for Mesa's compilers, so it is not built there: `ComputeTracer::media_problem` says why,
