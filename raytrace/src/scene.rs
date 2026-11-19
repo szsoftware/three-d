@@ -2,7 +2,7 @@
 //! The scene description, independent of any backend.
 //!
 
-use crate::{RtError, RtTexture, Sky, TextureId};
+use crate::{RtError, RtFog, RtMedium, RtTexture, Sky, TextureId};
 use three_d_asset::prelude::*;
 use three_d_asset::{Geometry, Model, PbrMaterial, TriMesh};
 
@@ -138,6 +138,11 @@ pub struct RtMaterial {
     pub emission_texture: Option<TextureId>,
     /// Multiplies the transmission (red).
     pub transmission_texture: Option<TextureId>,
+    ///
+    /// What fills a closed mesh of a transmissive material that is not [RtMaterial::thin_walled]: depth color of glass
+    /// and water, smoke or fog. See [RtMaterial::medium_boundary] for a mesh that only holds a medium.
+    ///
+    pub medium: Option<RtMedium>,
 }
 
 impl Default for RtMaterial {
@@ -159,6 +164,7 @@ impl Default for RtMaterial {
             normal_scale: 1.0,
             emission_texture: None,
             transmission_texture: None,
+            medium: None,
         }
     }
 }
@@ -175,6 +181,23 @@ impl RtMaterial {
             base_color: color,
             roughness: 1.0,
             specular: 0.0,
+            ..Default::default()
+        }
+    }
+
+    ///
+    /// The invisible boundary of a medium such as fog or smoke in a closed mesh: light passes it unchanged and the
+    /// medium acts inside.
+    ///
+    pub fn medium_boundary(medium: RtMedium) -> Self {
+        Self {
+            base_color: vec3(1.0, 1.0, 1.0),
+            roughness: 0.0,
+            specular: 0.0,
+            transmission: 1.0,
+            index_of_refraction: 1.0,
+            thin_walled: false,
+            medium: Some(medium),
             ..Default::default()
         }
     }
@@ -524,6 +547,7 @@ pub struct RtScene {
     instances: Vec<RtInstance>,
     lights: Vec<RtLight>,
     environment: RtEnvironment,
+    fog: Option<RtFog>,
     instance_revision: u64,
     revision: u64,
 }
@@ -538,6 +562,7 @@ impl Default for RtScene {
             instances: Vec::new(),
             lights: Vec::new(),
             environment: RtEnvironment::default(),
+            fog: None,
             instance_revision: 0,
             revision: 0,
         }
@@ -739,6 +764,25 @@ impl RtScene {
     pub fn set_environment(&mut self, environment: RtEnvironment) {
         self.environment = environment;
         self.revision = next_revision();
+    }
+
+    /// Sets haze or fog over the whole scene, `None` for clear air.
+    pub fn set_fog(&mut self, fog: Option<RtFog>) {
+        self.fog = fog.filter(|f| !f.medium.is_clear());
+        self.revision = next_revision();
+    }
+
+    /// The fog over the whole scene.
+    pub fn fog(&self) -> Option<&RtFog> {
+        self.fog.as_ref()
+    }
+
+    /// Whether light is absorbed or scattered on its way through the scene, by fog or inside solids.
+    pub fn has_media(&self) -> bool {
+        self.fog.is_some()
+            || self.materials.iter().any(|m| {
+                m.medium.is_some_and(|m| !m.is_clear()) && m.transmission > 0.0 && !m.thin_walled
+            })
     }
 
     /// The meshes.

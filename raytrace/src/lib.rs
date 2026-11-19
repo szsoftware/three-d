@@ -35,6 +35,7 @@ mod gpu;
 mod ies;
 mod lens;
 mod light;
+mod medium;
 mod photons;
 #[cfg(feature = "three-d")]
 mod preview;
@@ -58,6 +59,7 @@ pub use error::*;
 pub use gpu::*;
 pub use ies::IesProfile;
 pub use lens::DepthOfField;
+pub use medium::{RtFog, RtMedium};
 #[cfg(feature = "three-d")]
 pub use preview::*;
 pub use render_image::*;

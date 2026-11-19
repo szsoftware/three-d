@@ -110,7 +110,7 @@ fn cell(p: Vec3, size: f32) -> [i32; 3] {
 
 /// Whether light through a material of this kind is left to the photons: glass that bends it.
 pub(crate) fn bends_light(m: &crate::RtMaterial) -> bool {
-    m.transmission > 0.0 && !m.thin_walled
+    m.transmission > 0.0 && !m.thin_walled && m.index_of_refraction != 1.0
 }
 
 /// Bounding spheres of the instances of solid glass in world space.
