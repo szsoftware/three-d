@@ -63,8 +63,7 @@ impl RaytraceSupport {
 /// shader was made smaller: it needed more scratch memory than Ivy Bridge has and jumps further than Haswell can.
 ///
 pub fn driver_problem(context: &Context) -> Option<String> {
-    let (device, _) = context.as_wgpu()?;
-    let info = device.adapter_info();
+    let info = context.wgpu_adapter_info()?;
     crashes_with_the_tracer(info.vendor, &info.name, &info.driver, &info.driver_info).then(|| {
         format!(
             "The driver of this graphics card ({}) crashes with the ray tracer; ray tracing runs on the CPU.",
@@ -94,7 +93,8 @@ pub fn media_problem(info: &three_d::wgpu::AdapterInfo) -> Option<String> {
     })
 }
 
-/// Intel graphics of the 7th generation, by what the adapter tells.
+/// Intel graphics of the 7th generation, by what the adapter tells. Browsers tell only vendor and architecture, for
+/// example "intel" and "gen-7", which three-d passes on as driver and driver info.
 fn is_intel_gen7(vendor: u32, name: &str, driver: &str, driver_info: &str) -> bool {
     let text = format!("{name} {driver} {driver_info}").to_lowercase();
     let intel = vendor == 0x8086 || text.contains("intel");
@@ -110,7 +110,8 @@ fn is_intel_gen7(vendor: u32, name: &str, driver: &str, driver_info: &str) -> bo
         "bay trail",
     ]
     .iter()
-    .any(|k| text.contains(k));
+    .any(|k| text.contains(k))
+        || ["gen-7", "gen7"].contains(&driver_info.trim().to_lowercase().as_str());
     driver || (intel && chip)
 }
 
@@ -162,6 +163,10 @@ mod tests {
             "OpenGL",
             "4.6 (Core Profile) Mesa"
         ));
+        // Chrome's WebGPU: only the description, vendor and architecture
+        assert!(is_intel_gen7(0, "", "intel", "gen-7"));
+        assert!(!is_intel_gen7(0, "", "intel", "gen-9"));
+        assert!(!is_intel_gen7(0, "", "intel", "gen-12lp"));
         assert!(!is_intel_gen7(
             0x8086,
             "Intel(R) UHD Graphics 620 (KBL GT2)",

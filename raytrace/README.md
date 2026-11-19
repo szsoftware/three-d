@@ -59,7 +59,9 @@ preview.render(&target); // exposed, tone mapped and sRGB encoded
 On the CPU the preview traces on a thread of its own (`PreviewSettings::cpu_in_background`, not in the browser), so
 the frame rate of the application does not depend on the tracer; `update` shows the newest image. In the browser,
 which has one thread, `update` traces row after row for at most `PreviewSettings::cpu_frame_time` (12 ms) and shows a
-sample when it is complete, at an eighth of the resolution (`cpu_downscale` 8), so the page stays responsive. `driver_problem`
+sample when it is complete, at an eighth of the resolution (`cpu_downscale` 8), so the page stays responsive. Natively
+the CPU traces with one thread less than the machine has (`PreviewSettings::cpu_threads`), so the application keeps a
+core for its frames, and the threads of the preview run at nice 10 on Linux and Android. `driver_problem`
 names devices whose drivers crash with the tracer (none known at the moment); `RaytraceSupport::of` reports `Cpu` for
 them and the preview says why.
 
@@ -72,9 +74,20 @@ the CPU traces beside the frames. `gpu_downscale` sets the starting resolution, 
 the current one. The texture is then smaller than the viewport; call `resize` only when the viewport changes, it
 starts again (and does nothing for the same size).
 
-The shaders of the GPU compile on another thread (not in the browser), which takes about 8 s on the HD 4000; the CPU
-traces meanwhile and the preview goes on with the GPU in the first `update` after (`is_compiling`, `wait_for_gpu`).
-With wgpu on OpenGL the driver may still hold the context while it compiles.
+The shaders of the GPU compile on another thread at nice 19, which takes about 8 s on the HD 4000; the CPU traces
+meanwhile and the preview goes on with the GPU in the first `update` after (`is_compiling`, `wait_for_gpu`). With wgpu
+on OpenGL the driver may still hold the context while it compiles. In the browser wgpu can only compile synchronously,
+which holds the page (in headless Chromium with SwiftShader for minutes); there `ComputeTracer::from_context_async`
+first lets the browser compile the same pipelines with `createComputePipelineAsync` in the background, and wgpu then
+finds them in the browser's cache (12 s in the background, then 1 ms, in the same Chromium). It needs the browser's
+`GPUDevice`, which three-d keeps when it creates the device (`Context::webgpu_device`). When the samples move from the
+CPU to the GPU, the CPU's image is kept: if the preview goes back to the CPU for the same view, it goes on from there.
+
+Errors of the GPU in the work of the compute tracer (an invalid shader, too little memory) are caught with wgpu's error
+scopes instead of three-d's error handler: `ComputeTracer::gpu_error` returns the first one, `trace_gpu` returns it as
+`RtError::Gpu` from then on, and the preview goes on with the CPU. Browsers report them a frame or two later. In the
+browser the vendor and architecture of the adapter come from WebGPU's `GPUAdapterInfo` (`Context::wgpu_adapter_info`),
+so Intel graphics of the 7th generation (architecture "gen-7") are recognised as natively.
 
 Textures are shared with wgpu through `Texture2D::as_wgpu` in three-d, which keeps the order of three-d's work and the
 tracer's on the queue.

@@ -41,6 +41,7 @@ mod photons;
 mod preview;
 #[cfg(all(feature = "three-d", not(target_arch = "wasm32")))]
 mod preview_worker;
+mod priority;
 mod render_image;
 mod sampling;
 mod scene;
