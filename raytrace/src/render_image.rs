@@ -333,6 +333,23 @@ impl RenderImage {
     pub(crate) fn add_samples(&mut self, count: u32) {
         self.samples += count;
     }
+
+    /// Adds the sums of an image of the same size (and features, where both have them), not its samples.
+    #[cfg_attr(not(feature = "three-d"), allow(dead_code))]
+    pub(crate) fn add_image(&mut self, other: &RenderImage) {
+        for (a, b) in self.sum.iter_mut().zip(&other.sum) {
+            for c in 0..3 {
+                a[c] += b[c];
+            }
+        }
+        if let (Some(a), Some(b)) = (&mut self.features, &other.features) {
+            for (a, b) in a.iter_mut().zip(b) {
+                for c in 0..FEATURE_WORDS {
+                    a[c] += b[c];
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

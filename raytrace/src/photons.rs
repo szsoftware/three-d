@@ -20,6 +20,7 @@ pub(crate) struct Photon {
 }
 
 /// The photons of one pass in a grid of cells as large as the gather radius.
+#[derive(Debug)]
 pub(crate) struct PhotonMap {
     pub radius: f32,
     cells: HashMap<[i32; 3], Vec<Photon>>,

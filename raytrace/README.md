@@ -57,7 +57,9 @@ preview.render(&target); // exposed, tone mapped and sRGB encoded
 ```
 
 On the CPU the preview traces on a thread of its own (`PreviewSettings::cpu_in_background`, not in the browser), so
-the frame rate of the application does not depend on the tracer; `update` shows the newest image. `driver_problem`
+the frame rate of the application does not depend on the tracer; `update` shows the newest image. In the browser,
+which has one thread, `update` traces row after row for at most `PreviewSettings::cpu_frame_time` (12 ms) and shows a
+sample when it is complete, at an eighth of the resolution (`cpu_downscale` 8), so the page stays responsive. `driver_problem`
 names devices whose drivers crash with the tracer (none known at the moment); `RaytraceSupport::of` reports `Cpu` for
 them and the preview says why.
 

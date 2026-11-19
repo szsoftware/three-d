@@ -7,10 +7,14 @@ use crate::{
     Camera, CpuReferenceTracer, Denoiser, RenderImage, RtScene, ToneMapping, ToneOperator,
     TraceSettings, Tracer, TracerKind,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
 use three_d::{
     ColorTarget, Context, DepthTest, Effect, EffectMaterialId, Interpolation, Light, Program,
     RenderStates, RenderTarget, Texture2D, Viewer, Wrapping,
 };
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 ///
 /// What the preview of a context runs on, with a reason to show the user, for example in a tooltip.
@@ -43,6 +47,13 @@ impl PreviewAvailability {
                 );
             }
         }
+        if cfg!(target_arch = "wasm32") {
+            return Self::CpuOnly(
+                "In the browser WebGL2 has no compute shaders and this application does not use WebGPU; ray tracing \
+                 runs on the CPU in a single thread, at a low resolution and in parts of every frame."
+                    .to_owned(),
+            );
+        }
         Self::CpuOnly(
             "The OpenGL backend has no ray tracing on the GPU (needs the wgpu backend with WebGPU, Vulkan, Metal \
              or DirectX 12); ray tracing runs on the CPU."
@@ -69,8 +80,15 @@ pub struct PreviewSettings {
     /// browsers, which have no clock for it here.
     ///
     pub gpu_frame_time: Option<std::time::Duration>,
-    /// The CPU traces at width and height divided by this.
+    /// The CPU traces at width and height divided by this, 4 by default and 8 in browsers.
     pub cpu_downscale: u32,
+    ///
+    /// Longest time an update traces on the CPU when it traces in the update (in browsers, or without
+    /// `cpu_in_background`): a sample then takes several updates, row after row, and the image changes when it is
+    /// complete, so the frames go on. `None` traces a whole sample in every update. 12 ms in browsers by default, else
+    /// `None`.
+    ///
+    pub cpu_frame_time: Option<std::time::Duration>,
     ///
     /// The CPU traces on a thread of its own, one sample after the other, and [RaytracePreview::update] shows the
     /// newest image, so the frames do not wait for the tracer. Otherwise every update traces one sample and waits.
@@ -102,7 +120,12 @@ impl Default for PreviewSettings {
             gpu_samples_per_frame: 1,
             gpu_downscale: 1,
             gpu_frame_time: Some(std::time::Duration::from_millis(40)),
-            cpu_downscale: 4,
+            cpu_downscale: if cfg!(target_arch = "wasm32") { 8 } else { 4 },
+            cpu_frame_time: if cfg!(target_arch = "wasm32") {
+                Some(std::time::Duration::from_millis(12))
+            } else {
+                None
+            },
             cpu_in_background: true,
             max_samples: 1024,
             max_bounces: 6,
@@ -115,6 +138,7 @@ impl Default for PreviewSettings {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Engine {
     #[cfg(feature = "wgpu")]
     Gpu {
@@ -124,6 +148,9 @@ enum Engine {
     Cpu {
         tracer: CpuReferenceTracer,
         image: RenderImage,
+        /// The sample traced in parts with [PreviewSettings::cpu_frame_time], and the next row of it
+        pending: RenderImage,
+        next_row: u32,
     },
     #[cfg(not(target_arch = "wasm32"))]
     CpuWorker {
@@ -318,6 +345,8 @@ impl RaytracePreview {
             Engine::Cpu {
                 tracer: CpuReferenceTracer::new(),
                 image: RenderImage::with_features(w, h),
+                pending: RenderImage::with_features(w, h),
+                next_row: 0,
             },
             texture,
         )
@@ -387,6 +416,8 @@ impl RaytracePreview {
         let placeholder = Engine::Cpu {
             tracer: CpuReferenceTracer::new(),
             image: RenderImage::new(1, 1),
+            pending: RenderImage::new(1, 1),
+            next_row: 0,
         };
         #[allow(unused_variables)]
         let tracer: GpuTracer = match std::mem::replace(&mut self.engine, placeholder) {
@@ -559,7 +590,16 @@ impl RaytracePreview {
             match &mut self.engine {
                 #[cfg(feature = "wgpu")]
                 Engine::Gpu { image, .. } => image.reset(),
-                Engine::Cpu { image, .. } => image.reset(),
+                Engine::Cpu {
+                    image,
+                    pending,
+                    next_row,
+                    ..
+                } => {
+                    image.reset();
+                    pending.reset();
+                    *next_row = 0;
+                }
                 #[cfg(not(target_arch = "wasm32"))]
                 Engine::CpuWorker { .. } => unreachable!("handled above"),
             }
@@ -594,14 +634,48 @@ impl RaytracePreview {
                     None => image.write_to_three_d_texture(&self.texture),
                 }
             }
-            Engine::Cpu { tracer, image } => {
+            Engine::Cpu {
+                tracer,
+                image,
+                pending,
+                next_row,
+            } => {
                 // The camera of the reduced resolution
                 let mut small = camera.clone();
                 small.set_viewport(three_d_asset::Viewport::new_at_origo(
                     image.width(),
                     image.height(),
                 ));
-                tracer.trace(scene, &small, image, &settings)?;
+                match self.settings.cpu_frame_time {
+                    Some(budget) => {
+                        // Row after row until the time is up; the image changes when the sample is complete
+                        let start = Instant::now();
+                        let height = image.height();
+                        loop {
+                            let row = *next_row;
+                            tracer.trace_rows(
+                                scene,
+                                &small,
+                                pending,
+                                &settings,
+                                image.sample_count(),
+                                row..row + 1,
+                            )?;
+                            *next_row += 1;
+                            if *next_row >= height {
+                                break;
+                            }
+                            if start.elapsed() >= budget {
+                                return Ok(false);
+                            }
+                        }
+                        image.add_image(pending);
+                        image.add_samples(1);
+                        pending.reset();
+                        *next_row = 0;
+                    }
+                    None => tracer.trace(scene, &small, image, &settings)?,
+                }
                 match self.settings.denoiser {
                     Some(mut denoiser) => denoiser
                         .denoise(image)?

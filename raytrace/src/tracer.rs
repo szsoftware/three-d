@@ -116,6 +116,8 @@ pub struct CpuReferenceTracer {
     builder: CpuBvhBuilder,
     accel: Option<CpuAccel>,
     threads: Option<usize>,
+    /// The photons of the sample traced in bands, see [CpuReferenceTracer::trace_rows]
+    band_photons: Option<std::sync::Arc<PhotonMap>>,
 }
 
 impl CpuReferenceTracer {
@@ -171,41 +173,97 @@ impl Tracer for CpuReferenceTracer {
         settings: &TraceSettings,
     ) -> Result<(), RtError> {
         render_image.check_not_empty()?;
+        let first_sample = render_image.sample_count();
+        let rows = 0..render_image.height();
+        self.render(
+            scene,
+            camera,
+            render_image,
+            settings,
+            first_sample,
+            rows,
+            true,
+        )?;
+        render_image.add_samples(settings.samples_per_call);
+        Ok(())
+    }
+}
+
+impl CpuReferenceTracer {
+    ///
+    /// Traces the rows of one sample, the `sample`th, into the render image without counting the sample, so a sample
+    /// can be traced in parts over several calls ([TraceSettings::samples_per_call] is ignored). The image is complete
+    /// once all rows are traced, then [RenderImage::add_samples] counts it. Caustic photons are shot when the first
+    /// row is traced and kept for the other rows.
+    ///
+    #[cfg_attr(not(feature = "three-d"), allow(dead_code))]
+    pub(crate) fn trace_rows(
+        &mut self,
+        scene: &RtScene,
+        camera: &Camera,
+        render_image: &mut RenderImage,
+        settings: &TraceSettings,
+        sample: u32,
+        rows: std::ops::Range<u32>,
+    ) -> Result<(), RtError> {
+        render_image.check_not_empty()?;
+        let settings = TraceSettings {
+            samples_per_call: 1,
+            ..*settings
+        };
+        let shoot = rows.start == 0;
+        self.render(scene, camera, render_image, &settings, sample, rows, shoot)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render(
+        &mut self,
+        scene: &RtScene,
+        camera: &Camera,
+        render_image: &mut RenderImage,
+        settings: &TraceSettings,
+        first_sample: u32,
+        rows: std::ops::Range<u32>,
+        shoot: bool,
+    ) -> Result<(), RtError> {
         self.prepare(scene)?;
         let accel = self.accel.as_ref().expect("prepared");
-        let context = PathContext {
+        let mut context = PathContext {
             scene,
             accel,
             rays: CameraRays::new(camera, settings.depth_of_field),
             settings: *settings,
             width: render_image.width(),
             height: render_image.height(),
-            first_sample: render_image.sample_count(),
+            first_sample,
             caustics: None,
         };
-        let mut context = context;
         if settings.caustic_photons > 0 {
-            let map = context.shoot_photons(render_image.sample_count());
-            context.caustics = (!map.is_empty()).then_some(map);
+            if shoot {
+                let map = context.shoot_photons(first_sample);
+                self.band_photons = (!map.is_empty()).then(|| std::sync::Arc::new(map));
+            }
+            context.caustics = self.band_photons.clone();
         }
         let context = context;
         let width = render_image.width() as usize;
-        let threads = self
-            .thread_count()
-            .min(render_image.height() as usize)
-            .max(1);
-        let (rows, features) = render_image.rows_and_features_mut();
+        let rows = rows.start.min(render_image.height())..rows.end.min(render_image.height());
+        let threads = self.thread_count().min(rows.len()).max(1);
+        let (sums, features) = render_image.rows_and_features_mut();
         let mut row_slices: Vec<RowSlice> = match features {
-            Some(f) => rows
+            Some(f) => sums
                 .chunks_mut(width)
                 .zip(f.chunks_mut(width))
                 .map(|(r, f)| (r, Some(f)))
                 .collect(),
-            None => rows.chunks_mut(width).map(|r| (r, None)).collect(),
+            None => sums.chunks_mut(width).map(|r| (r, None)).collect(),
         };
+        let first_row = rows.start as usize;
+        let mut row_slices: Vec<RowSlice> =
+            row_slices.drain(first_row..rows.end as usize).collect();
         if threads == 1 {
-            for (y, (row, features)) in row_slices.iter_mut().enumerate() {
-                context.render_row(y as u32, row, features.as_deref_mut());
+            for (i, (row, features)) in row_slices.iter_mut().enumerate() {
+                context.render_row((first_row + i) as u32, row, features.as_deref_mut());
             }
         } else {
             // Rows are handed out one at a time, so threads stay busy where the scene is uneven
@@ -221,12 +279,11 @@ impl Tracer for CpuReferenceTracer {
                         }
                         let mut guard = row_slices[y].lock().unwrap();
                         let (row, features) = &mut *guard;
-                        context.render_row(y as u32, row, features.as_deref_mut());
+                        context.render_row((first_row + y) as u32, row, features.as_deref_mut());
                     });
                 }
             });
         }
-        render_image.add_samples(settings.samples_per_call);
         Ok(())
     }
 }
@@ -335,7 +392,7 @@ struct PathContext<'a> {
     height: u32,
     first_sample: u32,
     /// Photons through glass of this call, if caustics are on and photons landed.
-    caustics: Option<PhotonMap>,
+    caustics: Option<std::sync::Arc<PhotonMap>>,
 }
 
 /// The surface at a hit, in world space.

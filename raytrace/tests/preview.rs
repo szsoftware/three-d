@@ -334,3 +334,25 @@ fn the_cpu_traces_while_the_gpu_compiles() {
     assert!(preview.sample_count() >= 1);
     finish(&context);
 }
+
+#[test]
+fn the_cpu_traces_a_sample_in_parts_within_the_frame_time() {
+    let Some(context) = context() else { return };
+    let scene = sky_only(1000.0);
+    let mut preview = RaytracePreview::new_on_cpu(&context, 64, 32);
+    preview.set_settings(PreviewSettings {
+        cpu_in_background: false,
+        // Shorter than a row: one row per update
+        cpu_frame_time: Some(std::time::Duration::from_nanos(1)),
+        ..*preview.settings()
+    });
+    let rows = preview.texture().height();
+    let at = camera(64, 32, vec3(0.0, 0.0, 0.0));
+    for _ in 0..rows - 1 {
+        assert!(!preview.update(&scene, &at).unwrap());
+        assert_eq!(preview.sample_count(), 0);
+    }
+    assert!(preview.update(&scene, &at).unwrap());
+    assert_eq!(preview.sample_count(), 1);
+    finish(&context);
+}
