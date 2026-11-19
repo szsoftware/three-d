@@ -5,7 +5,7 @@
 //! and constants that wgpu asks for afterwards are found there while the compiled ones are alive.
 //!
 
-use super::{Slot, MEDIA_CONSTANTS, PHOTON_ENTRIES, PHOTON_SLOTS, TRACE_SLOTS};
+use super::{denoise_gpu, Slot, MEDIA_CONSTANTS, PHOTON_ENTRIES, PHOTON_SLOTS, TRACE_SLOTS};
 use js_sys::{Array, Function, Promise};
 use wasm_bindgen::{JsCast, JsValue};
 
@@ -26,6 +26,13 @@ const COMPILE: &str = "
     const jobs = [device.createComputePipelineAsync({ layout: traceLayout, compute: stage('trace', constants) })];
     if (media) jobs.push(device.createComputePipelineAsync({ layout: traceLayout, compute: stage('trace', media) }));
     for (const entry of entries) jobs.push(device.createComputePipelineAsync({ layout: photonLayout, compute: stage(entry, constants) }));
+    // The denoiser of the preview, which wgpu would otherwise compile in the first frame
+    const denoise = device.createShaderModule({ code: denoiseCode });
+    for (const [entryPoint, readOnly] of denoisePasses) {
+        const layout = layoutOf([[0, 'uniform', true, paramsBytes]].concat(
+            readOnly.map((r, i) => [i + 1, r ? 'read-only-storage' : 'storage', false, 0])));
+        jobs.push(device.createComputePipelineAsync({ layout, compute: { module: denoise, entryPoint } }));
+    }
     return Promise.all(jobs);
 ";
 
@@ -50,7 +57,8 @@ fn spec(slots: &[(u32, Slot)]) -> Array {
 }
 
 ///
-/// Compiles the pipelines of the tracer on the browser's device, with the one for participating media if `media`.
+/// Compiles the pipelines of the tracer on the browser's device, with the one for participating media if `media`, and
+/// those of the denoiser.
 /// Resolves to the pipelines, which have to be kept until wgpu made its own, or to the browser's error.
 ///
 pub(super) async fn compile(
@@ -59,7 +67,7 @@ pub(super) async fn compile(
     constants: &[(&str, f64)],
 ) -> Result<JsValue, JsValue> {
     let function = Function::new_with_args(
-        "device, code, trace, photons, entries, media, constants",
+        "device, code, trace, photons, entries, media, constants, denoiseCode, denoisePasses, paramsBytes",
         COMPILE,
     );
     let object = |pairs: &[(&str, f64)]| -> Result<JsValue, JsValue> {
@@ -94,9 +102,34 @@ pub(super) async fn compile(
         entries.into(),
         media,
         constants,
+        JsValue::from_str(include_str!("denoise.wgsl")),
+        denoise_gpu::PASSES
+            .iter()
+            .map(|(entry, read_only)| {
+                let read_only: Array = read_only.iter().map(|&r| JsValue::from_bool(r)).collect();
+                Array::of2(&JsValue::from_str(entry), &read_only)
+            })
+            .collect::<Array>()
+            .into(),
+        JsValue::from_f64(denoise_gpu::PARAMS_BYTES as f64),
     ]
     .into_iter()
     .collect();
     let promise: Promise = function.apply(&JsValue::NULL, &arguments)?.dyn_into()?;
     wasm_bindgen_futures::JsFuture::from(promise).await
+}
+
+/// Resolves after the milliseconds, without holding the page.
+pub(super) async fn sleep(milliseconds: i32) {
+    let promise = Promise::new(&mut |resolve, _| {
+        let set_timeout = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("setTimeout"))
+            .ok()
+            .and_then(|f| f.dyn_into::<Function>().ok());
+        if let Some(set_timeout) = set_timeout {
+            let _ = set_timeout.call2(&JsValue::NULL, &resolve, &JsValue::from(milliseconds));
+        } else {
+            let _ = resolve.call0(&JsValue::NULL);
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
 }

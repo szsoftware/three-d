@@ -574,6 +574,8 @@ impl RaytracePreview {
                 return;
             }
         }
+        #[cfg(feature = "wgpu")]
+        let start = crate::compute::timing::now();
         let (engine, texture) = Self::engine(
             &self.context,
             tracer,
@@ -582,6 +584,23 @@ impl RaytracePreview {
             &self.settings,
             self.gpu_scale,
         );
+        #[cfg(feature = "wgpu")]
+        if let (true, Engine::Gpu { tracer, image }) = (crate::compute::timing::enabled(), &engine)
+        {
+            use crate::compute::timing;
+            timing::log(&format!(
+                "preview made its GPU image {}x{} in {:.0} ms on the CPU",
+                image.width(),
+                image.height(),
+                timing::now() - start
+            ));
+            tracer.gpu().queue.submit([]);
+            timing::when_gpu_done(
+                &tracer.gpu().queue,
+                start,
+                "the preview's GPU image".to_owned(),
+            );
+        }
         self.pace = Pace::default();
         let old_engine = std::mem::replace(&mut self.engine, engine);
         let old_texture = std::mem::replace(&mut self.texture, texture);
@@ -734,6 +753,15 @@ impl RaytracePreview {
             });
         }
         #[cfg(feature = "wgpu")]
+        if matches!(self.engine, Engine::Gpu { .. }) && self.context.is_lost() {
+            // A lost device does nothing and tells that it is done at once
+            self.availability = PreviewAvailability::CpuOnly(
+                "The graphics device was lost (a driver crash or reset); ray tracing runs on the CPU.".to_owned(),
+            );
+            self.rebuild();
+            return self.update(scene, camera);
+        }
+        #[cfg(feature = "wgpu")]
         if let Engine::Gpu { tracer, .. } = &self.engine {
             if scene.has_media() {
                 if let Some(why) = tracer.media_problem() {
@@ -779,6 +807,10 @@ impl RaytracePreview {
         match &mut self.engine {
             #[cfg(feature = "wgpu")]
             Engine::Gpu { tracer, image } => {
+                // In a browser: at most one frame ahead of the GPU, on Intel graphics of the 7th generation not even that
+                if tracer.unfinished_calls() > crate::gpu::frames_ahead(tracer.adapter_info()) {
+                    return Ok(false);
+                }
                 let settings = TraceSettings {
                     samples_per_call: self.settings.gpu_samples_per_frame.max(1),
                     caustic_photons: self.settings.gpu_caustic_photons,

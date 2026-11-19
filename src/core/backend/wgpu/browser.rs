@@ -11,6 +11,8 @@ use wasm_bindgen::JsValue;
 pub(crate) struct BrowserDevice {
     pub device: JsValue,
     pub info: JsValue,
+    /// The graphics card as the browser's WebGL names it, see [webgl_renderer].
+    pub renderer: String,
 }
 
 impl BrowserDevice {
@@ -67,7 +69,11 @@ impl DeviceCapture {
             .filter(|i| i.is_object())
             .or_else(|| Reflect::get(&device, &JsValue::from_str("adapterInfo")).ok())
             .unwrap_or(JsValue::NULL);
-        Some(BrowserDevice { device, info })
+        Some(BrowserDevice {
+            device,
+            info,
+            renderer: webgl_renderer(),
+        })
     }
 }
 
@@ -75,4 +81,113 @@ impl Drop for DeviceCapture {
     fn drop(&mut self) {
         let _ = Function::new_with_args("sink", RESTORE).call1(&JsValue::NULL, &self.sink);
     }
+}
+
+///
+/// The power preference with which the browser offers a WebGPU adapter on the graphics card, `None` if it offers only
+/// software ones (SwiftShader, llvmpipe) or no WebGPU at all. The adapter without a preference comes first; browsers
+/// that know several adapters can give a software one there (Chrome with `--enable-unsafe-webgpu` on a laptop whose
+/// graphics card Chrome does not list as safe), and one on the graphics card for "low-power" or "high-performance".
+/// wgpu does not pass on whether an adapter is a fallback, so the browser is asked directly.
+///
+pub(crate) async fn hardware_power_preference() -> Option<wgpu::PowerPreference> {
+    for preference in [
+        wgpu::PowerPreference::None,
+        wgpu::PowerPreference::LowPower,
+        wgpu::PowerPreference::HighPerformance,
+    ] {
+        match adapter_is_software(preference).await {
+            Some(false) => return Some(preference),
+            Some(true) => {}
+            None => return None,
+        }
+    }
+    None
+}
+
+/// Whether the adapter the browser gives for the preference is a software one, `None` if it gives none.
+async fn adapter_is_software(preference: wgpu::PowerPreference) -> Option<bool> {
+    use wasm_bindgen::JsCast;
+    let get = |object: &JsValue, key: &str| Reflect::get(object, &JsValue::from_str(key)).ok();
+    let navigator = get(&js_sys::global(), "navigator")?;
+    let gpu = get(&navigator, "gpu").filter(|g| g.is_object())?;
+    let request = get(&gpu, "requestAdapter").and_then(|f| f.dyn_into::<Function>().ok())?;
+    let options = js_sys::Object::new();
+    let name = match preference {
+        wgpu::PowerPreference::LowPower => Some("low-power"),
+        wgpu::PowerPreference::HighPerformance => Some("high-performance"),
+        wgpu::PowerPreference::None => None,
+    };
+    if let Some(name) = name {
+        Reflect::set(
+            &options,
+            &JsValue::from_str("powerPreference"),
+            &JsValue::from_str(name),
+        )
+        .ok()?;
+    }
+    let promise = request
+        .call1(&gpu, &options)
+        .ok()?
+        .dyn_into::<js_sys::Promise>()
+        .ok()?;
+    let adapter = wasm_bindgen_futures::JsFuture::from(promise).await.ok()?;
+    if !adapter.is_object() {
+        return None;
+    }
+    let info = get(&adapter, "info").filter(|i| i.is_object());
+    let flag = |object: Option<&JsValue>| {
+        object
+            .and_then(|o| get(o, "isFallbackAdapter"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    };
+    let text = |key: &str| {
+        info.as_ref()
+            .and_then(|i| get(i, key))
+            .and_then(|a| a.as_string())
+            .unwrap_or_default()
+            .to_lowercase()
+    };
+    let names = format!(
+        "{} {} {}",
+        text("vendor"),
+        text("architecture"),
+        text("description")
+    );
+    Some(
+        flag(info.as_ref())
+            || flag(Some(&adapter))
+            || ["swiftshader", "llvmpipe", "lavapipe", "softpipe"]
+                .iter()
+                .any(|software| names.contains(software)),
+    )
+}
+
+const RENDERER: &str = "
+    let canvas = null;
+    if (typeof OffscreenCanvas !== 'undefined') canvas = new OffscreenCanvas(1, 1);
+    else if (typeof document !== 'undefined') canvas = document.createElement('canvas');
+    if (!canvas) return '';
+    const gl = canvas.getContext('webgl');
+    if (!gl) return '';
+    const debug = gl.getExtension('WEBGL_debug_renderer_info');
+    const renderer = debug ? gl.getParameter(debug.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+    const lose = gl.getExtension('WEBGL_lose_context');
+    if (lose) lose.loseContext();
+    return typeof renderer === 'string' ? renderer : '';
+";
+
+///
+/// The graphics card as the browser's WebGL names it (`UNMASKED_RENDERER_WEBGL`), for example
+/// "ANGLE (Intel, Mesa Intel(R) HD Graphics 4000 (IVB GT2), OpenGL ES 3.2)", empty if the browser does not tell.
+/// Browsers tell less about their WebGPU adapter: Chrome on Linux gave "google" and "swiftshader" as vendor and
+/// architecture for work that ran on an Intel HD Graphics 4000. The temporary WebGL context is released at once.
+///
+fn webgl_renderer() -> String {
+    Function::new_no_args(RENDERER)
+        .call0(&JsValue::NULL)
+        .ok()
+        .and_then(|r| r.as_string())
+        .unwrap_or_default()
 }

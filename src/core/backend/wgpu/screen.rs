@@ -70,9 +70,19 @@ impl WgpuBackend {
         preference: AdapterPreference,
         surface: Option<&w::Surface<'static>>,
     ) -> Result<(Self, w::Adapter), CoreError> {
+        // A browser may give a software adapter by default and the graphics card only for a power preference
+        #[cfg(target_arch = "wasm32")]
+        let power_preference = match preference {
+            AdapterPreference::Software => w::PowerPreference::default(),
+            _ => super::browser::hardware_power_preference()
+                .await
+                .unwrap_or_default(),
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let power_preference = w::PowerPreference::default();
         let adapter = instance
             .request_adapter(&w::RequestAdapterOptions {
-                power_preference: w::PowerPreference::default(),
+                power_preference,
                 force_fallback_adapter: preference == AdapterPreference::Software,
                 compatible_surface: surface,
             })

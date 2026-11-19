@@ -7,7 +7,16 @@ use crate::{AtrousDenoiser, GpuDevice};
 use three_d::wgpu as w;
 
 /// Bytes of the parameters of one pass.
-const PARAMS_BYTES: u64 = 48;
+pub(super) const PARAMS_BYTES: u64 = 48;
+
+/// The entry points of the passes with `read_only` of every storage buffer after the parameters. The browser compiles
+/// the same pipelines ahead, see browser.rs.
+pub(super) const PASSES: [(&str, &[bool]); 4] = [
+    ("prepare", &[true, false, false, false]),
+    ("guide", &[true, true, false, false]),
+    ("atrous", &[true, true, true, false]),
+    ("finish", &[true, true, false]),
+];
 
 /// Pipelines and intermediate buffers of the GPU denoiser for one image size.
 #[derive(Debug)]
@@ -102,10 +111,10 @@ impl GpuDenoise {
             width,
             height,
             pitch,
-            prepare: pipeline("prepare", &[true, false, false, false]),
-            guide: pipeline("guide", &[true, true, false, false]),
-            atrous: pipeline("atrous", &[true, true, true, false]),
-            finish: pipeline("finish", &[true, true, false]),
+            prepare: pipeline(PASSES[0].0, PASSES[0].1),
+            guide: pipeline(PASSES[1].0, PASSES[1].1),
+            atrous: pipeline(PASSES[2].0, PASSES[2].1),
+            finish: pipeline(PASSES[3].0, PASSES[3].1),
             params: device.create_buffer(&w::BufferDescriptor {
                 label: Some("denoise parameters"),
                 size: stride * (MAX_ITERATIONS as u64 + 1),

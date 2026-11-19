@@ -82,53 +82,13 @@ mod wgpu_context {
     }
 
     ///
-    /// Whether the WebGPU adapter of the browser is a software fallback such as SwiftShader: `isFallbackAdapter` of the
-    /// adapter's info (or of the adapter in older browsers), or "swiftshader" as its architecture. wgpu does not pass
-    /// these on, so the browser is asked directly. False if it can not tell.
+    /// Whether the browser offers WebGPU only in software such as SwiftShader, for every power preference.
     ///
     #[cfg(target_arch = "wasm32")]
     async fn browser_webgpu_is_fallback() -> bool {
-        use js_sys::Reflect;
-        use wasm_bindgen::{JsCast, JsValue};
-        let get = |object: &JsValue, key: &str| Reflect::get(object, &JsValue::from_str(key)).ok();
-        let Some(window) = web_sys::window() else {
-            return false;
-        };
-        let Some(gpu) = get(&window.navigator(), "gpu").filter(|g| g.is_object()) else {
-            return false;
-        };
-        let Some(request) =
-            get(&gpu, "requestAdapter").and_then(|f| f.dyn_into::<js_sys::Function>().ok())
-        else {
-            return false;
-        };
-        let Some(promise) = request
-            .call0(&gpu)
-            .ok()
-            .and_then(|p| p.dyn_into::<js_sys::Promise>().ok())
-        else {
-            return false;
-        };
-        let Ok(adapter) = wasm_bindgen_futures::JsFuture::from(promise).await else {
-            return false;
-        };
-        if !adapter.is_object() {
-            return false;
-        }
-        let info = get(&adapter, "info").filter(|i| i.is_object());
-        let flag = |object: Option<&JsValue>| {
-            object
-                .and_then(|o| get(o, "isFallbackAdapter"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-        };
-        let architecture = info
-            .as_ref()
-            .and_then(|i| get(i, "architecture"))
-            .and_then(|a| a.as_string())
-            .unwrap_or_default()
-            .to_lowercase();
-        flag(info.as_ref()) || flag(Some(&adapter)) || architecture.contains("swiftshader")
+        crate::core::backend::wgpu::browser::hardware_power_preference()
+            .await
+            .is_none()
     }
 }
 

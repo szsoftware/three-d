@@ -9,13 +9,17 @@ use crate::{
     RtEnvironment, RtError, RtLight, RtScene, RtTexture, RtWrapping, TextureId, TraceSettings,
     Tracer, TracerKind,
 };
+#[cfg(target_arch = "wasm32")]
+use std::sync::atomic::AtomicBool;
 use three_d::wgpu as w;
 
 #[cfg(target_arch = "wasm32")]
 mod browser;
 mod denoise_gpu;
+pub(crate) mod timing;
 use three_d_asset::prelude::*;
 use three_d_asset::ProjectionType;
+pub use timing::set_gpu_timing_log;
 
 /// Size of a workgroup in both directions, as in the shaders.
 const WORKGROUP: u32 = 8;
@@ -138,7 +142,16 @@ pub struct ComputeTracer {
     /// pipelines of wgpu in its cache
     #[cfg(target_arch = "wasm32")]
     warm: Option<wasm_bindgen::JsValue>,
+    /// Calls of [ComputeTracer::trace_gpu] whose work the browser has not finished yet, see
+    /// [ComputeTracer::unfinished_calls]
+    #[cfg(target_arch = "wasm32")]
+    unfinished: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Calls of [ComputeTracer::trace_gpu] logged so far, see [set_gpu_timing_log]
+    timed_calls: u32,
 }
+
+/// The first calls of [ComputeTracer::trace_gpu] that [set_gpu_timing_log] logs.
+const TIMED_CALLS: u32 = 8;
 
 /// Submissions of the tracer the GPU may have queued at once; the tracer waits for the oldest before it adds another.
 /// GPUs that can not interrupt compute work (Intel graphics of the 7th generation) run everything queued before the
@@ -254,6 +267,9 @@ impl ComputeTracer {
             errors,
             #[cfg(target_arch = "wasm32")]
             warm: None,
+            #[cfg(target_arch = "wasm32")]
+            unfinished: Default::default(),
+            timed_calls: 0,
         }
     }
 
@@ -284,20 +300,52 @@ impl ComputeTracer {
             if RaytraceSupport::of(context) < RaytraceSupport::Compute {
                 return None;
             }
+            // The browser's driver for Intel graphics of the 7th generation crashes on the shaders, see preview_problem
+            if context
+                .wgpu_adapter_info()
+                .is_some_and(|info| crate::gpu::preview_problem(&info).is_some())
+            {
+                return None;
+            }
             let warm = match context.webgpu_device() {
                 Some(device) => {
                     let info = context.wgpu_adapter_info()?;
                     let media = crate::media_problem(&info).is_none();
-                    Some(
-                        browser::compile(&device, media, &pipeline_constants(&info))
-                            .await
-                            .ok()?,
-                    )
+                    let start = timing::now();
+                    let compiled =
+                        browser::compile(&device, media, &pipeline_constants(&info)).await;
+                    if timing::enabled() {
+                        timing::log(&format!(
+                            "createComputePipelineAsync of the tracer and denoiser took {:.0} ms ({})",
+                            timing::now() - start,
+                            if compiled.is_ok() { "compiled" } else { "failed" }
+                        ));
+                    }
+                    Some(compiled.ok()?)
                 }
                 None => None,
             };
+            let start = timing::now();
             let mut tracer = Self::from_context(context)?;
             tracer.warm = warm;
+            if timing::enabled() {
+                timing::log(&format!(
+                    "made the tracer's pipelines with wgpu in {:.0} ms on the CPU",
+                    timing::now() - start
+                ));
+                timing::when_gpu_done(&tracer.gpu.queue, start, "making the tracer".to_owned());
+                let info = &tracer.adapter;
+                timing::log(&format!(
+                    "adapter {:?} vendor {:#x} driver {:?} driver info {:?}, frames ahead {}, media {}",
+                    info.name,
+                    info.vendor,
+                    info.driver,
+                    info.driver_info,
+                    crate::gpu::frames_ahead(info),
+                    tracer.media_problem().is_none()
+                ));
+            }
+            tracer.warm_up().await;
             Some(tracer)
         }
         #[cfg(not(target_arch = "wasm32"))]
@@ -345,6 +393,11 @@ impl ComputeTracer {
         orders_shadow_crossings(&self.adapter)
     }
 
+    /// The adapter as the context told it.
+    pub(crate) fn adapter_info(&self) -> &w::AdapterInfo {
+        &self.adapter
+    }
+
     /// The device the tracer runs on.
     pub fn gpu(&self) -> &GpuDevice {
         &self.gpu
@@ -368,8 +421,24 @@ impl ComputeTracer {
             return Err(RtError::Gpu(format!("the GPU failed: {error}")));
         }
         let scopes = ErrorScopes::push(&self.gpu.device);
+        let start = timing::now();
         let result = self.trace_gpu_watched(scene, camera, image, settings);
         scopes.pop_into(&self.errors);
+        if timing::enabled() && self.timed_calls < TIMED_CALLS {
+            self.timed_calls += 1;
+            let what = format!(
+                "trace call {} at {}x{}, {} sample(s)",
+                self.timed_calls,
+                image.width,
+                image.height,
+                settings.samples_per_call.max(1)
+            );
+            timing::log(&format!(
+                "{what}: {:.0} ms on the CPU",
+                timing::now() - start
+            ));
+            timing::when_gpu_done(&self.gpu.queue, start, what);
+        }
         result
     }
 
@@ -380,7 +449,32 @@ impl ComputeTracer {
         image: &mut GpuRenderImage,
         settings: &TraceSettings,
     ) -> Result<(), RtError> {
+        let start = timing::now();
+        // The number of the call if it is logged
+        let timed =
+            (timing::enabled() && self.timed_calls < TIMED_CALLS).then_some(self.timed_calls + 1);
+        if let Some(call) = timed {
+            // What was queued before this call, by the tracer or the application (textures, frames, the image)
+            self.gpu.queue.submit([]);
+            timing::when_gpu_done(
+                &self.gpu.queue,
+                start,
+                format!("trace call {call}, work queued before it"),
+            );
+        }
         self.prepare(scene)?;
+        if let Some(call) = timed {
+            timing::log(&format!(
+                "scene prepared (structures built and uploaded) in {:.0} ms on the CPU",
+                timing::now() - start
+            ));
+            self.gpu.queue.submit([]);
+            timing::when_gpu_done(
+                &self.gpu.queue,
+                start,
+                format!("trace call {call}, scene structures"),
+            );
+        }
         if scene.has_media() {
             if let Some(why) = self.media_problem() {
                 return Err(RtError::Gpu(why));
@@ -595,6 +689,20 @@ impl ComputeTracer {
             })
         });
 
+        if let Some(call) = timed {
+            // The uploads on their own, to tell them from the tracing
+            self.gpu.queue.submit([]);
+            timing::when_gpu_done(
+                &self.gpu.queue,
+                start,
+                format!(
+                    "trace call {call}, uploads ({} MB of scene, {} tiles, caustics {})",
+                    buffers.bytes() / 1_000_000,
+                    tiles.len(),
+                    caustics.is_some()
+                ),
+            );
+        }
         // One submission per sample and tile, so the GPU can go on with other work between them, and only a few at a time
         for s in 0..samples {
             let mut encoder = device.create_command_encoder(&w::CommandEncoderDescriptor {
@@ -646,10 +754,105 @@ impl ComputeTracer {
                     );
                 }
                 submit(&self.gpu, &mut self.in_flight, encoder.finish());
+                if let Some(call) = timed {
+                    timing::when_gpu_done(
+                        &self.gpu.queue,
+                        start,
+                        format!(
+                            "trace call {call}, sample {s}, tile {t} of {}x{} px{}",
+                            rect[2],
+                            rect[3],
+                            if t == 0 && caustics.is_some() {
+                                " with the photons"
+                            } else {
+                                ""
+                            }
+                        ),
+                    );
+                }
             }
         }
         image.samples += samples;
+        // The browser tells when the work is done; until then the next call would only queue more
+        #[cfg(target_arch = "wasm32")]
+        {
+            use std::sync::atomic::Ordering;
+            self.unfinished.fetch_add(1, Ordering::Relaxed);
+            let unfinished = self.unfinished.clone();
+            self.gpu.queue.on_submitted_work_done(move || {
+                unfinished.fetch_sub(1, Ordering::Relaxed);
+            });
+        }
         Ok(())
+    }
+
+    ///
+    /// Traces one workgroup of a tiny scene and waits until the GPU is done. Some drivers do work on the first dispatch
+    /// of a pipeline (Chrome on Intel graphics of the 7th generation took 25 s there); that way it happens while the
+    /// preview still traces on the CPU, and the first real frame is fast.
+    ///
+    #[cfg(target_arch = "wasm32")]
+    async fn warm_up(&mut self) {
+        let start = timing::now();
+        let mut scene = RtScene::new();
+        let Ok(square) = scene.add_mesh(&three_d_asset::TriMesh::square()) else {
+            return;
+        };
+        let material = scene.add_material(crate::RtMaterial::default());
+        if scene
+            .add_instance(square, material, Mat4::identity())
+            .is_err()
+        {
+            return;
+        }
+        let camera = Camera::new_perspective(
+            three_d_asset::Viewport::new_at_origo(WORKGROUP, WORKGROUP),
+            vec3(0.0, 0.0, 2.0),
+            vec3(0.0, 0.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+            degrees(45.0),
+            0.1,
+            10.0,
+        );
+        let mut image = GpuRenderImage::new(&self.gpu, WORKGROUP, WORKGROUP);
+        let timed_calls = self.timed_calls;
+        // Not counted as one of the calls of the application
+        self.timed_calls = TIMED_CALLS;
+        let traced = self.trace_gpu(&scene, &camera, &mut image, &TraceSettings::default());
+        self.timed_calls = timed_calls;
+        if traced.is_err() {
+            return;
+        }
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = done.clone();
+        self.gpu
+            .queue
+            .on_submitted_work_done(move || flag.store(true, std::sync::atomic::Ordering::Relaxed));
+        while !done.load(std::sync::atomic::Ordering::Relaxed) {
+            browser::sleep(10).await;
+        }
+        // The structures of the tiny scene are not needed any more
+        self.accel = None;
+        self.buffers = None;
+        if timing::enabled() {
+            timing::log(&format!(
+                "warm-up dispatch of one workgroup: GPU done after {:.0} ms",
+                timing::now() - start
+            ));
+        }
+    }
+
+    ///
+    /// The calls of [ComputeTracer::trace_gpu] whose work the GPU has not finished yet. Outside of browsers the tracer
+    /// waits itself before the queue gets long (see [ComputeTracer::trace_gpu]), so this is 0 there. A browser can not
+    /// wait: an application that traces every frame should skip the frame while this is more than one or two, so that
+    /// the browser does not queue work for seconds, which other graphics of the page wait for.
+    ///
+    pub fn unfinished_calls(&self) -> usize {
+        #[cfg(target_arch = "wasm32")]
+        return self.unfinished.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(target_arch = "wasm32"))]
+        0
     }
 }
 
@@ -1317,6 +1520,23 @@ struct SceneBuffers {
     /// The profiles of luminaires and the words where their tables start
     profiles: Vec<(std::sync::Arc<crate::IesProfile>, u32)>,
     texels: w::Buffer,
+}
+
+impl SceneBuffers {
+    /// Bytes on the GPU.
+    fn bytes(&self) -> u64 {
+        [
+            &self.nodes,
+            &self.triangles,
+            &self.vertices,
+            &self.instances,
+            &self.materials,
+            &self.texels,
+        ]
+        .iter()
+        .map(|b| b.size())
+        .sum()
+    }
 }
 
 /// Words of a buffer, floats by their bits.
