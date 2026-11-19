@@ -366,6 +366,8 @@ fn the_cpu_keeps_its_samples_when_the_gpu_hands_back() {
     }
     preview.set_settings(PreviewSettings {
         cpu_in_background: false,
+        // Not done before the GPU takes over on fast machines
+        max_samples: u32::MAX,
         ..*preview.settings()
     });
     let scene = sky_only(1000.0);
