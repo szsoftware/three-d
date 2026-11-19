@@ -7,6 +7,7 @@ fn probe() {
     let Ok(context) = three_d::Context::new_headless_wgpu() else {
         return;
     };
+    let mut lines = Vec::new();
     for probe in [0u32, 16, 64, 32, 1, 8, 2, 3, 9, 11] {
         // One process, one test: nothing else reads the variable
         unsafe { std::env::set_var("RAYTRACE_PROBE", probe.to_string()) };
@@ -65,7 +66,9 @@ fn probe() {
             };
             let r = tracer.trace(&scene, &camera, &mut image, &settings);
             let p = image.pixel(1, 1);
-            eprintln!("PROBE {probe} {scene_kind}: {:?} {:?}", r.err(), p);
+            lines.push(format!("PROBE {probe} {scene_kind}: {:?} {:?}", r.err(), p));
         }
     }
+    // Fails on purpose, so the test harness shows the lines in the log
+    panic!("{}", lines.join("\n"));
 }
