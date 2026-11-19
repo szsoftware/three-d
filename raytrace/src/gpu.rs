@@ -110,6 +110,19 @@ pub(crate) fn preview_problem(info: &three_d::wgpu::AdapterInfo) -> Option<Strin
     })
 }
 
+///
+/// How many traced frames the preview lets the GPU fall behind in a browser, where the tracer can not wait for the GPU
+/// (see [crate::ComputeTracer::unfinished_calls]). Intel graphics of the 7th generation can not interrupt compute work, the
+/// browser's WebGL on the same GPU waits for all of it there, so the preview waits until the GPU is done.
+///
+pub(crate) fn frames_ahead(info: &three_d::wgpu::AdapterInfo) -> usize {
+    if is_intel_gen7(info.vendor, &info.name, &info.driver, &info.driver_info) {
+        0
+    } else {
+        1
+    }
+}
+
 /// Intel graphics of the 7th generation, by what the adapter tells. Browsers tell only vendor and architecture, for
 /// example "intel" and "gen-7", which three-d passes on as driver and driver info.
 fn is_intel_gen7(vendor: u32, name: &str, driver: &str, driver_info: &str) -> bool {

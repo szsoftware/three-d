@@ -138,6 +138,10 @@ pub struct ComputeTracer {
     /// pipelines of wgpu in its cache
     #[cfg(target_arch = "wasm32")]
     warm: Option<wasm_bindgen::JsValue>,
+    /// Calls of [ComputeTracer::trace_gpu] whose work the browser has not finished yet, see
+    /// [ComputeTracer::unfinished_calls]
+    #[cfg(target_arch = "wasm32")]
+    unfinished: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Submissions of the tracer the GPU may have queued at once; the tracer waits for the oldest before it adds another.
@@ -254,6 +258,8 @@ impl ComputeTracer {
             errors,
             #[cfg(target_arch = "wasm32")]
             warm: None,
+            #[cfg(target_arch = "wasm32")]
+            unfinished: Default::default(),
         }
     }
 
@@ -343,6 +349,11 @@ impl ComputeTracer {
     ///
     pub fn orders_shadow_crossings(&self) -> bool {
         orders_shadow_crossings(&self.adapter)
+    }
+
+    /// The adapter as the context told it.
+    pub(crate) fn adapter_info(&self) -> &w::AdapterInfo {
+        &self.adapter
     }
 
     /// The device the tracer runs on.
@@ -649,7 +660,30 @@ impl ComputeTracer {
             }
         }
         image.samples += samples;
+        // The browser tells when the work is done; until then the next call would only queue more
+        #[cfg(target_arch = "wasm32")]
+        {
+            use std::sync::atomic::Ordering;
+            self.unfinished.fetch_add(1, Ordering::Relaxed);
+            let unfinished = self.unfinished.clone();
+            self.gpu.queue.on_submitted_work_done(move || {
+                unfinished.fetch_sub(1, Ordering::Relaxed);
+            });
+        }
         Ok(())
+    }
+
+    ///
+    /// The calls of [ComputeTracer::trace_gpu] whose work the GPU has not finished yet. Outside of browsers the tracer
+    /// waits itself before the queue gets long (see [ComputeTracer::trace_gpu]), so this is 0 there. A browser can not
+    /// wait: an application that traces every frame should skip the frame while this is more than one or two, so that
+    /// the browser does not queue work for seconds, which other graphics of the page wait for.
+    ///
+    pub fn unfinished_calls(&self) -> usize {
+        #[cfg(target_arch = "wasm32")]
+        return self.unfinished.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(target_arch = "wasm32"))]
+        0
     }
 }
 

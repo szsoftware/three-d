@@ -779,6 +779,10 @@ impl RaytracePreview {
         match &mut self.engine {
             #[cfg(feature = "wgpu")]
             Engine::Gpu { tracer, image } => {
+                // In a browser: at most one frame ahead of the GPU, on Intel graphics of the 7th generation not even that
+                if tracer.unfinished_calls() > crate::gpu::frames_ahead(tracer.adapter_info()) {
+                    return Ok(false);
+                }
                 let settings = TraceSettings {
                     samples_per_call: self.settings.gpu_samples_per_frame.max(1),
                     caustic_photons: self.settings.gpu_caustic_photons,
