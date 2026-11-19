@@ -97,7 +97,7 @@ A graphics card can be reset while it works, for example when a draw or compute 
 Where a reset is noticed:
 
 - wgpu on Vulkan, Metal and DirectX 12, for contexts that `three-d` created (wgpu itself reports the lost device there, also to your own `as_wgpu()` code).
-- **wgpu on top of OpenGL only with the patched wgpu-hal in `vendor/wgpu-hal`.** wgpu-hal creates its OpenGL contexts without reset notification, and such a context is never told about a reset: it goes on and returns wrong results without an error. The patch creates the context with `EGL_CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY = EGL_LOSE_CONTEXT_ON_RESET` where the driver supports it (EGL 1.5 or `EGL_EXT_create_context_robustness`, as Mesa does) and asks `glGetGraphicsResetStatus` after every submission and while waiting for the card, so wgpu reports a lost device as on Vulkan. This repository uses it, an application has to add the same entry to its own `Cargo.toml`, since cargo ignores the patches of dependencies:
+- **wgpu on top of OpenGL only with the patched wgpu-hal in `vendor/wgpu-hal`.** wgpu-hal creates its OpenGL contexts without reset notification, and such a context is never told about a reset: it goes on and returns wrong results without an error. The patch creates the context with `EGL_CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY = EGL_LOSE_CONTEXT_ON_RESET` where the driver supports it (EGL 1.5 or `EGL_EXT_create_context_robustness`, as Mesa does; without robust buffer access where the driver has none, as Mesa crocus on Ivy Bridge) and asks `glGetGraphicsResetStatus` after every submission and while waiting for the card, so wgpu reports a lost device as on Vulkan. This repository uses it, an application has to add the same entry to its own `Cargo.toml`, since cargo ignores the patches of dependencies:
 
   ```toml
   [patch.crates-io]
@@ -105,7 +105,7 @@ Where a reset is noticed:
   ```
 
   Without that entry, everything works as before and resets on OpenGL stay unnoticed. EGL only (Linux, Android), not WGL on Windows. The patch is for wgpu-hal 29.0.4. The changes are marked with `Patched (three-d)`.
-- The OpenGL backend in a context without a window (`Context::new_headless_gl_with_screen`), which `three-d` creates with the same strategy where the driver can.
+- The OpenGL backend in a context without a window (`Context::new_headless_gl_with_screen`), which `three-d` creates with the same strategy where the driver can. It asks for robust buffer access at the same time (glutin cannot do one without the other), so drivers without robust buffer access (Mesa crocus on Ivy Bridge) get no reset notification there.
 - Every other OpenGL context (a window, `Context::from_gl_context`) only if it was created with that strategy (`GL_KHR_robustness`), and then once `context.error_check()` has seen `GL_CONTEXT_LOST`.
 
 ## What works
