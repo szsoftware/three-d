@@ -578,115 +578,73 @@ impl Inner {
         gles_context_attributes.extend(&context_attributes);
 
         let context = {
-            #[derive(Copy, Clone)]
-            enum Robustness {
-                // Patched (three-d): first with the context lost on a reset of the GPU, then without
-                CoreLoseContextOnReset,
-                Core,
-                ExtLoseContextOnReset,
-                Ext,
+            // Patched (three-d): the attributes for robustness, tried in this order. First robust buffer access with
+            // the context lost on a reset of the GPU, then the context lost on a reset alone, because drivers without
+            // robust buffer access (Mesa crocus on Ivy Bridge) can still report resets, then robust access alone.
+            let khr_strategy = version >= (1, 5) || supports_khr_context;
+            let ext = display_extensions.contains("EGL_EXT_create_context_robustness");
+            let mut levels: Vec<(&str, Vec<khronos_egl::Int>)> = Vec::new();
+            let robust_core = [khronos_egl::CONTEXT_OPENGL_ROBUST_ACCESS, khronos_egl::TRUE as _];
+            let robust_ext = [EGL_CONTEXT_OPENGL_ROBUST_ACCESS_EXT, khronos_egl::TRUE as _];
+            let lose_core = [
+                EGL_CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY,
+                EGL_LOSE_CONTEXT_ON_RESET,
+            ];
+            let lose_ext = [
+                EGL_CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY_EXT,
+                EGL_LOSE_CONTEXT_ON_RESET,
+            ];
+            if version >= (1, 5) {
+                levels.push(("+robust access +lose context on reset", [robust_core, lose_core].concat()));
             }
-
-            let robustness = if version >= (1, 5) {
-                Some(Robustness::CoreLoseContextOnReset)
-            } else if display_extensions.contains("EGL_EXT_create_context_robustness") {
-                Some(Robustness::ExtLoseContextOnReset)
-            } else {
-                None
-            };
+            if ext {
+                levels.push((
+                    "+robust access EXT +lose context on reset EXT",
+                    [robust_ext, lose_ext].concat(),
+                ));
+            }
+            if khr_strategy {
+                levels.push(("+lose context on reset", lose_core.to_vec()));
+            }
+            if ext {
+                levels.push(("+lose context on reset EXT", lose_ext.to_vec()));
+            }
+            if version >= (1, 5) {
+                levels.push(("+robust access", robust_core.to_vec()));
+            }
+            if ext {
+                levels.push(("+robust access EXT", robust_ext.to_vec()));
+            }
+            levels.push(("-robust access", Vec::new()));
 
             let create_context = |api, base_attributes: &[khronos_egl::Int]| {
                 egl.bind_api(api)?;
 
-                let mut robustness = robustness;
-                loop {
-                    let robustness_attributes = match robustness {
-                        Some(Robustness::CoreLoseContextOnReset) => {
-                            vec![
-                                khronos_egl::CONTEXT_OPENGL_ROBUST_ACCESS,
-                                khronos_egl::TRUE as _,
-                                EGL_CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY,
-                                EGL_LOSE_CONTEXT_ON_RESET,
-                                khronos_egl::NONE,
-                            ]
-                        }
-                        Some(Robustness::Core) => {
-                            vec![
-                                khronos_egl::CONTEXT_OPENGL_ROBUST_ACCESS,
-                                khronos_egl::TRUE as _,
-                                khronos_egl::NONE,
-                            ]
-                        }
-                        Some(Robustness::ExtLoseContextOnReset) => {
-                            vec![
-                                EGL_CONTEXT_OPENGL_ROBUST_ACCESS_EXT,
-                                khronos_egl::TRUE as _,
-                                EGL_CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY_EXT,
-                                EGL_LOSE_CONTEXT_ON_RESET,
-                                khronos_egl::NONE,
-                            ]
-                        }
-                        Some(Robustness::Ext) => {
-                            vec![
-                                EGL_CONTEXT_OPENGL_ROBUST_ACCESS_EXT,
-                                khronos_egl::TRUE as _,
-                                khronos_egl::NONE,
-                            ]
-                        }
-                        None => vec![khronos_egl::NONE],
-                    };
-
+                let mut last = Err(khronos_egl::Error::BadAttribute);
+                for (label, robustness_attributes) in &levels {
                     let mut context_attributes = base_attributes.to_vec();
-                    context_attributes.extend(&robustness_attributes);
+                    context_attributes.extend(robustness_attributes);
+                    context_attributes.push(khronos_egl::NONE);
 
                     match egl.create_context(display, config, None, &context_attributes) {
                         Ok(context) => {
-                            match robustness {
-                                Some(Robustness::CoreLoseContextOnReset) => {
-                                    log::debug!("\tEGL context: +robust access +lose context on reset");
-                                }
-                                Some(Robustness::Core) => {
-                                    log::debug!("\tEGL context: +robust access");
-                                }
-                                Some(Robustness::ExtLoseContextOnReset) => {
-                                    log::debug!(
-                                        "\tEGL context: +robust access EXT +lose context on reset"
-                                    );
-                                }
-                                Some(Robustness::Ext) => {
-                                    log::debug!("\tEGL context: +robust access EXT");
-                                }
-                                None => {
-                                    log::debug!("\tEGL context: -robust access");
-                                }
-                            }
+                            log::debug!("\tEGL context: {label}");
                             return Ok(context);
                         }
-
                         // Robust access context creation can fail with different error codes
                         // depending on the EGL path. Retry with a lower robustness level.
                         Err(
-                            khronos_egl::Error::BadAttribute
+                            e @ (khronos_egl::Error::BadAttribute
                             | khronos_egl::Error::BadMatch
-                            | khronos_egl::Error::BadConfig,
-                        ) if robustness.is_some() => {
-                            robustness = match robustness {
-                                Some(Robustness::CoreLoseContextOnReset) => Some(Robustness::Core),
-                                Some(Robustness::Core)
-                                    if display_extensions
-                                        .contains("EGL_EXT_create_context_robustness") =>
-                                {
-                                    Some(Robustness::ExtLoseContextOnReset)
-                                }
-                                Some(Robustness::ExtLoseContextOnReset) => Some(Robustness::Ext),
-                                _ => None,
-                            };
-                            continue;
+                            | khronos_egl::Error::BadConfig),
+                        ) if !robustness_attributes.is_empty() => {
+                            log::debug!("\tEGL context: {label} failed: {e}");
+                            last = Err(e);
                         }
-
                         Err(e) => return Err(e),
                     }
                 }
+                last
             };
 
             let result = if supports_opengl {
