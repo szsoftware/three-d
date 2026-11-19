@@ -327,6 +327,16 @@ impl ComputeTracer {
                     timing::now() - start
                 ));
                 timing::when_gpu_done(&tracer.gpu.queue, start, "making the tracer".to_owned());
+                let info = &tracer.adapter;
+                timing::log(&format!(
+                    "adapter {:?} vendor {:#x} driver {:?} driver info {:?}, frames ahead {}, media {}",
+                    info.name,
+                    info.vendor,
+                    info.driver,
+                    info.driver_info,
+                    crate::gpu::frames_ahead(info),
+                    tracer.media_problem().is_none()
+                ));
             }
             tracer.warm_up().await;
             Some(tracer)
@@ -433,8 +443,11 @@ impl ComputeTracer {
         settings: &TraceSettings,
     ) -> Result<(), RtError> {
         let start = timing::now();
+        // The number of the call if it is logged
+        let timed =
+            (timing::enabled() && self.timed_calls < TIMED_CALLS).then_some(self.timed_calls + 1);
         self.prepare(scene)?;
-        if timing::enabled() && self.timed_calls < TIMED_CALLS {
+        if timed.is_some() {
             timing::log(&format!(
                 "scene prepared (structures built and uploaded) in {:.0} ms on the CPU",
                 timing::now() - start
@@ -654,6 +667,20 @@ impl ComputeTracer {
             })
         });
 
+        if let Some(call) = timed {
+            // The uploads on their own, to tell them from the tracing
+            self.gpu.queue.submit([]);
+            timing::when_gpu_done(
+                &self.gpu.queue,
+                start,
+                format!(
+                    "trace call {call}, uploads ({} MB of scene, {} tiles, caustics {})",
+                    buffers.bytes() / 1_000_000,
+                    tiles.len(),
+                    caustics.is_some()
+                ),
+            );
+        }
         // One submission per sample and tile, so the GPU can go on with other work between them, and only a few at a time
         for s in 0..samples {
             let mut encoder = device.create_command_encoder(&w::CommandEncoderDescriptor {
@@ -705,6 +732,22 @@ impl ComputeTracer {
                     );
                 }
                 submit(&self.gpu, &mut self.in_flight, encoder.finish());
+                if let Some(call) = timed {
+                    timing::when_gpu_done(
+                        &self.gpu.queue,
+                        start,
+                        format!(
+                            "trace call {call}, sample {s}, tile {t} of {}x{} px{}",
+                            rect[2],
+                            rect[3],
+                            if t == 0 && caustics.is_some() {
+                                " with the photons"
+                            } else {
+                                ""
+                            }
+                        ),
+                    );
+                }
             }
         }
         image.samples += samples;
@@ -1455,6 +1498,23 @@ struct SceneBuffers {
     /// The profiles of luminaires and the words where their tables start
     profiles: Vec<(std::sync::Arc<crate::IesProfile>, u32)>,
     texels: w::Buffer,
+}
+
+impl SceneBuffers {
+    /// Bytes on the GPU.
+    fn bytes(&self) -> u64 {
+        [
+            &self.nodes,
+            &self.triangles,
+            &self.vertices,
+            &self.instances,
+            &self.materials,
+            &self.texels,
+        ]
+        .iter()
+        .map(|b| b.size())
+        .sum()
+    }
 }
 
 /// Words of a buffer, floats by their bits.
