@@ -64,6 +64,12 @@ jobs:
       - if: startsWith(matrix.os, 'ubuntu')
         run: sudo apt-get install -y mesa-vulkan-drivers libegl1 libegl-mesa0 libgl1-mesa-dri && echo "THREE_D_EXPECT_BACKEND=vulkan" >> $GITHUB_ENV
 
+      # Only lavapipe for the Vulkan loader: with all Mesa drivers it loads and unloads the ones without a device while
+      # other test threads create their instances, and the loader of Ubuntu 26.04 crashes in that race (SIGSEGV in
+      # vkEnumeratePhysicalDevices next to dlclose)
+      - if: startsWith(matrix.os, 'ubuntu')
+        run: echo "VK_ICD_FILENAMES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -1)" >> $GITHUB_ENV
+
       # macOS tests the wgpu backend on Metal and Windows on DirectX 12 (software adapter), both against what OpenGL returned on Linux
       - if: startsWith(matrix.os, 'macos')
         run: echo "THREE_D_EXPECT_BACKEND=metal" >> $GITHUB_ENV
@@ -100,14 +106,8 @@ jobs:
           bin=$(cargo test -p three-d-raytrace --all-features --test gpu --no-run --message-format=json 2>/dev/null | jq -r 'select(.executable != null and .target.name == "gpu") | .executable')
           echo "binary: $bin"
           for i in 1 2 3 4; do echo "== parallel run $i"; "$bin" 2>&1 | tail -4; echo "exit ${PIPESTATUS[0]}"; done
-          for i in 1 2 3 4; do echo "== one thread run $i"; "$bin" --test-threads=1 2>&1 | grep -E "^test |result"; echo "exit ${PIPESTATUS[0]}"; done
-          for t in compute_is_supported_on_wgpu render_image_shows_upright_in_three_d compute_white_furnace; do
-            for i in 1 2 3; do echo "== alone $t $i"; "$bin" --exact $t 2>&1 | grep -E "result"; echo "exit ${PIPESTATUS[0]}"; done
-          done
-          for i in 1 2 3; do
-            echo "== gdb run $i"
-            gdb -q -batch -ex "set pagination off" -ex run -ex "thread apply all bt 30" --args "$bin" 2>&1 | grep -vE "^\[(New|Thread .* exited)" | grep -A400 -E "SIGSEGV|exited normally" | head -400
-          done
+          echo "VK_ICD_FILENAMES=$VK_ICD_FILENAMES"
+          for i in 5 6 7 8 9 10 11 12; do echo "== parallel run $i"; "$bin" 2>&1 | tail -4; echo "exit ${PIPESTATUS[0]}"; done
 
       # The ray tracing crate of the fork, also together with the wgpu backend on the adapter chosen above
       - name: Test ray tracing
