@@ -226,7 +226,16 @@ type TracedFor = (Vec<f32>, u64, u64);
 #[cfg(feature = "wgpu")]
 struct Compiling {
     #[cfg(not(target_arch = "wasm32"))]
-    receiver: std::sync::mpsc::Receiver<Box<crate::ComputeTracer>>,
+    receiver: Option<std::sync::mpsc::Receiver<Box<crate::ComputeTracer>>>,
+    /// On OpenGL: made on the thread of the context once the CPU shows an image, with the updates waited so far.
+    /// wgpu's OpenGL backend locks the one context for every call, so a thread that compiles holds up the frames and
+    /// wgpu gives up after a second.
+    #[cfg(not(target_arch = "wasm32"))]
+    deferred: Option<(
+        crate::GpuDevice,
+        Option<three_d::wgpu::AdapterInfo>,
+        std::cell::Cell<u32>,
+    )>,
     #[cfg(target_arch = "wasm32")]
     slot: std::rc::Rc<std::cell::RefCell<Option<GpuTracer>>>,
 }
@@ -239,12 +248,24 @@ impl Compiling {
         {
             let gpu = crate::GpuDevice::from_context(context)?;
             let info = context.wgpu_adapter_info();
+            if info
+                .as_ref()
+                .is_some_and(|i| i.backend == three_d::wgpu::Backend::Gl)
+            {
+                return Some(Self {
+                    receiver: None,
+                    deferred: Some((gpu, info, std::cell::Cell::new(0))),
+                });
+            }
             let (send, receiver) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 crate::priority::lower_this_thread(crate::priority::COMPILING);
                 let _ = send.send(Box::new(crate::ComputeTracer::for_adapter(&gpu, info)));
             });
-            Some(Self { receiver })
+            Some(Self {
+                receiver: Some(receiver),
+                deferred: None,
+            })
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -259,12 +280,26 @@ impl Compiling {
         }
     }
 
-    /// The tracer once it is made, `Some(None)` if that failed, `None` while it is not done.
-    fn poll(&self) -> Option<GpuTracer> {
+    ///
+    /// The tracer once it is made, `Some(None)` if that failed, `None` while it is not done. On OpenGL it is made here
+    /// when `shown` (the CPU shows an image), or after some updates without.
+    ///
+    fn poll(&self, #[allow(unused_variables)] shown: bool) -> Option<GpuTracer> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             use std::sync::mpsc::TryRecvError;
-            match self.receiver.try_recv() {
+            if let Some((gpu, info, updates)) = &self.deferred {
+                updates.set(updates.get() + 1);
+                if !shown && updates.get() < DEFERRED_UPDATES {
+                    return None;
+                }
+                return Some(Some(Box::new(crate::ComputeTracer::for_adapter(
+                    gpu,
+                    info.clone(),
+                ))));
+            }
+            let receiver = self.receiver.as_ref()?;
+            match receiver.try_recv() {
                 Ok(tracer) => Some(Some(tracer)),
                 Err(TryRecvError::Empty) => None,
                 Err(TryRecvError::Disconnected) => Some(None),
@@ -277,11 +312,16 @@ impl Compiling {
     /// Waits for the tracer; a browser can not wait, there it is the tracer if it is already made.
     fn wait(self) -> GpuTracer {
         #[cfg(not(target_arch = "wasm32"))]
-        return self.receiver.recv().ok();
-        #[cfg(target_arch = "wasm32")]
-        self.poll().flatten()
+        if let Some(receiver) = &self.receiver {
+            return receiver.recv().ok();
+        }
+        self.poll(true).flatten()
     }
 }
+
+/// Updates on OpenGL before the shaders are compiled on the context's thread even without an image of the CPU.
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+const DEFERRED_UPDATES: u32 = 60;
 
 /// The compute tracer, if the preview makes one.
 #[cfg(feature = "wgpu")]
@@ -557,6 +597,9 @@ impl RaytracePreview {
     /// Whether the shaders of the GPU still compile on another thread, which takes seconds on some drivers. The CPU
     /// traces meanwhile, and the preview goes on with the GPU in the first [RaytracePreview::update] after.
     ///
+    /// On wgpu's OpenGL backend no other thread can use the context while a frame is drawn, so there the shaders
+    /// compile in the [RaytracePreview::update] after the CPU shows its first image (that update takes as long).
+    ///
     pub fn is_compiling(&self) -> bool {
         #[cfg(feature = "wgpu")]
         return self.compiling.is_some();
@@ -583,7 +626,8 @@ impl RaytracePreview {
     /// Goes on with the GPU once its shaders are compiled.
     #[cfg(feature = "wgpu")]
     fn poll_compiling(&mut self) {
-        if let Some(tracer) = self.compiling.as_ref().and_then(Compiling::poll) {
+        let shown = self.sample_count() > 0;
+        if let Some(tracer) = self.compiling.as_ref().and_then(|c| c.poll(shown)) {
             self.compiling = None;
             self.take_gpu(tracer);
         }

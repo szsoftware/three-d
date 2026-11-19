@@ -402,3 +402,39 @@ fn the_cpu_keeps_its_samples_when_the_gpu_hands_back() {
         preview.sample_count()
     );
 }
+
+#[test]
+fn on_wgpu_over_opengl_the_shaders_compile_once_the_cpu_shows_an_image() {
+    let Some(context) = context() else { return };
+    if context
+        .wgpu_adapter_info()
+        .is_none_or(|info| info.backend != three_d::wgpu::Backend::Gl)
+    {
+        return;
+    }
+    let mut preview = RaytracePreview::new(&context, 16, 8);
+    if preview.availability() != &PreviewAvailability::Gpu {
+        return;
+    }
+    preview.set_settings(PreviewSettings {
+        cpu_in_background: false,
+        ..PreviewSettings::default()
+    });
+    let scene = sky_only(1000.0);
+    // No thread compiles: wgpu's OpenGL backend gives up when another thread holds the context for a second
+    let mut updates = 0;
+    while preview.sample_count() == 0 {
+        assert!(preview.is_compiling());
+        preview
+            .update(&scene, &camera(16, 8, vec3(0.0, 0.0, 0.0)))
+            .unwrap();
+        updates += 1;
+        assert!(updates < 1000, "the CPU never showed an image");
+    }
+    preview
+        .update(&scene, &camera(16, 8, vec3(0.0, 0.0, 0.0)))
+        .unwrap();
+    assert!(!preview.is_compiling());
+    assert_eq!(preview.kind(), TracerKind::Compute);
+    finish(&context);
+}

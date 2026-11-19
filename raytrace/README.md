@@ -76,7 +76,9 @@ starts again (and does nothing for the same size).
 
 The shaders of the GPU compile on another thread at nice 19, which takes about 8 s on the HD 4000; the CPU traces
 meanwhile and the preview goes on with the GPU in the first `update` after (`is_compiling`, `wait_for_gpu`). With wgpu
-on OpenGL the driver may still hold the context while it compiles. In the browser wgpu can only compile synchronously,
+on OpenGL no other thread may use the context while a frame is drawn (wgpu gives up after a second with "Could not
+lock adapter context"), so there the shaders compile in the `update` after the CPU shows its first image, and that
+update takes as long. In the browser wgpu can only compile synchronously,
 which holds the page (in headless Chromium with SwiftShader for minutes); there `ComputeTracer::from_context_async`
 first lets the browser compile the same pipelines with `createComputePipelineAsync` in the background, and wgpu then
 finds them in the browser's cache (12 s in the background, then 1 ms, in the same Chromium). It needs the browser's
