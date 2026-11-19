@@ -308,6 +308,32 @@ fn a_slow_gpu_gets_a_lighter_preview() {
 }
 
 #[test]
+fn the_first_gpu_frame_does_not_count_for_the_pace() {
+    let Some(context) = context() else { return };
+    let mut preview = RaytracePreview::new(&context, 16, 8);
+    preview.wait_for_gpu();
+    if preview.kind() != TracerKind::Compute {
+        return;
+    }
+    preview.set_settings(PreviewSettings {
+        gpu_frame_time: Some(std::time::Duration::from_millis(200)),
+        ..*preview.settings()
+    });
+    let scene = sky_only(1000.0);
+    let camera = camera(16, 8, vec3(0.0, 0.0, 0.0));
+    // The first frame on the GPU takes long (the scene's structures, the first use of the pipelines), far too long
+    // for the limit, the next ones do not
+    preview.update(&scene, &camera).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    for _ in 0..3 {
+        preview.update(&scene, &camera).unwrap();
+    }
+    finish(&context);
+    assert_eq!(preview.kind(), TracerKind::Compute);
+    assert_eq!(preview.gpu_downscale(), 1);
+}
+
+#[test]
 fn the_cpu_goes_on_after_the_gpu_changed_its_resolution() {
     let Some(context) = context() else { return };
     let mut preview = RaytracePreview::new(&context, 64, 32);

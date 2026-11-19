@@ -81,10 +81,11 @@ pub struct PreviewSettings {
     /// Longest time between two updates while the GPU traces. When three frames in a row take longer, the preview
     /// halves the GPU's resolution (down to a quarter) and, if that is not enough, goes on with the CPU, which traces
     /// beside the frames. A frame five times longer goes at once to the resolution that would be fast enough, or to the
-    /// CPU; [RaytracePreview::availability] then says why. Weak GPUs such as Intel HD 4000 trace no
-    /// faster than four CPU cores and would hold up every frame. `None` keeps the GPU at `gpu_downscale`. The frames of
-    /// a browser do not wait for the GPU; there it is the time the GPU takes for the work of one update, from when the
-    /// browser says it is done.
+    /// CPU; [RaytracePreview::availability] then says why. The first frame after the GPU starts does not count, it
+    /// builds the scene's structures and uses the pipelines for the first time. Weak GPUs such as Intel HD 4000 trace
+    /// no faster than four CPU cores and would hold up every frame. `None` keeps the GPU at `gpu_downscale`. The frames
+    /// of a browser do not wait for the GPU; there it is the time the GPU takes for the work of one update, from when
+    /// the browser says it is done.
     ///
     pub gpu_frame_time: Option<std::time::Duration>,
     /// The CPU traces at width and height divided by this, 4 by default and 8 in browsers.
@@ -345,12 +346,13 @@ struct Pace {
     /// In the browser: whether the times of the tracer's calls before this engine were dropped
     #[cfg(target_arch = "wasm32")]
     started: bool,
-    /// Frames since the engine was made; the first ones wait for shaders to compile
+    /// Times measured since the engine was made: between frames, in the browser of the GPU's calls
     frames: u32,
     slow: u32,
 }
 
-/// Frames after a new engine that do not count, while its buffers are made.
+/// Times measured after a new engine that do not count: the first has the scene's structures and the first use of the
+/// pipelines.
 #[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
 const WARM_UP_FRAMES: u32 = 1;
 /// Slow frames in a row before the preview gets lighter.
@@ -906,7 +908,11 @@ impl RaytracePreview {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let now = std::time::Instant::now();
-            let interval = self.pace.last.replace(now).map(|last| now - last);
+            // The first frame of an engine has no time before it; the time after it, with the first trace, is the
+            // warm-up
+            let Some(interval) = self.pace.last.replace(now).map(|last| now - last) else {
+                return false;
+            };
             self.pace_step(interval, limit, true)
         }
         #[cfg(target_arch = "wasm32")]
@@ -924,7 +930,7 @@ impl RaytracePreview {
                 let busy = std::time::Duration::from_secs_f64(busy / 1000.0);
                 // Not at once on one slow call: a hidden page stops its frames, and the browser may tell late about
                 // the at most two calls it still had
-                if self.pace_step(Some(busy), limit, false) {
+                if self.pace_step(busy, limit, false) {
                     return true;
                 }
             }
@@ -937,23 +943,18 @@ impl RaytracePreview {
     #[cfg(feature = "wgpu")]
     fn pace_step(
         &mut self,
-        interval: Option<std::time::Duration>,
+        interval: std::time::Duration,
         limit: std::time::Duration,
         at_once: bool,
     ) -> bool {
         self.pace.frames += 1;
-        // Only while tracing: a finished image costs the GPU nothing
-        if self.is_done() || self.pace.frames <= WARM_UP_FRAMES {
+        // Only while tracing: a finished image costs the GPU nothing. The first time after a new engine has the scene's
+        // structures and the first use of the pipelines in it.
+        if self.is_done() || self.pace.frames <= WARM_UP_FRAMES || interval <= limit {
             self.pace.slow = 0;
             return false;
         }
-        match interval {
-            Some(interval) if interval > limit => self.pace.slow += 1,
-            _ => self.pace.slow = 0,
-        }
-        let Some(interval) = interval.filter(|_| self.pace.slow > 0) else {
-            return false;
-        };
+        self.pace.slow += 1;
         // Far too slow: at once to the resolution that would be fast enough, the time goes with the pixels
         let far_too_slow = interval > limit * FAR_TOO_SLOW;
         if self.pace.slow < SLOW_FRAMES && !(far_too_slow && at_once) {
