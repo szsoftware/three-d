@@ -142,8 +142,10 @@ override MEDIA: bool = false;
 // Surfaces touching the solid a path just left are hit, not jumped over (a pane of glass on the floor); off for the
 // compilers of Intel graphics of the 7th generation, for which the tracer is just small enough without
 override CONTACT: bool = true;
-// TEMPORARY probe for DirectX 12: bits switch parts of the media code off
-override PROBE: u32 = 0u;
+// Shadow rays take the surfaces of solids in their order (crossed_transmittance); off where the compiler goes wrong on
+// that code (WARP, the software adapter of DirectX 12, then computes zeros in the whole tracer), which then takes the
+// sums of summed_transmittance as before solids could be nested
+override ORDERED: bool = true;
 // The solid a path just left and up to where its surfaces are passed by, NONE for none (tracer.rs past)
 var<private> skip_instance: u32 = 0xffffffffu;
 var<private> skip_until: f32;
@@ -448,49 +450,42 @@ fn segment_depth(n: Nest, o: vec3<f32>, d: vec3<f32>, t0: f32, t1: f32) -> vec3<
 // What the solids and media along a shadow ray let through, the surfaces of solids taken in their order
 // (tracer.rs transmittance); the sums of shadow_hit where there are too many surfaces
 fn crossed_transmittance(o: vec3<f32>, d: vec3<f32>, distance: f32) -> vec3<f32> {
-    if crossing_count > MAX_CROSSINGS || (PROBE & 2u) != 0u {
+    if !ORDERED || crossing_count > MAX_CROSSINGS {
         return summed_transmittance(o, d, distance);
     }
-    var n = path_nest;
-    if (PROBE & 512u) != 0u {
-        n = Nest(array<u32, 4>(NONE, NONE, NONE, NONE), array<f32, 4>(1.0, 1.0, 1.0, 1.0), 0u);
+    // Sorted by distance
+    for (var i = 1u; i < crossing_count; i++) {
+        var j = i;
+        while j > 0u && crossing_t[j - 1u] > crossing_t[j] {
+            let t = crossing_t[j];
+            crossing_t[j] = crossing_t[j - 1u];
+            crossing_t[j - 1u] = t;
+            let info = crossing_info[j];
+            crossing_info[j] = crossing_info[j - 1u];
+            crossing_info[j - 1u] = info;
+            let color = crossing_color[j];
+            crossing_color[j] = crossing_color[j - 1u];
+            crossing_color[j - 1u] = color;
+            j -= 1u;
+        }
     }
+    var n = path_nest;
     var start = 0.0;
     var depth = vec3<f32>(0.0);
     var through = vec3<f32>(1.0);
-    // In the order of their distance, the nearest not taken yet each time: the arrays are only read, which the
-    // compilers of DirectX 12 get right (sorting them in place left the whole tracer black on WARP)
-    var taken = 0u;
-    for (var k = 0u; k < crossing_count && (PROBE & 256u) == 0u; k++) {
-        var i = 0u;
-        var nearest = BIG * 4.0;
-        for (var j = 0u; j < crossing_count; j++) {
-            if (taken & (1u << j)) == 0u && crossing_t[j] < nearest {
-                nearest = crossing_t[j];
-                i = j;
-            }
-        }
-        taken |= 1u << i;
-        let info = crossing_info[i];
-        let color = crossing_color[i];
-        depth += segment_depth(n, o, d, start, nearest);
-        var c = Crossing(n, true, 1.0);
-        if (PROBE & 4u) == 0u {
-            c = nest_cross(n, info & 0x7fffffffu, (info & 0x80000000u) != 0u);
-        }
+    for (var i = 0u; i < crossing_count; i++) {
+        depth += segment_depth(n, o, d, start, crossing_t[i]);
+        let c = nest_cross(n, crossing_info[i] & 0x7fffffffu, (crossing_info[i] & 0x80000000u) != 0u);
         if c.seen {
             // Straight through, so the reflection is the same both ways
             var eta = c.eta;
             if eta < 1.0 {
                 eta = 1.0 / eta;
             }
-            through *= color.rgb * (1.0 - fresnel_dielectric(color.w, eta));
+            through *= crossing_color[i].rgb * (1.0 - fresnel_dielectric(crossing_color[i].w, eta));
         }
         n = c.after;
-        start = nearest;
-    }
-    if (PROBE & 8u) != 0u {
-        return through * exp(-max(depth, vec3<f32>(0.0)));
+        start = crossing_t[i];
     }
     if distance >= 0.5 * BIG {
         // Open meshes and fog that does not thin out: the medium does not end
@@ -794,7 +789,7 @@ fn shadow_hit(index: u32, m: Material, p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f3
     let transmission = m.params.w;
     let face = face_normal_in_world(index, p0, p1, p2);
     let cos_i = clamp(abs(dot(face, shadow_direction)), 0.0, 1.0);
-    if MEDIA && m.flags.x == 0.0 {
+    if MEDIA && ORDERED && m.flags.x == 0.0 {
         // Solids in their order in crossed_transmittance, with the Fresnel term from the media on both sides
         if crossing_count < MAX_CROSSINGS {
             crossing_t[crossing_count] = t;
@@ -1674,25 +1669,8 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
     // Boundaries of media passed, which are no bounce
     var passes = 0u;
     if MEDIA {
-        if (PROBE & 1u) != 0u {
-            path_nest = Nest(array<u32, 4>(NONE, NONE, NONE, NONE), array<f32, 4>(1.0, 1.0, 1.0, 1.0), 0u);
-        } else {
-            path_nest = camera_nest();
-        }
-        if (PROBE & 8u) != 0u {
-            path_medium = NONE;
-        } else {
-            path_medium = nest_material(path_nest);
-        }
-        if (PROBE & 16u) != 0u {
-            return vec3<f32>(1.0, 2.0, 3.0);
-        }
-        if (PROBE & 32u) != 0u && path_medium != NONE {
-            return vec3<f32>(5.0, f32(path_nest.count), f32(path_medium));
-        }
-        if (PROBE & 64u) != 0u {
-            return vec3<f32>(f32(params.camera_nest.x == NONE), f32(params.camera_nest.w == NONE), params.fog_shape.z);
-        }
+        path_nest = camera_nest();
+        path_medium = nest_material(path_nest);
         medium_event = false;
     }
     if CONTACT {
@@ -1736,9 +1714,6 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
             }
         }
         let hit = walk(ray_origin, ray_direction, light_distance, shadow);
-        if (PROBE & 4096u) != 0u {
-            return vec3<f32>(4.0, hit.t, f32(hit.instance == NONE));
-        }
         if CONTACT && !shadow {
             skip_instance = NONE;
         }
@@ -1747,11 +1722,7 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
         if shadow {
             var through = transmittance;
             if MEDIA {
-                let crossed = crossed_transmittance(origin, shadow_ray.direction, shadow_ray.distance);
-                if (PROBE & 16384u) != 0u && (any(crossed != crossed) || any(abs(crossed) > vec3<f32>(1e30))) {
-                    return vec3<f32>(77.0, crossed.x, shadow_ray.distance);
-                }
-                through *= crossed;
+                through *= crossed_transmittance(origin, shadow_ray.direction, shadow_ray.distance);
             }
             direct += shadow_ray.contribution * through;
             shadow_ray = next_shadow_ray(shadow_ray.next, origin, -direction, surface_n, surface_ng, reflecting(surface_base_color, surface_params));
@@ -1767,9 +1738,6 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
                     end = hit.t;
                 }
                 let step = sample_medium(origin, direction, end);
-                if (PROBE & 1024u) != 0u {
-                    return vec3<f32>(9.0, step.weight.x, step.t);
-                }
                 throughput *= step.weight;
                 if step.t >= 0.0 {
                     if bounce >= params.camera.w {
@@ -1816,9 +1784,6 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
                 }
                 break;
             } else if hit.instance == NONE {
-                if (PROBE & 2048u) != 0u {
-                    return vec3<f32>(8.0, throughput.x, environment(direction, true).x);
-                }
                 result += clamped(bounce, throughput * environment(direction, last_was_delta && (!diffuse_seen || (glass_reflected && params.caustics.y == 0.0))));
                 if bounce == 0u {
                     add_features(vec3<f32>(1.0), -direction, SKY_DISTANCE);

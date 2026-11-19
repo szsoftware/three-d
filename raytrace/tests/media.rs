@@ -13,6 +13,10 @@ fn tracers() -> Vec<(&'static str, Box<dyn Tracer>)> {
     #[cfg(feature = "wgpu")]
     match three_d::Context::new_headless_wgpu() {
         Ok(context) => match ComputeTracer::from_context(&context) {
+            // WARP adds up the media along shadow rays, see ComputeTracer::orders_shadow_crossings
+            Some(tracer) if !tracer.orders_shadow_crossings() => {
+                tracers.push(("compute adding up shadows", Box::new(tracer)))
+            }
             Some(tracer) => tracers.push(("compute", Box::new(tracer))),
             None if std::env::var("WGPU_BACKEND").as_deref() == Ok("gl") => {}
             None => panic!("no compute shaders: {:?}", RaytraceSupport::of(&context)),
@@ -443,8 +447,13 @@ fn the_shadow_of_ice_in_water() {
         0.01,
         10.0,
     );
-    let expected = water + ice;
     for (name, mut tracer) in tracers() {
+        // In order the ice takes the place of the water in it; added up, the water counts there too
+        let expected = if name == "compute adding up shadows" {
+            water * 2.0 + ice
+        } else {
+            water + ice
+        };
         let mut lit = [vec3(0.0, 0.0, 0.0); 2];
         for (i, boxes) in [false, true].into_iter().enumerate() {
             let mut image = RenderImage::new(4, 4);
