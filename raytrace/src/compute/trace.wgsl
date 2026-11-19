@@ -142,6 +142,8 @@ override MEDIA: bool = false;
 // Surfaces touching the solid a path just left are hit, not jumped over (a pane of glass on the floor); off for the
 // compilers of Intel graphics of the 7th generation, for which the tracer is just small enough without
 override CONTACT: bool = true;
+// TEMPORARY probe for DirectX 12: bits switch parts of the media code off
+override PROBE: u32 = 0u;
 // The solid a path just left and up to where its surfaces are passed by, NONE for none (tracer.rs past)
 var<private> skip_instance: u32 = 0xffffffffu;
 var<private> skip_until: f32;
@@ -446,7 +448,7 @@ fn segment_depth(n: Nest, o: vec3<f32>, d: vec3<f32>, t0: f32, t1: f32) -> vec3<
 // What the solids and media along a shadow ray let through, the surfaces of solids taken in their order
 // (tracer.rs transmittance); the sums of shadow_hit where there are too many surfaces
 fn crossed_transmittance(o: vec3<f32>, d: vec3<f32>, distance: f32) -> vec3<f32> {
-    if crossing_count > MAX_CROSSINGS {
+    if crossing_count > MAX_CROSSINGS || (PROBE & 2u) != 0u {
         return summed_transmittance(o, d, distance);
     }
     // Sorted by distance
@@ -1665,8 +1667,25 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
     // Boundaries of media passed, which are no bounce
     var passes = 0u;
     if MEDIA {
-        path_nest = camera_nest();
-        path_medium = nest_material(path_nest);
+        if (PROBE & 1u) != 0u {
+            path_nest = Nest(array<u32, 4>(NONE, NONE, NONE, NONE), array<f32, 4>(1.0, 1.0, 1.0, 1.0), 0u);
+        } else {
+            path_nest = camera_nest();
+        }
+        if (PROBE & 8u) != 0u {
+            path_medium = NONE;
+        } else {
+            path_medium = nest_material(path_nest);
+        }
+        if (PROBE & 16u) != 0u {
+            return vec3<f32>(1.0, 2.0, 3.0);
+        }
+        if (PROBE & 32u) != 0u && path_medium != NONE {
+            return vec3<f32>(5.0, f32(path_nest.count), f32(path_medium));
+        }
+        if (PROBE & 64u) != 0u {
+            return vec3<f32>(f32(params.camera_nest.x == NONE), f32(params.camera_nest.w == NONE), params.fog_shape.z);
+        }
         medium_event = false;
     }
     if CONTACT {

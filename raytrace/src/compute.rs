@@ -74,7 +74,17 @@ const PHOTON_ENTRIES: [&str; 4] = [
     "sort_photons",
 ];
 /// The constants of the tracer for scenes with participating media.
+#[allow(dead_code)]
 const MEDIA_CONSTANTS: [(&str, f64); 1] = [("MEDIA", 1.0)];
+
+/// TEMPORARY probe for DirectX 12 (env RAYTRACE_PROBE).
+fn probe_constants() -> Vec<(&'static str, f64)> {
+    let probe: u32 = std::env::var("RAYTRACE_PROBE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    vec![("MEDIA", 1.0), ("PROBE", f64::from(probe))]
+}
 
 /// The constants of all pipelines on the adapter: without CONTACT where the tracer would get too large (Intel graphics
 /// of the 7th generation, see [crate::media_problem]).
@@ -377,7 +387,7 @@ impl ComputeTracer {
                     module: &self.module,
                     entry_point: Some("trace"),
                     compilation_options: w::PipelineCompilationOptions {
-                        constants: &MEDIA_CONSTANTS,
+                        constants: &probe_constants(),
                         ..Default::default()
                     },
                     cache: None,
