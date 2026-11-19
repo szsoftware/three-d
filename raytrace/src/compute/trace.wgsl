@@ -152,29 +152,11 @@ var<private> skip_until: f32;
 // refraction (that of the solid around for media without refraction)
 const MAX_NESTED: u32 = 4u;
 struct Nest {
-    solids: vec4<u32>,
-    iors: vec4<f32>,
+    solids: array<u32, 4>,
+    iors: array<f32, 4>,
     count: u32,
 }
 var<private> path_nest: Nest;
-
-// Entries of the nest by selects, not by indexing: arrays (and vectors indexed by a variable) in local structs that are
-// copied around made DirectX 12 (WARP with DXC) compute zeros in the whole media tracer
-fn lane(i: u32) -> vec4<bool> {
-    return vec4<bool>(i == 0u, i == 1u, i == 2u, i == 3u);
-}
-
-fn solid_at(n: Nest, i: u32) -> u32 {
-    return select(select(select(n.solids.x, n.solids.y, i == 1u), n.solids.z, i == 2u), n.solids.w, i == 3u);
-}
-
-fn ior_at(n: Nest, i: u32) -> f32 {
-    return select(select(select(n.iors.x, n.iors.y, i == 1u), n.iors.z, i == 2u), n.iors.w, i == 3u);
-}
-
-fn empty_nest() -> Nest {
-    return Nest(vec4<u32>(NONE), vec4<f32>(1.0), 0u);
-}
 
 fn nest_priority(instance: u32) -> f32 {
     return materials[instances[instance].info.z].flags.w;
@@ -185,7 +167,7 @@ fn nest_top(n: Nest) -> u32 {
     var top = NONE;
     var best = -1.0;
     for (var i = 0u; i < n.count; i++) {
-        let p = nest_priority(solid_at(n, i));
+        let p = nest_priority(n.solids[i]);
         if p >= best {
             best = p;
             top = i;
@@ -199,7 +181,7 @@ fn nest_ior(n: Nest) -> f32 {
     if top == NONE {
         return 1.0;
     }
-    return ior_at(n, top);
+    return n.iors[top];
 }
 
 // The material of the solid whose medium the path is in, NONE in the air
@@ -208,12 +190,12 @@ fn nest_material(n: Nest) -> u32 {
     if top == NONE {
         return NONE;
     }
-    return instances[solid_at(n, top)].info.z;
+    return instances[n.solids[top]].info.z;
 }
 
 fn nest_contains(n: Nest, instance: u32) -> bool {
     for (var i = 0u; i < n.count; i++) {
-        if solid_at(n, i) == instance {
+        if n.solids[i] == instance {
             return true;
         }
     }
@@ -230,18 +212,18 @@ fn nest_with(n_in: Nest, instance: u32) -> Nest {
         // The oldest of the lowest priority goes
         var lowest = 0u;
         for (var i = 1u; i < n.count; i++) {
-            if nest_priority(solid_at(n, i)) < nest_priority(solid_at(n, lowest)) {
+            if nest_priority(n.solids[i]) < nest_priority(n.solids[lowest]) {
                 lowest = i;
             }
         }
         for (var i = lowest; i + 1u < n.count; i++) {
-            n.solids = select(n.solids, vec4<u32>(solid_at(n, i + 1u)), lane(i));
-            n.iors = select(n.iors, vec4<f32>(ior_at(n, i + 1u)), lane(i));
+            n.solids[i] = n.solids[i + 1u];
+            n.iors[i] = n.iors[i + 1u];
         }
         n.count -= 1u;
     }
-    n.solids = select(n.solids, vec4<u32>(instance), lane(n.count));
-    n.iors = select(n.iors, vec4<f32>(ior), lane(n.count));
+    n.solids[n.count] = instance;
+    n.iors[n.count] = ior;
     n.count += 1u;
     return n;
 }
@@ -250,9 +232,9 @@ fn nest_without(n_in: Nest, instance: u32) -> Nest {
     var n = n_in;
     var j = 0u;
     for (var i = 0u; i < n_in.count; i++) {
-        if solid_at(n_in, i) != instance {
-            n.solids = select(n.solids, vec4<u32>(solid_at(n_in, i)), lane(j));
-            n.iors = select(n.iors, vec4<f32>(ior_at(n_in, i)), lane(j));
+        if n_in.solids[i] != instance {
+            n.solids[j] = n_in.solids[i];
+            n.iors[j] = n_in.iors[i];
             j += 1u;
         }
     }
@@ -277,9 +259,9 @@ fn nest_cross(n: Nest, instance: u32, front_face: bool) -> Crossing {
     if front_face {
         after = nest_with(n, instance);
         let top = nest_top(after);
-        seen = solid_at(after, top) == instance;
+        seen = after.solids[top] == instance;
     } else {
-        seen = solid_at(n, nest_top(n)) == instance;
+        seen = n.solids[nest_top(n)] == instance;
     }
     var eta = 1.0;
     if seen {
@@ -289,7 +271,7 @@ fn nest_cross(n: Nest, instance: u32, front_face: bool) -> Crossing {
 }
 
 fn camera_nest() -> Nest {
-    var n = empty_nest();
+    var n = Nest(array<u32, 4>(NONE, NONE, NONE, NONE), array<f32, 4>(1.0, 1.0, 1.0, 1.0), 0u);
     for (var i = 0u; i < 4u; i++) {
         if params.camera_nest[i] != NONE {
             n = nest_with(n, params.camera_nest[i]);
@@ -471,7 +453,7 @@ fn crossed_transmittance(o: vec3<f32>, d: vec3<f32>, distance: f32) -> vec3<f32>
     }
     var n = path_nest;
     if (PROBE & 512u) != 0u {
-        n = empty_nest();
+        n = Nest(array<u32, 4>(NONE, NONE, NONE, NONE), array<f32, 4>(1.0, 1.0, 1.0, 1.0), 0u);
     }
     var start = 0.0;
     var depth = vec3<f32>(0.0);
@@ -1693,7 +1675,7 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
     var passes = 0u;
     if MEDIA {
         if (PROBE & 1u) != 0u {
-            path_nest = empty_nest();
+            path_nest = Nest(array<u32, 4>(NONE, NONE, NONE, NONE), array<f32, 4>(1.0, 1.0, 1.0, 1.0), 0u);
         } else {
             path_nest = camera_nest();
         }
@@ -1766,20 +1748,8 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
             var through = transmittance;
             if MEDIA {
                 let crossed = crossed_transmittance(origin, shadow_ray.direction, shadow_ray.distance);
-                if (PROBE & 16384u) != 0u {
-                    // The bits, which no compiler can assume away: 1 for NaN, 2 for infinite, else the value
-                    let bits = bitcast<u32>(crossed.x) & 0x7fffffffu;
-                    var code = 0.0;
-                    if bits > 0x7f800000u {
-                        code = 1.0;
-                    } else if bits == 0x7f800000u {
-                        code = 2.0;
-                    }
-                    var value = crossed.x;
-                    if code > 0.0 {
-                        value = -1.0;
-                    }
-                    return vec3<f32>(code + 10.0, value, min(shadow_ray.distance, 1e6));
+                if (PROBE & 16384u) != 0u && (any(crossed != crossed) || any(abs(crossed) > vec3<f32>(1e30))) {
+                    return vec3<f32>(77.0, crossed.x, shadow_ray.distance);
                 }
                 through *= crossed;
             }
