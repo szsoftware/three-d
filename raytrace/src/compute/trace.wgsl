@@ -451,39 +451,40 @@ fn crossed_transmittance(o: vec3<f32>, d: vec3<f32>, distance: f32) -> vec3<f32>
     if crossing_count > MAX_CROSSINGS || (PROBE & 2u) != 0u {
         return summed_transmittance(o, d, distance);
     }
-    // Sorted by distance
-    for (var i = 1u; i < crossing_count; i++) {
-        var j = i;
-        while j > 0u && crossing_t[j - 1u] > crossing_t[j] {
-            let t = crossing_t[j];
-            crossing_t[j] = crossing_t[j - 1u];
-            crossing_t[j - 1u] = t;
-            let info = crossing_info[j];
-            crossing_info[j] = crossing_info[j - 1u];
-            crossing_info[j - 1u] = info;
-            let color = crossing_color[j];
-            crossing_color[j] = crossing_color[j - 1u];
-            crossing_color[j - 1u] = color;
-            j -= 1u;
-        }
-    }
     var n = path_nest;
     var start = 0.0;
     var depth = vec3<f32>(0.0);
     var through = vec3<f32>(1.0);
-    for (var i = 0u; i < crossing_count; i++) {
-        depth += segment_depth(n, o, d, start, crossing_t[i]);
-        let c = nest_cross(n, crossing_info[i] & 0x7fffffffu, (crossing_info[i] & 0x80000000u) != 0u);
+    // In the order of their distance, the nearest not taken yet each time: the arrays are only read, which the
+    // compilers of DirectX 12 get right (sorting them in place left the whole tracer black on WARP)
+    var taken = 0u;
+    for (var k = 0u; k < crossing_count; k++) {
+        var i = 0u;
+        var nearest = BIG * 4.0;
+        for (var j = 0u; j < crossing_count; j++) {
+            if (taken & (1u << j)) == 0u && crossing_t[j] < nearest {
+                nearest = crossing_t[j];
+                i = j;
+            }
+        }
+        taken |= 1u << i;
+        let info = crossing_info[i];
+        let color = crossing_color[i];
+        depth += segment_depth(n, o, d, start, nearest);
+        var c = Crossing(n, true, 1.0);
+        if (PROBE & 4u) == 0u {
+            c = nest_cross(n, info & 0x7fffffffu, (info & 0x80000000u) != 0u);
+        }
         if c.seen {
             // Straight through, so the reflection is the same both ways
             var eta = c.eta;
             if eta < 1.0 {
                 eta = 1.0 / eta;
             }
-            through *= crossing_color[i].rgb * (1.0 - fresnel_dielectric(crossing_color[i].w, eta));
+            through *= color.rgb * (1.0 - fresnel_dielectric(color.w, eta));
         }
         n = c.after;
-        start = crossing_t[i];
+        start = nearest;
     }
     if distance >= 0.5 * BIG {
         // Open meshes and fog that does not thin out: the medium does not end
