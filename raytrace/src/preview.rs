@@ -254,6 +254,7 @@ impl RaytracePreview {
                 {
                     let (send, receive) = std::sync::mpsc::channel();
                     std::thread::spawn(move || {
+                        lower_priority();
                         let _ = send.send(Box::new(crate::ComputeTracer::new(&gpu)));
                     });
                     compiling = Some(receive);
@@ -803,5 +804,15 @@ impl Effect for DisplayEffect<'_> {
             depth_test: DepthTest::Always,
             ..Default::default()
         }
+    }
+}
+
+/// Lets the CPU tracer and the application go first on machines with few cores, while the shaders compile.
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+fn lower_priority() {
+    // The nice value belongs to the thread on Linux
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, 19);
     }
 }

@@ -22,6 +22,10 @@ image = { version = "0.25", default-features = false, features = ["png", "exr"],
 # Only to let wgpu read the WGSL of the compute tracer, the same wgpu as three-d's
 wgpu = { version = "29", default-features = false, features = ["wgsl"], optional = true }
 
+# To compile the shaders of the preview at a low priority beside the CPU tracer
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
 naga = { version = "29", features = ["wgsl-in"] }
