@@ -27,6 +27,31 @@ pub enum PreviewAvailability {
     CpuOnly(String),
 }
 
+///
+/// Why the preview started its image again, see [RaytracePreview::last_restart]. Every restart forgets the samples, so
+/// an application that shows the preview should only cause one when the image really changes.
+///
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreviewRestart {
+    /// The first image of the preview.
+    First,
+    /// The camera moved or turned, or its field of view or planes changed.
+    Camera,
+    /// The camera's viewport has another size; a window that was resized, but also one whose size the application
+    /// passes on while it is minimized or before its layout settled.
+    Viewport,
+    /// Another scene, or the scene changed: another [RtScene] for the same content counts, as does every change that
+    /// raises [RtScene::revision].
+    Scene,
+    /// [RaytracePreview::resize] with another size.
+    Resize,
+    /// [RaytracePreview::set_settings] with settings that change the image, or [RaytracePreview::restart].
+    Settings,
+    /// The preview went on with another engine: on the GPU once its shaders compiled, at a lower GPU resolution, or
+    /// on the CPU.
+    Engine,
+}
+
 impl PreviewAvailability {
     /// What a context can run.
     pub fn of(#[allow(unused_variables)] context: &Context) -> Self {
@@ -214,6 +239,11 @@ pub struct RaytracePreview {
     height: u32,
     /// What the samples were traced for: camera matrices and viewport, scene and revision
     traced_for: Option<TracedFor>,
+    /// Why the next image starts again, when it is not a change of camera or scene
+    restart_cause: Option<PreviewRestart>,
+    /// Why the image started again the last time, and how many times it did
+    last_restart: Option<PreviewRestart>,
+    restarts: u64,
     settings: PreviewSettings,
     /// What the GPU's resolution is divided by now
     gpu_scale: u32,
@@ -409,6 +439,9 @@ impl RaytracePreview {
             width,
             height,
             traced_for: None,
+            restart_cause: None,
+            last_restart: None,
+            restarts: 0,
             settings,
             gpu_scale,
             pace: Pace::default(),
@@ -507,6 +540,9 @@ impl RaytracePreview {
             || settings.gpu_caustic_photons != self.settings.gpu_caustic_photons
             || settings.depth_of_field != self.settings.depth_of_field;
         self.settings = settings;
+        if rebuild || restart {
+            self.restart_cause = Some(PreviewRestart::Settings);
+        }
         if rebuild {
             self.rebuild();
         } else if restart {
@@ -516,13 +552,14 @@ impl RaytracePreview {
 
     ///
     /// Changes the size of the preview, the size of the viewport it is traced for, and starts again; nothing happens
-    /// for the same size. Call it when the viewport changes, not when the size of [RaytracePreview::texture] differs:
-    /// the texture is smaller on the CPU and on slow GPUs.
+    /// for the same size, or for a width or height of 0 (a minimized window). Call it when the viewport changes, not
+    /// when the size of [RaytracePreview::texture] differs: the texture is smaller on the CPU and on slow GPUs.
     ///
     pub fn resize(&mut self, width: u32, height: u32) {
-        if (width, height) != (self.width, self.height) {
+        if (width, height) != (self.width, self.height) && width > 0 && height > 0 {
             self.width = width;
             self.height = height;
+            self.restart_cause = Some(PreviewRestart::Resize);
             #[cfg(feature = "wgpu")]
             {
                 self.parked = None;
@@ -598,6 +635,7 @@ impl RaytracePreview {
         let old_engine = std::mem::replace(&mut self.engine, engine);
         let old_texture = std::mem::replace(&mut self.texture, texture);
         let old_traced_for = self.traced_for.take();
+        self.restart_cause.get_or_insert(PreviewRestart::Engine);
         // From the CPU to the GPU: the CPU's samples wait, the worker stops after the sample it traces
         #[cfg(feature = "wgpu")]
         if park && !self.on_cpu() && !matches!(old_engine, Engine::Gpu { .. }) {
@@ -663,8 +701,43 @@ impl RaytracePreview {
         }
     }
 
+    /// Why the image starts again for the key, see [PreviewRestart].
+    fn restart_reason(&self, key: &TracedFor) -> PreviewRestart {
+        match (&self.traced_for, self.restart_cause) {
+            (_, Some(cause)) => cause,
+            (None, None) if self.restarts == 0 => PreviewRestart::First,
+            (None, None) => PreviewRestart::Settings,
+            (Some((camera, id, revision)), None) => {
+                // The last two numbers of the camera's key are the viewport's size
+                let n = camera.len();
+                if n != key.0.len() || camera[n - 2..] != key.0[n - 2..] {
+                    PreviewRestart::Viewport
+                } else if *id != key.1 || *revision != key.2 {
+                    PreviewRestart::Scene
+                } else {
+                    PreviewRestart::Camera
+                }
+            }
+        }
+    }
+
+    ///
+    /// Why the image started again the last time, `None` before the first [RaytracePreview::update]. For finding out
+    /// what in an application starts the preview again, for example a camera or scene made anew in every frame, or a
+    /// size passed on while the window is minimized; see [RaytracePreview::restarts].
+    ///
+    pub fn last_restart(&self) -> Option<PreviewRestart> {
+        self.last_restart
+    }
+
+    /// How many times the image started, the first one included.
+    pub fn restarts(&self) -> u64 {
+        self.restarts
+    }
+
     /// Forgets all samples.
     pub fn restart(&mut self) {
+        self.restart_cause.get_or_insert(PreviewRestart::Settings);
         self.traced_for = None;
         #[cfg(feature = "wgpu")]
         {
@@ -695,10 +768,15 @@ impl RaytracePreview {
     /// whenever it changed.
     ///
     pub fn update(&mut self, scene: &RtScene, camera: &Camera) -> Result<bool, crate::RtError> {
+        // Nothing to see, for example in a minimized window: the image waits
+        if camera.viewport().width == 0 || camera.viewport().height == 0 {
+            return Ok(false);
+        }
         #[cfg(feature = "wgpu")]
         self.poll_compiling();
         let key = (camera_key(camera), scene.id(), scene.revision());
         let changed = self.traced_for.as_ref() != Some(&key);
+        let reason = changed.then(|| self.restart_reason(&key));
         #[cfg(not(target_arch = "wasm32"))]
         if let Engine::CpuWorker {
             worker,
@@ -728,6 +806,9 @@ impl RaytracePreview {
                     threads: self.settings.cpu_threads,
                 });
                 *shown = 0;
+                self.restart_cause = None;
+                self.last_restart = reason;
+                self.restarts += 1;
                 self.traced_for = Some(key);
             } else {
                 worker.adjust(
@@ -787,6 +868,9 @@ impl RaytracePreview {
                 #[cfg(not(target_arch = "wasm32"))]
                 Engine::CpuWorker { .. } => unreachable!("handled above"),
             }
+            self.restart_cause = None;
+            self.last_restart = reason;
+            self.restarts += 1;
             self.traced_for = Some(key);
         } else if self.sample_count() >= self.settings.max_samples {
             return Ok(false);

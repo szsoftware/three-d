@@ -271,6 +271,49 @@ fn the_cpu_traces_in_the_background() {
 }
 
 #[test]
+fn the_preview_tells_why_it_started_again() {
+    let Some(context) = context() else { return };
+    let mut preview = RaytracePreview::new_on_cpu(&context, 16, 8);
+    let scene = sky_only(1000.0);
+    let at = vec3(0.0, 0.0, 0.0);
+    assert_eq!(preview.last_restart(), None);
+    preview.update(&scene, &camera(16, 8, at)).unwrap();
+    assert_eq!(preview.last_restart(), Some(PreviewRestart::First));
+    // The same camera and scene, also made anew: no restart
+    preview.update(&scene, &camera(16, 8, at)).unwrap();
+    assert_eq!(preview.restarts(), 1);
+    preview
+        .update(&scene, &camera(16, 8, vec3(1.0, 0.0, 0.0)))
+        .unwrap();
+    assert_eq!(preview.last_restart(), Some(PreviewRestart::Camera));
+    preview.update(&scene, &camera(16, 9, at)).unwrap();
+    assert_eq!(preview.last_restart(), Some(PreviewRestart::Viewport));
+    // Another scene with the same content
+    preview
+        .update(&sky_only(1000.0), &camera(16, 9, at))
+        .unwrap();
+    assert_eq!(preview.last_restart(), Some(PreviewRestart::Scene));
+    let scene = sky_only(1000.0);
+    preview.update(&scene, &camera(16, 9, at)).unwrap();
+    preview.resize(32, 18);
+    preview.update(&scene, &camera(16, 9, at)).unwrap();
+    assert_eq!(preview.last_restart(), Some(PreviewRestart::Resize));
+    preview.set_settings(PreviewSettings {
+        max_bounces: preview.settings().max_bounces + 1,
+        ..*preview.settings()
+    });
+    preview.update(&scene, &camera(16, 9, at)).unwrap();
+    assert_eq!(preview.last_restart(), Some(PreviewRestart::Settings));
+    let restarts = preview.restarts();
+    assert_eq!(restarts, 7);
+    // A minimized window: nothing changes, the image waits
+    preview.resize(0, 0);
+    assert!(!preview.update(&scene, &camera(0, 0, at)).unwrap());
+    preview.update(&scene, &camera(16, 9, at)).unwrap();
+    assert_eq!(preview.restarts(), restarts);
+}
+
+#[test]
 fn a_slow_gpu_gets_a_lighter_preview() {
     let Some(context) = context() else { return };
     let mut preview = RaytracePreview::new(&context, 64, 32);
