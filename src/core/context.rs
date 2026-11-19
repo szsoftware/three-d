@@ -295,6 +295,43 @@ impl Context {
         }
     }
 
+    ///
+    /// What the wgpu adapter of this context is, `None` with another backend. In the browser wgpu only passes on the
+    /// description as name; the browser's vendor and architecture of the adapter are added as `driver` and
+    /// `driver_info` (for example "intel" and "gen-7"), when the context created the device itself.
+    ///
+    #[cfg(feature = "wgpu")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "wgpu")))]
+    pub fn wgpu_adapter_info(&self) -> Option<wgpu::AdapterInfo> {
+        let backend::Backend::Wgpu(wgpu) = &*self.backend else {
+            return None;
+        };
+        #[allow(unused_mut)]
+        let mut info = wgpu.device.adapter_info();
+        #[cfg(target_arch = "wasm32")]
+        if let Some(browser) = &wgpu.browser {
+            info.driver = browser.info("vendor");
+            info.driver_info = browser.info("architecture");
+            if info.name.is_empty() {
+                info.name = browser.info("description");
+            }
+        }
+        Some(info)
+    }
+
+    ///
+    /// The browser's `GPUDevice` behind the wgpu device of this context, for WebGPU calls wgpu does not have, such as
+    /// `createComputePipelineAsync`. `None` with another backend or when the context did not create the device itself.
+    ///
+    #[cfg(all(feature = "wgpu", target_arch = "wasm32"))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "wgpu", target_arch = "wasm32"))))]
+    pub fn webgpu_device(&self) -> Option<wasm_bindgen::JsValue> {
+        match &*self.backend {
+            backend::Backend::Wgpu(wgpu) => wgpu.browser.as_ref().map(|b| b.device.clone()),
+            _ => None,
+        }
+    }
+
     /// The backend which executes all graphics calls of the [core](crate::core) module.
     pub(crate) fn backend(&self) -> &dyn backend::BackendApi {
         self.backend.api()
