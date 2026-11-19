@@ -93,6 +93,9 @@ impl WgpuBackend {
                 "there is no hardware accelerated wgpu adapter".to_string(),
             ));
         }
+        // The browser's device itself, for what wgpu does not pass on
+        #[cfg(target_arch = "wasm32")]
+        let capture = super::browser::DeviceCapture::install();
         let (device, queue) = adapter
             .request_device(&w::DeviceDescriptor {
                 label: Some("three-d"),
@@ -125,6 +128,10 @@ impl WgpuBackend {
         let mut backend = Self::new(device, queue);
         backend.errors = Some(errors);
         backend.lost = lost;
+        #[cfg(target_arch = "wasm32")]
+        {
+            backend.browser = capture.and_then(|c| c.finish());
+        }
         backend.float32_renderable = adapter
             .get_texture_format_features(w::TextureFormat::Rgba32Float)
             .allowed_usages

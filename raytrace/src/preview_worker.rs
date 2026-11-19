@@ -23,6 +23,8 @@ pub(crate) struct Job {
     pub depth_of_field: Option<crate::DepthOfField>,
     pub max_samples: u32,
     pub denoiser: Option<AtrousDenoiser>,
+    /// Threads to trace with.
+    pub threads: usize,
 }
 
 /// A finished image of the worker.
@@ -79,13 +81,20 @@ impl CpuWorker {
     }
 
     /// Changes the settings of the running job that do not need a new start.
-    pub(crate) fn adjust(&self, max_samples: u32, denoiser: Option<AtrousDenoiser>) {
+    pub(crate) fn adjust(
+        &self,
+        max_samples: u32,
+        denoiser: Option<AtrousDenoiser>,
+        threads: usize,
+    ) {
         let (lock, wake) = &*self.shared;
         let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(job) = &mut state.job {
-            if job.max_samples != max_samples || job.denoiser != denoiser {
+            if job.max_samples != max_samples || job.denoiser != denoiser || job.threads != threads
+            {
                 job.max_samples = max_samples;
                 job.denoiser = denoiser;
+                job.threads = threads;
                 wake.notify_all();
             }
         }
@@ -120,7 +129,9 @@ impl Drop for CpuWorker {
 
 fn run(shared: Arc<(Mutex<State>, Condvar)>, width: u32, height: u32) {
     let (lock, wake) = &*shared;
-    let mut tracer = CpuReferenceTracer::new();
+    // Behind the application; the threads of the tracer and the denoiser inherit it on Linux
+    crate::priority::lower_this_thread(crate::priority::TRACING);
+    let mut tracer = CpuReferenceTracer::new().with_low_priority();
     let mut image = RenderImage::with_features(width, height);
     let mut traced = 0;
     let mut hand_over = HAND_OVER;
@@ -145,6 +156,7 @@ fn run(shared: Arc<(Mutex<State>, Condvar)>, width: u32, height: u32) {
             image.reset();
             traced = generation;
         }
+        tracer.set_threads(Some(job.threads));
         let settings = TraceSettings {
             max_bounces: job.max_bounces,
             caustic_photons: job.caustic_photons,

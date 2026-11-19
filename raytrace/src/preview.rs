@@ -95,6 +95,12 @@ pub struct PreviewSettings {
     /// Browsers have no threads, there the update always traces.
     ///
     pub cpu_in_background: bool,
+    ///
+    /// Threads the CPU traces with: by default one less than the machine has, at least one, so the application keeps
+    /// a core for its frames. The threads that trace in the background run at a low priority on Linux and Android
+    /// (nice 10). Browsers trace in one thread.
+    ///
+    pub cpu_threads: usize,
     /// No more samples are added after this many, the image stays as it is.
     pub max_samples: u32,
     /// Most bounces of a path.
@@ -114,6 +120,18 @@ pub struct PreviewSettings {
     pub denoiser: Option<crate::AtrousDenoiser>,
 }
 
+/// One thread less than the machine has, at least one.
+fn default_cpu_threads() -> usize {
+    if cfg!(target_arch = "wasm32") {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .saturating_sub(1)
+        .max(1)
+}
+
 impl Default for PreviewSettings {
     fn default() -> Self {
         Self {
@@ -127,6 +145,7 @@ impl Default for PreviewSettings {
                 None
             },
             cpu_in_background: true,
+            cpu_threads: default_cpu_threads(),
             max_samples: 1024,
             max_bounces: 6,
             gpu_caustic_photons: 200_000,
@@ -186,14 +205,84 @@ pub struct RaytracePreview {
     width: u32,
     height: u32,
     /// What the samples were traced for: camera matrices and viewport, scene and revision
-    traced_for: Option<(Vec<f32>, u64, u64)>,
+    traced_for: Option<TracedFor>,
     settings: PreviewSettings,
     /// What the GPU's resolution is divided by now
     gpu_scale: u32,
     pace: Pace,
-    /// The compute tracer while its shaders compile on another thread
-    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
-    compiling: Option<std::sync::mpsc::Receiver<Box<crate::ComputeTracer>>>,
+    /// The compute tracer while its shaders compile on another thread, or in the background of the browser
+    #[cfg(feature = "wgpu")]
+    compiling: Option<Compiling>,
+    /// The CPU engine with its texture and what it traced for, while the GPU traces: back when the preview goes to
+    /// the CPU again, so its samples are not lost
+    #[cfg(feature = "wgpu")]
+    parked: Option<(Engine, Texture2D, Option<TracedFor>)>,
+}
+
+/// Camera matrices and viewport, scene and revision.
+type TracedFor = (Vec<f32>, u64, u64);
+
+/// The compute tracer of the preview, while it is made.
+#[cfg(feature = "wgpu")]
+struct Compiling {
+    #[cfg(not(target_arch = "wasm32"))]
+    receiver: std::sync::mpsc::Receiver<Box<crate::ComputeTracer>>,
+    #[cfg(target_arch = "wasm32")]
+    slot: std::rc::Rc<std::cell::RefCell<Option<GpuTracer>>>,
+}
+
+#[cfg(feature = "wgpu")]
+impl Compiling {
+    /// Makes the tracer for the context: natively on a thread, in a browser with the browser's background compiling.
+    fn start(context: &Context) -> Option<Self> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let gpu = crate::GpuDevice::from_context(context)?;
+            let info = context.wgpu_adapter_info();
+            let (send, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                crate::priority::lower_this_thread(crate::priority::COMPILING);
+                let _ = send.send(Box::new(
+                    crate::ComputeTracer::new(&gpu).with_adapter_info(info),
+                ));
+            });
+            Some(Self { receiver })
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let sink = slot.clone();
+            let context = context.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let tracer = crate::ComputeTracer::from_context_async(&context).await;
+                *sink.borrow_mut() = Some(tracer.map(Box::new));
+            });
+            Some(Self { slot })
+        }
+    }
+
+    /// The tracer once it is made, `Some(None)` if that failed, `None` while it is not done.
+    fn poll(&self) -> Option<GpuTracer> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use std::sync::mpsc::TryRecvError;
+            match self.receiver.try_recv() {
+                Ok(tracer) => Some(Some(tracer)),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(None),
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        self.slot.borrow_mut().take()
+    }
+
+    /// Waits for the tracer; a browser can not wait, there it is the tracer if it is already made.
+    fn wait(self) -> GpuTracer {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.receiver.recv().ok();
+        #[cfg(target_arch = "wasm32")]
+        self.poll().flatten()
+    }
 }
 
 /// The compute tracer, if the preview makes one.
@@ -269,30 +358,14 @@ impl RaytracePreview {
     ) -> Self {
         let settings = PreviewSettings::default();
         let gpu_scale = settings.gpu_downscale.max(1);
-        #[allow(unused_mut)]
-        let mut tracer: GpuTracer = None;
-        #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
-        let mut compiling = None;
         #[cfg(feature = "wgpu")]
-        if availability == PreviewAvailability::Gpu {
-            if let Some(gpu) = crate::GpuDevice::from_context(context) {
-                // The shaders take seconds to compile on some drivers; the CPU traces meanwhile
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    let (send, receive) = std::sync::mpsc::channel();
-                    std::thread::spawn(move || {
-                        lower_priority();
-                        let _ = send.send(Box::new(crate::ComputeTracer::new(&gpu)));
-                    });
-                    compiling = Some(receive);
-                }
-                #[cfg(target_arch = "wasm32")]
-                {
-                    tracer = Some(Box::new(crate::ComputeTracer::new(&gpu)));
-                }
-            }
-        }
-        let (engine, texture) = Self::engine(context, tracer, width, height, &settings, gpu_scale);
+        let compiling = if availability == PreviewAvailability::Gpu {
+            // The shaders take seconds to compile on some drivers; the CPU traces meanwhile
+            Compiling::start(context)
+        } else {
+            None
+        };
+        let (engine, texture) = Self::engine(context, None, width, height, &settings, gpu_scale);
         Self {
             context: context.clone(),
             availability,
@@ -304,8 +377,10 @@ impl RaytracePreview {
             settings,
             gpu_scale,
             pace: Pace::default(),
-            #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+            #[cfg(feature = "wgpu")]
             compiling,
+            #[cfg(feature = "wgpu")]
+            parked: None,
         }
     }
 
@@ -343,7 +418,7 @@ impl RaytracePreview {
         }
         (
             Engine::Cpu {
-                tracer: CpuReferenceTracer::new(),
+                tracer: CpuReferenceTracer::with_threads(settings.cpu_threads),
                 image: RenderImage::with_features(w, h),
                 pending: RenderImage::with_features(w, h),
                 next_row: 0,
@@ -386,6 +461,12 @@ impl RaytracePreview {
         if settings.gpu_downscale != self.settings.gpu_downscale {
             self.gpu_scale = settings.gpu_downscale.max(1);
         }
+        #[cfg(feature = "wgpu")]
+        if settings.cpu_downscale != self.settings.cpu_downscale
+            || settings.cpu_in_background != self.settings.cpu_in_background
+        {
+            self.parked = None;
+        }
         let restart = settings.max_bounces != self.settings.max_bounces
             || settings.cpu_caustic_photons != self.settings.cpu_caustic_photons
             || settings.gpu_caustic_photons != self.settings.gpu_caustic_photons
@@ -407,20 +488,18 @@ impl RaytracePreview {
         if (width, height) != (self.width, self.height) {
             self.width = width;
             self.height = height;
+            #[cfg(feature = "wgpu")]
+            {
+                self.parked = None;
+            }
             self.rebuild();
         }
     }
 
     /// Makes the engine again for the size, settings and availability, with the compute tracer kept, and starts again.
     fn rebuild(&mut self) {
-        let placeholder = Engine::Cpu {
-            tracer: CpuReferenceTracer::new(),
-            image: RenderImage::new(1, 1),
-            pending: RenderImage::new(1, 1),
-            next_row: 0,
-        };
         #[allow(unused_variables)]
-        let tracer: GpuTracer = match std::mem::replace(&mut self.engine, placeholder) {
+        let tracer: GpuTracer = match std::mem::replace(&mut self.engine, placeholder_engine()) {
             #[cfg(feature = "wgpu")]
             Engine::Gpu { tracer, .. } if self.availability == PreviewAvailability::Gpu => {
                 Some(tracer)
@@ -432,6 +511,25 @@ impl RaytracePreview {
 
     /// Makes the engine with the tracer, on the CPU without one, and starts again.
     fn rebuild_with(&mut self, tracer: GpuTracer) {
+        // Back to the CPU: with the samples it had
+        #[cfg(feature = "wgpu")]
+        if tracer.is_none() {
+            if let Some((engine, texture, traced_for)) = self.parked.take() {
+                self.pace = Pace::default();
+                self.engine = engine;
+                self.texture = texture;
+                self.traced_for = traced_for;
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Engine::CpuWorker { worker, .. } = &self.engine {
+                    worker.adjust(
+                        self.settings.max_samples,
+                        self.settings.denoiser,
+                        self.settings.cpu_threads,
+                    );
+                }
+                return;
+            }
+        }
         let (engine, texture) = Self::engine(
             &self.context,
             tracer,
@@ -441,9 +539,20 @@ impl RaytracePreview {
             self.gpu_scale,
         );
         self.pace = Pace::default();
-        self.engine = engine;
-        self.texture = texture;
-        self.traced_for = None;
+        let old_engine = std::mem::replace(&mut self.engine, engine);
+        let old_texture = std::mem::replace(&mut self.texture, texture);
+        let old_traced_for = self.traced_for.take();
+        // From the CPU to the GPU: the CPU's samples wait, the worker stops after the sample it traces
+        #[cfg(feature = "wgpu")]
+        if !self.on_cpu() && !matches!(old_engine, Engine::Gpu { .. }) {
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Engine::CpuWorker { worker, shown, .. } = &old_engine {
+                worker.adjust(*shown, self.settings.denoiser, self.settings.cpu_threads);
+            }
+            self.parked = Some((old_engine, old_texture, old_traced_for));
+        }
+        #[cfg(not(feature = "wgpu"))]
+        let _ = (old_engine, old_texture, old_traced_for);
     }
 
     ///
@@ -451,41 +560,38 @@ impl RaytracePreview {
     /// traces meanwhile, and the preview goes on with the GPU in the first [RaytracePreview::update] after.
     ///
     pub fn is_compiling(&self) -> bool {
-        #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+        #[cfg(feature = "wgpu")]
         return self.compiling.is_some();
-        #[cfg(not(all(feature = "wgpu", not(target_arch = "wasm32"))))]
+        #[cfg(not(feature = "wgpu"))]
         false
     }
 
+    ///
     /// Waits until the shaders of the GPU are compiled and goes on with the GPU, see [RaytracePreview::is_compiling].
+    /// A browser can not wait: there it goes on with the GPU only if the shaders are already compiled.
+    ///
     pub fn wait_for_gpu(&mut self) {
-        #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+        #[cfg(feature = "wgpu")]
         if let Some(compiling) = self.compiling.take() {
-            self.take_gpu(compiling.recv().ok());
+            #[cfg(target_arch = "wasm32")]
+            if compiling.slot.borrow().is_none() {
+                self.compiling = Some(compiling);
+                return;
+            }
+            self.take_gpu(compiling.wait());
         }
     }
 
     /// Goes on with the GPU once its shaders are compiled.
-    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    #[cfg(feature = "wgpu")]
     fn poll_compiling(&mut self) {
-        use std::sync::mpsc::TryRecvError;
-        let Some(compiling) = &self.compiling else {
-            return;
-        };
-        match compiling.try_recv() {
-            Ok(tracer) => {
-                self.compiling = None;
-                self.take_gpu(Some(tracer));
-            }
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => {
-                self.compiling = None;
-                self.take_gpu(None);
-            }
+        if let Some(tracer) = self.compiling.as_ref().and_then(Compiling::poll) {
+            self.compiling = None;
+            self.take_gpu(tracer);
         }
     }
 
-    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    #[cfg(feature = "wgpu")]
     fn take_gpu(&mut self, tracer: Option<Box<crate::ComputeTracer>>) {
         if tracer.is_none() {
             self.availability = PreviewAvailability::CpuOnly(
@@ -500,6 +606,10 @@ impl RaytracePreview {
     /// Forgets all samples.
     pub fn restart(&mut self) {
         self.traced_for = None;
+        #[cfg(feature = "wgpu")]
+        {
+            self.parked = None;
+        }
     }
 
     /// Samples every pixel has.
@@ -525,7 +635,7 @@ impl RaytracePreview {
     /// whenever it changed.
     ///
     pub fn update(&mut self, scene: &RtScene, camera: &Camera) -> Result<bool, crate::RtError> {
-        #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+        #[cfg(feature = "wgpu")]
         self.poll_compiling();
         let key = (camera_key(camera), scene.id(), scene.revision());
         let changed = self.traced_for.as_ref() != Some(&key);
@@ -555,11 +665,16 @@ impl RaytracePreview {
                     depth_of_field: self.settings.depth_of_field,
                     max_samples: self.settings.max_samples,
                     denoiser: self.settings.denoiser,
+                    threads: self.settings.cpu_threads,
                 });
                 *shown = 0;
                 self.traced_for = Some(key);
             } else {
-                worker.adjust(self.settings.max_samples, self.settings.denoiser);
+                worker.adjust(
+                    self.settings.max_samples,
+                    self.settings.denoiser,
+                    self.settings.cpu_threads,
+                );
             }
             return Ok(match worker.take()? {
                 Some(finished) => {
@@ -626,7 +741,18 @@ impl RaytracePreview {
                     image.width(),
                     image.height(),
                 ));
-                tracer.trace_gpu(scene, &small, image, &settings)?;
+                match tracer.trace_gpu(scene, &small, image, &settings) {
+                    Ok(()) => {}
+                    // On the CPU from now on, with the samples it had
+                    Err(crate::RtError::Gpu(why)) => {
+                        self.availability = PreviewAvailability::CpuOnly(format!(
+                            "The GPU failed to trace ({why}); ray tracing runs on the CPU."
+                        ));
+                        self.rebuild();
+                        return self.update(scene, camera);
+                    }
+                    Err(error) => return Err(error),
+                }
                 match &self.settings.denoiser {
                     Some(denoiser) => {
                         image.write_denoised_to_three_d_texture(&self.texture, denoiser)
@@ -640,6 +766,11 @@ impl RaytracePreview {
                 pending,
                 next_row,
             } => {
+                if tracer.threads() != self.settings.cpu_threads.max(1)
+                    && !cfg!(target_arch = "wasm32")
+                {
+                    tracer.set_threads(Some(self.settings.cpu_threads));
+                }
                 // The camera of the reduced resolution
                 let mut small = camera.clone();
                 small.set_viewport(three_d_asset::Viewport::new_at_origo(
@@ -892,12 +1023,12 @@ impl Effect for DisplayEffect<'_> {
     }
 }
 
-/// Lets the CPU tracer and the application go first on machines with few cores, while the shaders compile.
-#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
-fn lower_priority() {
-    // The nice value belongs to the thread on Linux
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    unsafe {
-        libc::setpriority(libc::PRIO_PROCESS, 0, 19);
+/// An engine that is replaced at once.
+fn placeholder_engine() -> Engine {
+    Engine::Cpu {
+        tracer: CpuReferenceTracer::new(),
+        image: RenderImage::new(1, 1),
+        pending: RenderImage::new(1, 1),
+        next_row: 0,
     }
 }

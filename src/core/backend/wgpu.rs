@@ -25,6 +25,8 @@ use std::sync::{Arc, Mutex};
 mod bits;
 mod builtin;
 // wgpu draws with OpenGL on these systems only
+#[cfg(target_arch = "wasm32")]
+pub(crate) mod browser;
 #[cfg(all(
     feature = "wgpu-gl",
     any(target_os = "linux", target_os = "windows", target_os = "android")
@@ -74,6 +76,9 @@ pub(crate) struct WgpuBackend {
     pub(super) float32_renderable: bool,
     /// Whether the device is lost, see [Context::is_lost]. Only known for a device that the backend created.
     lost: Arc<reset::DeviceLost>,
+    /// The browser's own device and adapter info, if the backend asked the browser for the device.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) browser: Option<browser::BrowserDevice>,
 }
 
 // The backend only holds handles and plain data behind a mutex, a panic cannot leave it in a state that is unsafe to observe.
@@ -447,6 +452,8 @@ impl WgpuBackend {
             device,
             queue,
             lost: Default::default(),
+            #[cfg(target_arch = "wasm32")]
+            browser: None,
         }
     }
 

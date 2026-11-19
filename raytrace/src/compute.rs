@@ -11,8 +11,9 @@ use crate::{
 };
 use three_d::wgpu as w;
 
+#[cfg(target_arch = "wasm32")]
+mod browser;
 mod denoise_gpu;
-use three_d::wgpu::util::DeviceExt;
 use three_d_asset::prelude::*;
 use three_d_asset::ProjectionType;
 
@@ -21,6 +22,59 @@ const WORKGROUP: u32 = 8;
 
 /// Bytes of one tile entry in the uniform buffer, before the alignment of dynamic offsets.
 const TILE_BYTES: u64 = 32;
+
+/// A binding of the tracer's bind groups, all of them buffers seen by compute shaders.
+#[derive(Clone, Copy)]
+enum Slot {
+    Uniform { dynamic: bool, min_size: u64 },
+    Storage { read_only: bool },
+}
+
+const PARAMS: Slot = Slot::Uniform {
+    dynamic: false,
+    min_size: 0,
+};
+const TILE: Slot = Slot::Uniform {
+    dynamic: true,
+    min_size: TILE_BYTES,
+};
+const READ: Slot = Slot::Storage { read_only: true };
+const WRITE: Slot = Slot::Storage { read_only: false };
+
+/// The bindings of the trace kernel.
+const TRACE_SLOTS: [(u32, Slot); 10] = [
+    (0, PARAMS),
+    (1, TILE),
+    (2, READ),
+    (3, READ),
+    (4, READ),
+    (5, READ),
+    (6, READ),
+    (7, READ),
+    (8, WRITE),
+    (9, READ),
+];
+/// The bindings of the photon kernels: without the render image, with the photons written.
+const PHOTON_SLOTS: [(u32, Slot); 9] = [
+    (0, PARAMS),
+    (1, TILE),
+    (2, READ),
+    (3, READ),
+    (4, READ),
+    (5, READ),
+    (6, READ),
+    (7, WRITE),
+    (9, READ),
+];
+/// The photon kernels: shoot, count per cell, find where cells start, sort.
+const PHOTON_ENTRIES: [&str; 4] = [
+    "shoot_photons",
+    "count_photons",
+    "find_cell_starts",
+    "sort_photons",
+];
+/// The constants of the tracer for scenes with participating media.
+const MEDIA_CONSTANTS: [(&str, f64); 1] = [("MEDIA", 1.0)];
 
 ///
 /// A path tracer in compute shaders on the wgpu backend, the same algorithm and material model as the
@@ -59,6 +113,14 @@ pub struct ComputeTracer {
     scratch: Option<GpuRenderImage>,
     /// Submissions that may still run, oldest first, see [MAX_SUBMISSIONS_IN_FLIGHT]
     in_flight: std::collections::VecDeque<w::SubmissionIndex>,
+    /// The adapter as the context tells it, with the browser's vendor and architecture in a browser
+    adapter: w::AdapterInfo,
+    /// Errors of the GPU in the work of the tracer, which the browser reports later
+    errors: ErrorWatch,
+    /// The pipelines the browser compiled with `createComputePipelineAsync`, kept so that the browser finds the same
+    /// pipelines of wgpu in its cache
+    #[cfg(target_arch = "wasm32")]
+    warm: Option<wasm_bindgen::JsValue>,
 }
 
 /// Submissions of the tracer the GPU may have queued at once; the tracer waits for the oldest before it adds another.
@@ -75,41 +137,36 @@ impl ComputeTracer {
     ///
     pub fn new(gpu: &GpuDevice) -> Self {
         let device = &gpu.device;
-        let uniform = |binding, dynamic, size| w::BindGroupLayoutEntry {
-            binding,
-            visibility: w::ShaderStages::COMPUTE,
-            ty: w::BindingType::Buffer {
-                ty: w::BufferBindingType::Uniform,
-                has_dynamic_offset: dynamic,
-                min_binding_size: std::num::NonZeroU64::new(size),
-            },
-            count: None,
+        let errors = ErrorWatch::default();
+        let scopes = ErrorScopes::push(device);
+        let layout_of = |label, slots: &[(u32, Slot)]| {
+            let entries: Vec<_> = slots
+                .iter()
+                .map(|&(binding, slot)| w::BindGroupLayoutEntry {
+                    binding,
+                    visibility: w::ShaderStages::COMPUTE,
+                    ty: w::BindingType::Buffer {
+                        ty: match slot {
+                            Slot::Uniform { .. } => w::BufferBindingType::Uniform,
+                            Slot::Storage { read_only } => {
+                                w::BufferBindingType::Storage { read_only }
+                            }
+                        },
+                        has_dynamic_offset: matches!(slot, Slot::Uniform { dynamic: true, .. }),
+                        min_binding_size: match slot {
+                            Slot::Uniform { min_size, .. } => std::num::NonZeroU64::new(min_size),
+                            Slot::Storage { .. } => None,
+                        },
+                    },
+                    count: None,
+                })
+                .collect();
+            device.create_bind_group_layout(&w::BindGroupLayoutDescriptor {
+                label: Some(label),
+                entries: &entries,
+            })
         };
-        let storage = |binding, read_only| w::BindGroupLayoutEntry {
-            binding,
-            visibility: w::ShaderStages::COMPUTE,
-            ty: w::BindingType::Buffer {
-                ty: w::BufferBindingType::Storage { read_only },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
-        let layout = device.create_bind_group_layout(&w::BindGroupLayoutDescriptor {
-            label: Some("ray tracing"),
-            entries: &[
-                uniform(0, false, 0),
-                uniform(1, true, TILE_BYTES),
-                storage(2, true),
-                storage(3, true),
-                storage(4, true),
-                storage(5, true),
-                storage(6, true),
-                storage(7, true),
-                storage(8, false),
-                storage(9, true),
-            ],
-        });
+        let layout = layout_of("ray tracing", &TRACE_SLOTS);
         let module = device.create_shader_module(w::ShaderModuleDescriptor {
             label: Some("ray tracing"),
             source: w::ShaderSource::Wgsl(include_str!("compute/trace.wgsl").into()),
@@ -127,33 +184,13 @@ impl ComputeTracer {
             compilation_options: Default::default(),
             cache: None,
         });
-        // Without the render image, with the photons written
-        let photon_layout = device.create_bind_group_layout(&w::BindGroupLayoutDescriptor {
-            label: Some("caustic photons"),
-            entries: &[
-                uniform(0, false, 0),
-                uniform(1, true, TILE_BYTES),
-                storage(2, true),
-                storage(3, true),
-                storage(4, true),
-                storage(5, true),
-                storage(6, true),
-                storage(7, false),
-                storage(9, true),
-            ],
-        });
+        let photon_layout = layout_of("caustic photons", &PHOTON_SLOTS);
         let photon_pipeline_layout = device.create_pipeline_layout(&w::PipelineLayoutDescriptor {
             label: Some("caustic photons"),
             bind_group_layouts: &[Some(&photon_layout)],
             immediate_size: 0,
         });
-        let photon_pipelines = [
-            "shoot_photons",
-            "count_photons",
-            "find_cell_starts",
-            "sort_photons",
-        ]
-        .map(|entry| {
+        let photon_pipelines = PHOTON_ENTRIES.map(|entry| {
             device.create_compute_pipeline(&w::ComputePipelineDescriptor {
                 label: Some(entry),
                 layout: Some(&photon_pipeline_layout),
@@ -163,6 +200,7 @@ impl ComputeTracer {
                 cache: None,
             })
         });
+        scopes.pop_into(&errors);
         Self {
             gpu: gpu.clone(),
             builder: CpuBvhBuilder::default(),
@@ -179,15 +217,64 @@ impl ComputeTracer {
             tile_size: 256,
             scratch: None,
             in_flight: std::collections::VecDeque::new(),
+            adapter: device.adapter_info(),
+            errors,
+            #[cfg(target_arch = "wasm32")]
+            warm: None,
         }
     }
 
+    ///
     /// A tracer on the device of a three-d context, `None` if the context can not run compute shaders.
+    ///
+    /// Compiling the shaders takes seconds on some drivers, and in a browser that stops the page meanwhile; there
+    /// [ComputeTracer::from_context_async] lets the browser compile them in the background.
+    ///
     pub fn from_context(context: &three_d::Context) -> Option<Self> {
         if RaytraceSupport::of(context) < RaytraceSupport::Compute {
             return None;
         }
-        GpuDevice::from_context(context).map(|gpu| Self::new(&gpu))
+        Some(
+            Self::new(&GpuDevice::from_context(context)?)
+                .with_adapter_info(context.wgpu_adapter_info()),
+        )
+    }
+
+    /// The adapter as the context tells it, which knows more in a browser than the device, see
+    /// [three_d::Context::wgpu_adapter_info].
+    pub(crate) fn with_adapter_info(mut self, info: Option<w::AdapterInfo>) -> Self {
+        if let Some(info) = info {
+            self.adapter = info;
+        }
+        self
+    }
+
+    ///
+    /// As [ComputeTracer::from_context], but in a browser the shaders are compiled first with WebGPU's
+    /// `createComputePipelineAsync`, which does not stop the page, and the tracer is made from the compiled pipelines.
+    /// `None` also if they fail to compile there. Outside of browsers it is [ComputeTracer::from_context].
+    ///
+    pub async fn from_context_async(context: &three_d::Context) -> Option<Self> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            if RaytraceSupport::of(context) < RaytraceSupport::Compute {
+                return None;
+            }
+            let warm = match context.webgpu_device() {
+                Some(device) => {
+                    let media = context
+                        .wgpu_adapter_info()
+                        .is_none_or(|info| crate::media_problem(&info).is_none());
+                    Some(browser::compile(&device, media).await.ok()?)
+                }
+                None => None,
+            };
+            let mut tracer = Self::from_context(context)?;
+            tracer.warm = warm;
+            Some(tracer)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        Self::from_context(context)
     }
 
     ///
@@ -209,7 +296,16 @@ impl ComputeTracer {
     /// if it can. [ComputeTracer::trace_gpu] returns [RtError::Gpu] for such scenes there; trace them on the CPU.
     ///
     pub fn media_problem(&self) -> Option<String> {
-        crate::media_problem(&self.gpu.device.adapter_info())
+        crate::media_problem(&self.adapter)
+    }
+
+    ///
+    /// The first error the GPU reported in the work of the tracer, for example a shader that failed to compile or too
+    /// little memory, `None` while there is none. Browsers report errors a little later, so this may only show an
+    /// error after a frame or two. [ComputeTracer::trace_gpu] returns it as [RtError::Gpu] from then on.
+    ///
+    pub fn gpu_error(&mut self) -> Option<String> {
+        self.errors.check()
     }
 
     /// The device the tracer runs on.
@@ -231,6 +327,22 @@ impl ComputeTracer {
         if image.width == 0 || image.height == 0 {
             return Err(RtError::EmptyImage);
         }
+        if let Some(error) = self.gpu_error() {
+            return Err(RtError::Gpu(format!("the GPU failed: {error}")));
+        }
+        let scopes = ErrorScopes::push(&self.gpu.device);
+        let result = self.trace_gpu_watched(scene, camera, image, settings);
+        scopes.pop_into(&self.errors);
+        result
+    }
+
+    fn trace_gpu_watched(
+        &mut self,
+        scene: &RtScene,
+        camera: &Camera,
+        image: &mut GpuRenderImage,
+        settings: &TraceSettings,
+    ) -> Result<(), RtError> {
         self.prepare(scene)?;
         if scene.has_media() {
             if let Some(why) = self.media_problem() {
@@ -245,7 +357,7 @@ impl ComputeTracer {
                     module: &self.module,
                     entry_point: Some("trace"),
                     compilation_options: w::PipelineCompilationOptions {
-                        constants: &[("MEDIA", 1.0)],
+                        constants: &MEDIA_CONSTANTS,
                         ..Default::default()
                     },
                     cache: None,
@@ -292,9 +404,10 @@ impl ComputeTracer {
             );
         }
 
-        let params = device.create_buffer_init(&w::util::BufferInitDescriptor {
-            label: Some("ray tracing parameters"),
-            contents: &params_bytes(
+        let params = filled_buffer(
+            &self.gpu,
+            "ray tracing parameters",
+            &params_bytes(
                 scene,
                 camera,
                 image.width,
@@ -302,8 +415,8 @@ impl ComputeTracer {
                 settings,
                 caustics.as_ref(),
             ),
-            usage: w::BufferUsages::UNIFORM,
-        });
+            w::BufferUsages::UNIFORM,
+        );
 
         // One entry per dispatch: a tile and the sample it adds
         let stride = TILE_BYTES.max(device.limits().min_uniform_buffer_offset_alignment as u64);
@@ -342,11 +455,12 @@ impl ComputeTracer {
                 }
             }
         }
-        let tile_buffer = device.create_buffer_init(&w::util::BufferInitDescriptor {
-            label: Some("ray tracing tiles"),
-            contents: &tile_data,
-            usage: w::BufferUsages::UNIFORM,
-        });
+        let tile_buffer = filled_buffer(
+            &self.gpu,
+            "ray tracing tiles",
+            &tile_data,
+            w::BufferUsages::UNIFORM,
+        );
 
         let bind_group = device.create_bind_group(&w::BindGroupDescriptor {
             label: Some("ray tracing"),
@@ -488,6 +602,91 @@ impl ComputeTracer {
     }
 }
 
+///
+/// A buffer with the bytes, written through the queue. Not mapped at creation: browsers refuse that for some sizes on
+/// some GPUs, and wgpu panics then.
+///
+fn filled_buffer(gpu: &GpuDevice, label: &str, bytes: &[u8], usage: w::BufferUsages) -> w::Buffer {
+    // Copies need a multiple of four bytes, and a binding at least one word
+    let size = (bytes.len() as u64).div_ceil(4).max(1) * 4;
+    let buffer = gpu.device.create_buffer(&w::BufferDescriptor {
+        label: Some(label),
+        size,
+        usage: usage | w::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    if !bytes.is_empty() {
+        let mut padded = bytes.to_vec();
+        padded.resize(size as usize, 0);
+        gpu.queue.write_buffer(&buffer, 0, &padded);
+    }
+    buffer
+}
+
+/// The scopes of wgpu that catch the errors of some work: out of memory, validation and internal errors.
+struct ErrorScopes([w::ErrorScopeGuard; 3]);
+
+impl ErrorScopes {
+    fn push(device: &w::Device) -> Self {
+        Self([
+            device.push_error_scope(w::ErrorFilter::OutOfMemory),
+            device.push_error_scope(w::ErrorFilter::Validation),
+            device.push_error_scope(w::ErrorFilter::Internal),
+        ])
+    }
+
+    /// Ends the scopes, innermost first, and hands what they caught to the watch.
+    fn pop_into(self, watch: &ErrorWatch) {
+        let mut pending = watch.pending.lock().unwrap_or_else(|e| e.into_inner());
+        for scope in self.0.into_iter().rev() {
+            pending.push(Box::pin(scope.pop()));
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+type ErrorFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Option<w::Error>> + Send>>;
+#[cfg(target_arch = "wasm32")]
+type ErrorFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Option<w::Error>>>>;
+
+///
+/// What the error scopes of the tracer caught. Natively wgpu knows at once, a browser answers a little later, so the
+/// answers are polled without waiting.
+///
+#[derive(Default)]
+struct ErrorWatch {
+    pending: std::sync::Mutex<Vec<ErrorFuture>>,
+    first: std::sync::Mutex<Option<String>>,
+}
+
+impl std::fmt::Debug for ErrorWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ErrorWatch")
+            .field("first", &self.first)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ErrorWatch {
+    /// The first error caught, after looking at the answers there are.
+    fn check(&self) -> Option<String> {
+        let mut first = self.first.lock().unwrap_or_else(|e| e.into_inner());
+        if first.is_none() {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            pending.retain_mut(|future| match future.as_mut().poll(&mut context) {
+                std::task::Poll::Ready(Some(error)) => {
+                    first.get_or_insert_with(|| error.to_string());
+                    false
+                }
+                std::task::Poll::Ready(None) => false,
+                std::task::Poll::Pending => true,
+            });
+        }
+        first.clone()
+    }
+}
+
 /// Submits work after waiting for the oldest submission when [MAX_SUBMISSIONS_IN_FLIGHT] may still run.
 fn submit(
     gpu: &GpuDevice,
@@ -536,7 +735,7 @@ impl Tracer for ComputeTracer {
             .is_some_and(|b| b.revision == scene.revision());
         if rebuilt || !current {
             self.buffers = Some(SceneBuffers::new(
-                &self.gpu.device,
+                &self.gpu,
                 scene,
                 self.accel.as_ref().expect("built"),
             ));
@@ -1100,7 +1299,8 @@ impl Words {
 }
 
 impl SceneBuffers {
-    fn new(device: &w::Device, scene: &RtScene, accel: &CpuAccel) -> Self {
+    fn new(gpu: &GpuDevice, scene: &RtScene, accel: &CpuAccel) -> Self {
+        let device = &gpu.device;
         let limits = device.limits();
         let max_bytes = limits
             .max_storage_buffer_binding_size
@@ -1300,11 +1500,7 @@ impl SceneBuffers {
         }
 
         let storage = |label, words: &Words| {
-            device.create_buffer_init(&w::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: &words.bytes(),
-                usage: w::BufferUsages::STORAGE,
-            })
+            filled_buffer(gpu, label, &words.bytes(), w::BufferUsages::STORAGE)
         };
         let texels = texel_words(scene.textures(), max_bytes);
         Self {
@@ -1651,6 +1847,29 @@ mod tests {
         assert_eq!(shrunk.0.len(), 4 + 8 + 32 * 16 + 4);
         assert_eq!(&shrunk.0[4..7], &[12, 32, 16]);
         assert_eq!(shrunk.0[12], u32::from_le_bytes([200, 100, 50, 255]));
+    }
+
+    #[test]
+    fn errors_of_the_gpu_are_caught() {
+        let Ok(context) = three_d::Context::new_headless_wgpu() else {
+            return;
+        };
+        let gpu = GpuDevice::from_context(&context).unwrap();
+        let watch = ErrorWatch::default();
+        let scopes = ErrorScopes::push(&gpu.device);
+        assert!(watch.check().is_none());
+        // Mapped for reading and bound as storage at once is not allowed
+        let _ = gpu.device.create_buffer(&w::BufferDescriptor {
+            label: None,
+            size: 16,
+            usage: w::BufferUsages::MAP_READ | w::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        scopes.pop_into(&watch);
+        let error = watch.check().expect("an error");
+        assert!(error.to_lowercase().contains("usage"), "{error}");
+        // And the context does not see it
+        assert!(context.error_check().is_ok());
     }
 
     /// wgpu reports invalid shaders only to an error handler, so the shaders are checked here on every platform.

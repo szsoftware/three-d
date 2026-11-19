@@ -356,3 +356,47 @@ fn the_cpu_traces_a_sample_in_parts_within_the_frame_time() {
     assert_eq!(preview.sample_count(), 1);
     finish(&context);
 }
+
+#[test]
+fn the_cpu_keeps_its_samples_when_the_gpu_hands_back() {
+    let Some(context) = context() else { return };
+    let mut preview = RaytracePreview::new(&context, 16, 8);
+    if preview.availability() != &PreviewAvailability::Gpu {
+        return;
+    }
+    preview.set_settings(PreviewSettings {
+        cpu_in_background: false,
+        ..*preview.settings()
+    });
+    let scene = sky_only(1000.0);
+    let view = camera(16, 8, vec3(0.0, 0.0, 0.0));
+    // The CPU's samples until the GPU takes over
+    let mut on_cpu = 0;
+    let start = std::time::Instant::now();
+    while preview.kind() == TracerKind::CpuReference {
+        on_cpu = preview.sample_count();
+        preview.update(&scene, &view).unwrap();
+        assert!(
+            start.elapsed().as_secs() < 120,
+            "the shaders never compiled"
+        );
+    }
+    // Far too slow for this limit: back to the CPU, with the samples it had and one more
+    preview.set_settings(PreviewSettings {
+        gpu_frame_time: Some(std::time::Duration::from_nanos(1)),
+        ..*preview.settings()
+    });
+    while preview.kind() == TracerKind::Compute {
+        preview.update(&scene, &view).unwrap();
+    }
+    finish(&context);
+    eprintln!(
+        "{on_cpu} samples on the CPU before the GPU, {} after",
+        preview.sample_count()
+    );
+    assert!(
+        preview.sample_count() > on_cpu,
+        "{} after {on_cpu}",
+        preview.sample_count()
+    );
+}

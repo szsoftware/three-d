@@ -116,6 +116,8 @@ pub struct CpuReferenceTracer {
     builder: CpuBvhBuilder,
     accel: Option<CpuAccel>,
     threads: Option<usize>,
+    /// The threads trace at a low priority, see [CpuReferenceTracer::with_low_priority]
+    low_priority: bool,
     /// The photons of the sample traced in bands, see [CpuReferenceTracer::trace_rows]
     band_photons: Option<std::sync::Arc<PhotonMap>>,
 }
@@ -132,6 +134,25 @@ impl CpuReferenceTracer {
             threads: Some(threads.max(1)),
             ..Self::default()
         }
+    }
+
+    ///
+    /// The tracer's threads run at a low priority, so that an application on the same cores goes first: nice 10 on
+    /// Linux and Android, unchanged elsewhere. The thread that calls [Tracer::trace] keeps its priority, it only waits.
+    ///
+    pub fn with_low_priority(mut self) -> Self {
+        self.low_priority = true;
+        self
+    }
+
+    /// Changes the number of threads, `None` for all.
+    pub fn set_threads(&mut self, threads: Option<usize>) {
+        self.threads = threads.map(|t| t.max(1));
+    }
+
+    /// The number of threads it traces with, 1 in browsers.
+    pub fn threads(&self) -> usize {
+        self.thread_count()
     }
 
     /// The acceleration structure, after [Tracer::prepare].
@@ -270,16 +291,26 @@ impl CpuReferenceTracer {
             let next = std::sync::atomic::AtomicUsize::new(0);
             let row_slices: Vec<std::sync::Mutex<_>> =
                 row_slices.into_iter().map(std::sync::Mutex::new).collect();
+            let low_priority = self.low_priority;
             std::thread::scope(|s| {
                 for _ in 0..threads {
-                    s.spawn(|| loop {
-                        let y = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if y >= row_slices.len() {
-                            break;
+                    s.spawn(|| {
+                        if low_priority {
+                            crate::priority::lower_this_thread(crate::priority::TRACING);
                         }
-                        let mut guard = row_slices[y].lock().unwrap();
-                        let (row, features) = &mut *guard;
-                        context.render_row((first_row + y) as u32, row, features.as_deref_mut());
+                        loop {
+                            let y = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if y >= row_slices.len() {
+                                break;
+                            }
+                            let mut guard = row_slices[y].lock().unwrap();
+                            let (row, features) = &mut *guard;
+                            context.render_row(
+                                (first_row + y) as u32,
+                                row,
+                                features.as_deref_mut(),
+                            );
+                        }
                     });
                 }
             });
