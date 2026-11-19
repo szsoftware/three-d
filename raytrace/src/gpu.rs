@@ -79,6 +79,42 @@ fn crashes_with_the_tracer(_vendor: u32, _name: &str, _driver: &str, _driver_inf
 }
 
 ///
+/// Why the compute tracer can not trace participating media (`RtMedium`, `RtFog`) on a device, `None` if it can. Its
+/// shader for scenes with media needs more scratch memory than Intel graphics of the 7th generation (Ivy Bridge,
+/// Haswell, Bay Trail) have and jumps further than they can; Mesa's compilers for them (crocus, hasvk) crash or hang on
+/// it, so it is not even built there and such scenes are traced on the CPU.
+///
+pub fn media_problem(info: &three_d::wgpu::AdapterInfo) -> Option<String> {
+    is_intel_gen7(info.vendor, &info.name, &info.driver, &info.driver_info).then(|| {
+        format!(
+            "The graphics card ({}) can not trace fog, smoke and tinted glass, its shader compiler fails on them; \
+             ray tracing of scenes with them runs on the CPU.",
+            info.name
+        )
+    })
+}
+
+/// Intel graphics of the 7th generation, by what the adapter tells.
+fn is_intel_gen7(vendor: u32, name: &str, driver: &str, driver_info: &str) -> bool {
+    let text = format!("{name} {driver} {driver_info}").to_lowercase();
+    let intel = vendor == 0x8086 || text.contains("intel");
+    // Mesa's drivers for exactly these chips
+    let driver = text.contains("crocus") || text.contains("hasvk");
+    let chip = [
+        "ivb",
+        "hsw",
+        "byt",
+        "ivybridge",
+        "ivy bridge",
+        "haswell",
+        "bay trail",
+    ]
+    .iter()
+    .any(|k| text.contains(k));
+    driver || (intel && chip)
+}
+
+///
 /// The wgpu device and queue of a three-d context, which a GPU tracer uses next to three-d.
 ///
 /// Textures of three-d are shared with [Texture2D::as_wgpu](three_d::Texture2D::as_wgpu), which also orders the work of
@@ -99,5 +135,44 @@ impl GpuDevice {
             device: device.clone(),
             queue: queue.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn intel_gen7_is_recognised() {
+        assert!(is_intel_gen7(
+            0x8086,
+            "Intel(R) HD Graphics 4000 (IVB GT2)",
+            "Intel open-source Mesa driver",
+            "Mesa 26.0.8"
+        ));
+        assert!(is_intel_gen7(
+            0x8086,
+            "Mesa Intel(R) HD Graphics 4600 (HSW GT2)",
+            "",
+            ""
+        ));
+        assert!(is_intel_gen7(
+            0,
+            "crocus",
+            "OpenGL",
+            "4.6 (Core Profile) Mesa"
+        ));
+        assert!(!is_intel_gen7(
+            0x8086,
+            "Intel(R) UHD Graphics 620 (KBL GT2)",
+            "Intel open-source Mesa driver",
+            "Mesa 26.0.8"
+        ));
+        assert!(!is_intel_gen7(
+            0x10de,
+            "NVIDIA GeForce RTX 4070",
+            "NVIDIA",
+            "560"
+        ));
     }
 }

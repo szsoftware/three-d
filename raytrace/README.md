@@ -187,7 +187,9 @@ binds (128 MB guaranteed by WebGPU), the largest ones are halved in size until t
   inside other media (an ice cube in a glass of water), a camera inside a closed mesh with a medium (use the fog
   there), media whose density varies other than the fog with height. The compute tracer builds a second pipeline for
   scenes with media (the override constant `MEDIA` in trace.wgsl), so the tracer of scenes without stays as small as
-  before for the compilers of small GPUs. `examples/volumes.rs` renders a pergola in ground haze with a water basin
+  before for the compilers of small GPUs. On Intel graphics of the 7th generation (Ivy Bridge, Haswell, Bay Trail) that
+  pipeline is too large for Mesa's compilers, so it is not built there: `ComputeTracer::media_problem` says why,
+  `trace_gpu` returns `RtError::Gpu` for scenes with media and `RaytracePreview` goes on with the CPU. `examples/volumes.rs` renders a pergola in ground haze with a water basin
   and a ball of smoke.
 - Deterministic: the same seed gives the same image with any number of threads.
 

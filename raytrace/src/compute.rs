@@ -204,6 +204,14 @@ impl ComputeTracer {
         self.tile_size
     }
 
+    ///
+    /// Why the tracer can not trace scenes with participating media on its device (fog, smoke, tinted glass), `None`
+    /// if it can. [ComputeTracer::trace_gpu] returns [RtError::Gpu] for such scenes there; trace them on the CPU.
+    ///
+    pub fn media_problem(&self) -> Option<String> {
+        crate::media_problem(&self.gpu.device.adapter_info())
+    }
+
     /// The device the tracer runs on.
     pub fn gpu(&self) -> &GpuDevice {
         &self.gpu
@@ -224,6 +232,11 @@ impl ComputeTracer {
             return Err(RtError::EmptyImage);
         }
         self.prepare(scene)?;
+        if scene.has_media() {
+            if let Some(why) = self.media_problem() {
+                return Err(RtError::Gpu(why));
+            }
+        }
         if scene.has_media() && self.media_pipeline.is_none() {
             self.media_pipeline = Some(self.gpu.device.create_compute_pipeline(
                 &w::ComputePipelineDescriptor {

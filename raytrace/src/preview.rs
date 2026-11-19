@@ -540,6 +540,17 @@ impl RaytracePreview {
             });
         }
         #[cfg(feature = "wgpu")]
+        if let Engine::Gpu { tracer, .. } = &self.engine {
+            if scene.has_media() {
+                if let Some(why) = tracer.media_problem() {
+                    // For good: the scene may get its media back any time
+                    self.availability = PreviewAvailability::CpuOnly(why);
+                    self.rebuild();
+                    return self.update(scene, camera);
+                }
+            }
+        }
+        #[cfg(feature = "wgpu")]
         if matches!(self.engine, Engine::Gpu { .. }) && self.pace_gpu() {
             // Lighter now: the next update starts on the new engine
             return self.update(scene, camera);
