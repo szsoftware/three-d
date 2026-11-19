@@ -452,13 +452,16 @@ fn crossed_transmittance(o: vec3<f32>, d: vec3<f32>, distance: f32) -> vec3<f32>
         return summed_transmittance(o, d, distance);
     }
     var n = path_nest;
+    if (PROBE & 512u) != 0u {
+        n = Nest(array<u32, 4>(NONE, NONE, NONE, NONE), array<f32, 4>(1.0, 1.0, 1.0, 1.0), 0u);
+    }
     var start = 0.0;
     var depth = vec3<f32>(0.0);
     var through = vec3<f32>(1.0);
     // In the order of their distance, the nearest not taken yet each time: the arrays are only read, which the
     // compilers of DirectX 12 get right (sorting them in place left the whole tracer black on WARP)
     var taken = 0u;
-    for (var k = 0u; k < crossing_count; k++) {
+    for (var k = 0u; k < crossing_count && (PROBE & 256u) == 0u; k++) {
         var i = 0u;
         var nearest = BIG * 4.0;
         for (var j = 0u; j < crossing_count; j++) {
@@ -485,6 +488,9 @@ fn crossed_transmittance(o: vec3<f32>, d: vec3<f32>, distance: f32) -> vec3<f32>
         }
         n = c.after;
         start = nearest;
+    }
+    if (PROBE & 8u) != 0u {
+        return through * exp(-max(depth, vec3<f32>(0.0)));
     }
     if distance >= 0.5 * BIG {
         // Open meshes and fog that does not thin out: the medium does not end
@@ -1741,7 +1747,11 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
         if shadow {
             var through = transmittance;
             if MEDIA {
-                through *= crossed_transmittance(origin, shadow_ray.direction, shadow_ray.distance);
+                let crossed = crossed_transmittance(origin, shadow_ray.direction, shadow_ray.distance);
+                if (PROBE & 16384u) != 0u && (any(crossed != crossed) || any(abs(crossed) > vec3<f32>(1e30))) {
+                    return vec3<f32>(77.0, crossed.x, shadow_ray.distance);
+                }
+                through *= crossed;
             }
             direct += shadow_ray.contribution * through;
             shadow_ray = next_shadow_ray(shadow_ray.next, origin, -direction, surface_n, surface_ng, reflecting(surface_base_color, surface_params));

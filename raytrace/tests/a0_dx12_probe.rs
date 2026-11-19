@@ -8,7 +8,7 @@ fn probe() {
         return;
     };
     let mut lines = Vec::new();
-    for probe in [0u32, 4, 2] {
+    for probe in [16384u32, 8, 256, 512, 776] {
         // One process, one test: nothing else reads the variable
         unsafe { std::env::set_var("RAYTRACE_PROBE", probe.to_string()) };
         for scene_kind in ["fog", "box"] {
