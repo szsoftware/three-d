@@ -802,13 +802,14 @@ impl Tracer for ComputeTracer {
         scratch.reset();
         // Go on with the samples of the render image, so every call adds new ones
         scratch.samples = render_image.sample_count();
-        let result = self.trace_gpu(scene, camera, &mut scratch, settings);
+        let mut result = self.trace_gpu(scene, camera, &mut scratch, settings);
         if result.is_ok() {
-            scratch.add_to(
-                render_image,
-                &scratch.read_sums(),
-                settings.samples_per_call,
-            );
+            let sums = scratch.read_sums();
+            // The GPU is done after the read, so its errors are known: a pipeline that failed to compile leaves zeros
+            match self.gpu_error() {
+                Some(error) => result = Err(RtError::Gpu(format!("the GPU failed: {error}"))),
+                None => scratch.add_to(render_image, &sums, settings.samples_per_call),
+            }
         }
         self.scratch = Some(scratch);
         result
