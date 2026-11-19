@@ -158,6 +158,32 @@ impl CpuAccel {
     }
 
     ///
+    /// As [CpuAccel::intersect], but surfaces of the instance in `skip` closer than its distance are passed by.
+    ///
+    pub(crate) fn intersect_skipping(
+        &self,
+        scene: &RtScene,
+        origin: Vec3,
+        direction: Vec3,
+        t_max: f32,
+        skip: Option<(u32, f32)>,
+    ) -> Option<Hit> {
+        let Some((instance, until)) = skip else {
+            return self.intersect(scene, origin, direction, t_max);
+        };
+        let mut best = None;
+        let mut t = t_max;
+        self.walk(scene, origin, direction, &mut t, |hit, t_max| {
+            if hit.instance != instance || hit.t >= until {
+                *t_max = hit.t;
+                best = Some(*hit);
+            }
+            false
+        });
+        best
+    }
+
+    ///
     /// Calls `visit` for every triangle the ray hits before `t_max`, in no particular order, until it returns `true`.
     ///
     pub fn for_each_hit(

@@ -93,6 +93,23 @@ pub fn media_problem(info: &three_d::wgpu::AdapterInfo) -> Option<String> {
     })
 }
 
+///
+/// Why the preview takes the CPU on a device that could trace on the GPU: on Intel graphics of the 7th generation with
+/// wgpu over OpenGL the shaders compile on the thread that draws, which holds the image for seconds, and the GPU
+/// tracer ends up no faster than the CPU there.
+///
+pub(crate) fn preview_problem(info: &three_d::wgpu::AdapterInfo) -> Option<String> {
+    (info.backend == three_d::wgpu::Backend::Gl
+        && is_intel_gen7(info.vendor, &info.name, &info.driver, &info.driver_info))
+    .then(|| {
+        format!(
+            "On this graphics card ({}) with OpenGL the shaders of the ray tracer would hold the image for seconds \
+             and are no faster than the CPU; ray tracing runs on the CPU.",
+            info.name
+        )
+    })
+}
+
 /// Intel graphics of the 7th generation, by what the adapter tells. Browsers tell only vendor and architecture, for
 /// example "intel" and "gen-7", which three-d passes on as driver and driver info.
 fn is_intel_gen7(vendor: u32, name: &str, driver: &str, driver_info: &str) -> bool {
@@ -142,6 +159,30 @@ impl GpuDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_preview_takes_the_cpu_on_gen7_only_over_opengl() {
+        let info = |backend| three_d::wgpu::AdapterInfo {
+            name: "Mesa Intel(R) HD Graphics 4000 (IVB GT2)".to_owned(),
+            vendor: 0x8086,
+            device: 0x0166,
+            device_type: three_d::wgpu::DeviceType::IntegratedGpu,
+            driver: String::new(),
+            driver_info: String::new(),
+            backend,
+            device_pci_bus_id: String::new(),
+            subgroup_min_size: 8,
+            subgroup_max_size: 32,
+            transient_saves_memory: false,
+        };
+        assert!(preview_problem(&info(three_d::wgpu::Backend::Gl)).is_some());
+        assert!(preview_problem(&info(three_d::wgpu::Backend::Vulkan)).is_none());
+        let other = three_d::wgpu::AdapterInfo {
+            name: "Mesa Intel(R) UHD Graphics 620 (KBL GT2)".to_owned(),
+            ..info(three_d::wgpu::Backend::Gl)
+        };
+        assert!(preview_problem(&other).is_none());
+    }
 
     #[test]
     fn intel_gen7_is_recognised() {

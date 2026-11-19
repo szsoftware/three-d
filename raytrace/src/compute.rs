@@ -76,6 +76,16 @@ const PHOTON_ENTRIES: [&str; 4] = [
 /// The constants of the tracer for scenes with participating media.
 const MEDIA_CONSTANTS: [(&str, f64); 1] = [("MEDIA", 1.0)];
 
+/// The constants of all pipelines on the adapter: without CONTACT where the tracer would get too large (Intel graphics
+/// of the 7th generation, see [crate::media_problem]).
+fn pipeline_constants(adapter: &w::AdapterInfo) -> Vec<(&'static str, f64)> {
+    if crate::media_problem(adapter).is_some() {
+        vec![("CONTACT", 0.0)]
+    } else {
+        Vec::new()
+    }
+}
+
 ///
 /// A path tracer in compute shaders on the wgpu backend, the same algorithm and material model as the
 /// [CpuReferenceTracer](crate::CpuReferenceTracer).
@@ -136,7 +146,17 @@ impl ComputeTracer {
     /// A tracer on the device. The device needs compute shaders, see [RaytraceSupport::of].
     ///
     pub fn new(gpu: &GpuDevice) -> Self {
+        Self::for_adapter(gpu, None)
+    }
+
+    ///
+    /// A tracer on the device, for the adapter as the context tells it (see [three_d::Context::wgpu_adapter_info]),
+    /// which knows more in a browser than the device.
+    ///
+    pub(crate) fn for_adapter(gpu: &GpuDevice, adapter: Option<w::AdapterInfo>) -> Self {
         let device = &gpu.device;
+        let adapter = adapter.unwrap_or_else(|| device.adapter_info());
+        let constants = pipeline_constants(&adapter);
         let errors = ErrorWatch::default();
         let scopes = ErrorScopes::push(device);
         let layout_of = |label, slots: &[(u32, Slot)]| {
@@ -181,7 +201,10 @@ impl ComputeTracer {
             layout: Some(&pipeline_layout),
             module: &module,
             entry_point: Some("trace"),
-            compilation_options: Default::default(),
+            compilation_options: w::PipelineCompilationOptions {
+                constants: &constants,
+                ..Default::default()
+            },
             cache: None,
         });
         let photon_layout = layout_of("caustic photons", &PHOTON_SLOTS);
@@ -196,7 +219,10 @@ impl ComputeTracer {
                 layout: Some(&photon_pipeline_layout),
                 module: &module,
                 entry_point: Some(entry),
-                compilation_options: Default::default(),
+                compilation_options: w::PipelineCompilationOptions {
+                    constants: &constants,
+                    ..Default::default()
+                },
                 cache: None,
             })
         });
@@ -217,7 +243,7 @@ impl ComputeTracer {
             tile_size: 256,
             scratch: None,
             in_flight: std::collections::VecDeque::new(),
-            adapter: device.adapter_info(),
+            adapter,
             errors,
             #[cfg(target_arch = "wasm32")]
             warm: None,
@@ -234,19 +260,10 @@ impl ComputeTracer {
         if RaytraceSupport::of(context) < RaytraceSupport::Compute {
             return None;
         }
-        Some(
-            Self::new(&GpuDevice::from_context(context)?)
-                .with_adapter_info(context.wgpu_adapter_info()),
-        )
-    }
-
-    /// The adapter as the context tells it, which knows more in a browser than the device, see
-    /// [three_d::Context::wgpu_adapter_info].
-    pub(crate) fn with_adapter_info(mut self, info: Option<w::AdapterInfo>) -> Self {
-        if let Some(info) = info {
-            self.adapter = info;
-        }
-        self
+        Some(Self::for_adapter(
+            &GpuDevice::from_context(context)?,
+            context.wgpu_adapter_info(),
+        ))
     }
 
     ///
@@ -262,10 +279,13 @@ impl ComputeTracer {
             }
             let warm = match context.webgpu_device() {
                 Some(device) => {
-                    let media = context
-                        .wgpu_adapter_info()
-                        .is_none_or(|info| crate::media_problem(&info).is_none());
-                    Some(browser::compile(&device, media).await.ok()?)
+                    let info = context.wgpu_adapter_info()?;
+                    let media = crate::media_problem(&info).is_none();
+                    Some(
+                        browser::compile(&device, media, &pipeline_constants(&info))
+                            .await
+                            .ok()?,
+                    )
                 }
                 None => None,
             };
@@ -370,6 +390,15 @@ impl ComputeTracer {
         };
         let device = &self.gpu.device;
         let buffers = self.buffers.as_ref().expect("prepared");
+        let camera_inside = if scene.has_media() {
+            crate::tracer::solids_containing(
+                scene,
+                self.accel.as_ref().expect("prepared"),
+                camera.position(),
+            )
+        } else {
+            crate::nesting::Inside::AIR
+        };
         let caustics = CausticPlan::new(
             scene,
             self.accel.as_ref().expect("prepared"),
@@ -414,6 +443,7 @@ impl ComputeTracer {
                 image.height,
                 settings,
                 caustics.as_ref(),
+                &camera_inside,
             ),
             w::BufferUsages::UNIFORM,
         );
@@ -772,13 +802,14 @@ impl Tracer for ComputeTracer {
         scratch.reset();
         // Go on with the samples of the render image, so every call adds new ones
         scratch.samples = render_image.sample_count();
-        let result = self.trace_gpu(scene, camera, &mut scratch, settings);
+        let mut result = self.trace_gpu(scene, camera, &mut scratch, settings);
         if result.is_ok() {
-            scratch.add_to(
-                render_image,
-                &scratch.read_sums(),
-                settings.samples_per_call,
-            );
+            let sums = scratch.read_sums();
+            // The GPU is done after the read, so its errors are known: a pipeline that failed to compile leaves zeros
+            match self.gpu_error() {
+                Some(error) => result = Err(RtError::Gpu(format!("the GPU failed: {error}"))),
+                None => scratch.add_to(render_image, &sums, settings.samples_per_call),
+            }
         }
         self.scratch = Some(scratch);
         result
@@ -1388,7 +1419,7 @@ impl SceneBuffers {
                     m.normal_scale,
                     m.alpha_cutout.unwrap_or(-1.0),
                 ),
-                0.0,
+                m.medium_priority as f32,
             );
             let id = |t: Option<TextureId>| t.map_or(NONE, |t| t.0);
             materials.u(id(m.base_color_texture));
@@ -1730,6 +1761,7 @@ fn params_bytes(
     height: u32,
     settings: &TraceSettings,
     caustics: Option<&CausticPlan>,
+    camera_inside: &crate::nesting::Inside,
 ) -> Vec<u8> {
     let mut p = Words::default();
     let perspective = matches!(camera.projection_type(), ProjectionType::Perspective { .. });
@@ -1828,6 +1860,12 @@ fn params_bytes(
     }
     p.f(if scene.has_media() { 1.0 } else { 0.0 });
     p.f(0.0);
+    // The solids the camera is in
+    let mut nest = [NONE; 4];
+    for (slot, solid) in nest.iter_mut().zip(camera_inside.solids()) {
+        *slot = solid.instance;
+    }
+    nest.iter().for_each(|&i| p.u(i));
     p.bytes()
 }
 

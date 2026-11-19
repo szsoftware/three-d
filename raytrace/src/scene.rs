@@ -143,6 +143,13 @@ pub struct RtMaterial {
     /// and water, smoke or fog. See [RtMaterial::medium_boundary] for a mesh that only holds a medium.
     ///
     pub medium: Option<RtMedium>,
+    ///
+    /// Which solid fills the space where closed meshes overlap, for media inside media: an ice cube in a glass of
+    /// water, water in a glass. The higher priority wins there, the surfaces of the others are not seen; at the same
+    /// priority the solid entered last. Let the water overlap the glass's wall a little and give the glass the higher
+    /// priority, then the water ends at the glass without a gap. 0 by default.
+    ///
+    pub medium_priority: u32,
 }
 
 impl Default for RtMaterial {
@@ -165,6 +172,7 @@ impl Default for RtMaterial {
             emission_texture: None,
             transmission_texture: None,
             medium: None,
+            medium_priority: 0,
         }
     }
 }

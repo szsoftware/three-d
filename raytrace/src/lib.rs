@@ -36,6 +36,7 @@ mod ies;
 mod lens;
 mod light;
 mod medium;
+mod nesting;
 mod photons;
 #[cfg(feature = "three-d")]
 mod preview;
