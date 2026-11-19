@@ -142,6 +142,10 @@ override MEDIA: bool = false;
 // Surfaces touching the solid a path just left are hit, not jumped over (a pane of glass on the floor); off for the
 // compilers of Intel graphics of the 7th generation, for which the tracer is just small enough without
 override CONTACT: bool = true;
+// Shadow rays take the surfaces of solids in their order (crossed_transmittance); off where the compiler goes wrong on
+// that code (WARP, the software adapter of DirectX 12, then computes zeros in the whole tracer), which then takes the
+// sums of summed_transmittance as before solids could be nested
+override ORDERED: bool = true;
 // The solid a path just left and up to where its surfaces are passed by, NONE for none (tracer.rs past)
 var<private> skip_instance: u32 = 0xffffffffu;
 var<private> skip_until: f32;
@@ -446,7 +450,7 @@ fn segment_depth(n: Nest, o: vec3<f32>, d: vec3<f32>, t0: f32, t1: f32) -> vec3<
 // What the solids and media along a shadow ray let through, the surfaces of solids taken in their order
 // (tracer.rs transmittance); the sums of shadow_hit where there are too many surfaces
 fn crossed_transmittance(o: vec3<f32>, d: vec3<f32>, distance: f32) -> vec3<f32> {
-    if crossing_count > MAX_CROSSINGS {
+    if !ORDERED || crossing_count > MAX_CROSSINGS {
         return summed_transmittance(o, d, distance);
     }
     // Sorted by distance
@@ -785,7 +789,7 @@ fn shadow_hit(index: u32, m: Material, p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f3
     let transmission = m.params.w;
     let face = face_normal_in_world(index, p0, p1, p2);
     let cos_i = clamp(abs(dot(face, shadow_direction)), 0.0, 1.0);
-    if MEDIA && m.flags.x == 0.0 {
+    if MEDIA && ORDERED && m.flags.x == 0.0 {
         // Solids in their order in crossed_transmittance, with the Fresnel term from the media on both sides
         if crossing_count < MAX_CROSSINGS {
             crossing_t[crossing_count] = t;

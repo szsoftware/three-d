@@ -76,6 +76,13 @@ const PHOTON_ENTRIES: [&str; 4] = [
 /// The constants of the tracer for scenes with participating media.
 const MEDIA_CONSTANTS: [(&str, f64); 1] = [("MEDIA", 1.0)];
 
+/// Whether the media tracer takes the surfaces of solids along shadow rays in their order on the adapter. Not on WARP,
+/// the software adapter of DirectX 12 (Microsoft Basic Render Driver): with that code its compiler computes zeros in
+/// the whole media tracer, the code it is given even where it never runs.
+fn orders_shadow_crossings(adapter: &w::AdapterInfo) -> bool {
+    !(adapter.backend == w::Backend::Dx12 && adapter.device_type == w::DeviceType::Cpu)
+}
+
 /// The constants of all pipelines on the adapter: without CONTACT where the tracer would get too large (Intel graphics
 /// of the 7th generation, see [crate::media_problem]).
 fn pipeline_constants(adapter: &w::AdapterInfo) -> Vec<(&'static str, f64)> {
@@ -328,6 +335,16 @@ impl ComputeTracer {
         self.errors.check()
     }
 
+    ///
+    /// Whether shadow rays in scenes with media take the surfaces of solids in their order, with the media of nested
+    /// solids by their [RtMaterial::medium_priority] as the paths do. Everywhere but on WARP, the software adapter of
+    /// DirectX 12, whose compiler gets that code wrong: there shadow rays add up the media of the solids they cross,
+    /// which is right as long as solids do not overlap, and counts the media of nested solids both.
+    ///
+    pub fn orders_shadow_crossings(&self) -> bool {
+        orders_shadow_crossings(&self.adapter)
+    }
+
     /// The device the tracer runs on.
     pub fn gpu(&self) -> &GpuDevice {
         &self.gpu
@@ -377,7 +394,11 @@ impl ComputeTracer {
                     module: &self.module,
                     entry_point: Some("trace"),
                     compilation_options: w::PipelineCompilationOptions {
-                        constants: &MEDIA_CONSTANTS,
+                        constants: &if orders_shadow_crossings(&self.adapter) {
+                            MEDIA_CONSTANTS.to_vec()
+                        } else {
+                            [MEDIA_CONSTANTS.as_slice(), &[("ORDERED", 0.0)]].concat()
+                        },
                         ..Default::default()
                     },
                     cache: None,

@@ -206,7 +206,8 @@ binds (128 MB guaranteed by WebGPU), the largest ones are halved in size until t
   where closed meshes overlap, the one with the higher `RtMaterial::medium_priority` fills the space (glass over ice
   over water), the surfaces of the others are not seen and refraction goes by the index on both sides; paths keep up to
   four solids, shadow rays take the surfaces in their order (on the GPU up to eight per shadow ray, beyond that the
-  signed sums). The camera may be inside a solid (smoke, under water): the solids containing it are found from a ray to
+  signed sums; on WARP, the software adapter of DirectX 12, always the sums, because its compiler computes zeros with
+  the ordered code, see `ComputeTracer::orders_shadow_crossings`). The camera may be inside a solid (smoke, under water): the solids containing it are found from a ray to
   infinity. A surface touching the solid a path just left (a pane of glass lying on the floor) is hit and not jumped
   over. Not included: media whose density varies other than the fog with height, nesting for the photons of caustics
   on the GPU. `examples/nested_media.rs` renders a glass tank of water with ice cubes and a pane on the floor. The compute tracer builds a second pipeline for
