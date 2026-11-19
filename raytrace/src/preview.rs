@@ -37,6 +37,12 @@ impl PreviewAvailability {
                 return Self::CpuOnly(problem);
             }
             if RaytraceSupport::of(context) >= RaytraceSupport::Compute {
+                if let Some(problem) = context
+                    .wgpu_adapter_info()
+                    .and_then(|info| crate::gpu::preview_problem(&info))
+                {
+                    return Self::CpuOnly(problem);
+                }
                 return Self::Gpu;
             }
             if context.as_wgpu().is_some() {
