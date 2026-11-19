@@ -9,6 +9,8 @@ use crate::{
     RtEnvironment, RtError, RtLight, RtScene, RtTexture, RtWrapping, TextureId, TraceSettings,
     Tracer, TracerKind,
 };
+#[cfg(target_arch = "wasm32")]
+use std::sync::atomic::AtomicBool;
 use three_d::wgpu as w;
 
 #[cfg(target_arch = "wasm32")]
@@ -326,6 +328,7 @@ impl ComputeTracer {
                 ));
                 timing::when_gpu_done(&tracer.gpu.queue, start, "making the tracer".to_owned());
             }
+            tracer.warm_up().await;
             Some(tracer)
         }
         #[cfg(not(target_arch = "wasm32"))]
@@ -716,6 +719,62 @@ impl ComputeTracer {
             });
         }
         Ok(())
+    }
+
+    ///
+    /// Traces one workgroup of a tiny scene and waits until the GPU is done. Some drivers do work on the first dispatch
+    /// of a pipeline (Chrome on Intel graphics of the 7th generation took 25 s there); that way it happens while the
+    /// preview still traces on the CPU, and the first real frame is fast.
+    ///
+    #[cfg(target_arch = "wasm32")]
+    async fn warm_up(&mut self) {
+        let start = timing::now();
+        let mut scene = RtScene::new();
+        let Ok(square) = scene.add_mesh(&three_d_asset::TriMesh::square()) else {
+            return;
+        };
+        let material = scene.add_material(crate::RtMaterial::default());
+        if scene
+            .add_instance(square, material, Mat4::identity())
+            .is_err()
+        {
+            return;
+        }
+        let camera = Camera::new_perspective(
+            three_d_asset::Viewport::new_at_origo(WORKGROUP, WORKGROUP),
+            vec3(0.0, 0.0, 2.0),
+            vec3(0.0, 0.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+            degrees(45.0),
+            0.1,
+            10.0,
+        );
+        let mut image = GpuRenderImage::new(&self.gpu, WORKGROUP, WORKGROUP);
+        let timed_calls = self.timed_calls;
+        // Not counted as one of the calls of the application
+        self.timed_calls = TIMED_CALLS;
+        let traced = self.trace_gpu(&scene, &camera, &mut image, &TraceSettings::default());
+        self.timed_calls = timed_calls;
+        if traced.is_err() {
+            return;
+        }
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = done.clone();
+        self.gpu
+            .queue
+            .on_submitted_work_done(move || flag.store(true, std::sync::atomic::Ordering::Relaxed));
+        while !done.load(std::sync::atomic::Ordering::Relaxed) {
+            browser::sleep(10).await;
+        }
+        // The structures of the tiny scene are not needed any more
+        self.accel = None;
+        self.buffers = None;
+        if timing::enabled() {
+            timing::log(&format!(
+                "warm-up dispatch of one workgroup: GPU done after {:.0} ms",
+                timing::now() - start
+            ));
+        }
     }
 
     ///

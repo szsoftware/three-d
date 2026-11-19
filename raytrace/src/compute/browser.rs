@@ -118,3 +118,18 @@ pub(super) async fn compile(
     let promise: Promise = function.apply(&JsValue::NULL, &arguments)?.dyn_into()?;
     wasm_bindgen_futures::JsFuture::from(promise).await
 }
+
+/// Resolves after the milliseconds, without holding the page.
+pub(super) async fn sleep(milliseconds: i32) {
+    let promise = Promise::new(&mut |resolve, _| {
+        let set_timeout = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("setTimeout"))
+            .ok()
+            .and_then(|f| f.dyn_into::<Function>().ok());
+        if let Some(set_timeout) = set_timeout {
+            let _ = set_timeout.call2(&JsValue::NULL, &resolve, &JsValue::from(milliseconds));
+        } else {
+            let _ = resolve.call0(&JsValue::NULL);
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}
