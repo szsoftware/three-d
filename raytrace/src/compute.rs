@@ -52,7 +52,17 @@ pub struct ComputeTracer {
     extras: Option<w::Buffer>,
     tile_size: u32,
     scratch: Option<GpuRenderImage>,
+    /// Submissions that may still run, oldest first, see [MAX_SUBMISSIONS_IN_FLIGHT]
+    in_flight: std::collections::VecDeque<w::SubmissionIndex>,
 }
+
+/// Submissions of the tracer the GPU may have queued at once; the tracer waits for the oldest before it adds another.
+/// GPUs that can not interrupt compute work (Intel graphics of the 7th generation) run everything queued before the
+/// driver's check that the GPU is alive, and Linux resets the GPU when that waits a few seconds. One tile and sample per
+/// submission and few of them keep the queue short. In the browser the tracer can not wait; there the queue is not
+/// limited.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_SUBMISSIONS_IN_FLIGHT: usize = 2;
 
 impl ComputeTracer {
     ///
@@ -160,6 +170,7 @@ impl ComputeTracer {
             extras: None,
             tile_size: 256,
             scratch: None,
+            in_flight: std::collections::VecDeque::new(),
         }
     }
 
@@ -379,7 +390,7 @@ impl ComputeTracer {
             })
         });
 
-        // One submission per sample, so the GPU can go on with other work between them
+        // One submission per sample and tile, so the GPU can go on with other work between them, and only a few at a time
         for s in 0..samples {
             let mut encoder = device.create_command_encoder(&w::CommandEncoderDescriptor {
                 label: Some("ray tracing"),
@@ -407,13 +418,20 @@ impl ComputeTracer {
                     pass.dispatch_workgroups(groups, 1, 1);
                 }
             }
-            {
-                let mut pass = encoder.begin_compute_pass(&w::ComputePassDescriptor {
-                    label: Some("ray tracing"),
-                    timestamp_writes: None,
+            let mut first = Some(encoder);
+            for (t, rect) in tiles.iter().enumerate() {
+                // The photons go with the first tile
+                let mut encoder = first.take().unwrap_or_else(|| {
+                    device.create_command_encoder(&w::CommandEncoderDescriptor {
+                        label: Some("ray tracing"),
+                    })
                 });
-                pass.set_pipeline(&self.pipeline);
-                for (t, rect) in tiles.iter().enumerate() {
+                {
+                    let mut pass = encoder.begin_compute_pass(&w::ComputePassDescriptor {
+                        label: Some("ray tracing"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(&self.pipeline);
                     let offset = (s as u64 * tiles.len() as u64 + t as u64) * stride;
                     pass.set_bind_group(0, &bind_group, &[offset as u32]);
                     pass.dispatch_workgroups(
@@ -422,11 +440,36 @@ impl ComputeTracer {
                         1,
                     );
                 }
+                submit(&self.gpu, &mut self.in_flight, encoder.finish());
             }
-            self.gpu.queue.submit([encoder.finish()]);
         }
         image.samples += samples;
         Ok(())
+    }
+}
+
+/// Submits work after waiting for the oldest submission when [MAX_SUBMISSIONS_IN_FLIGHT] may still run.
+fn submit(
+    gpu: &GpuDevice,
+    in_flight: &mut std::collections::VecDeque<w::SubmissionIndex>,
+    commands: w::CommandBuffer,
+) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        while in_flight.len() >= MAX_SUBMISSIONS_IN_FLIGHT {
+            let oldest = in_flight.pop_front().unwrap();
+            // An error (a lost device) shows when the work is read back
+            let _ = gpu.device.poll(w::PollType::Wait {
+                submission_index: Some(oldest),
+                timeout: None,
+            });
+        }
+        in_flight.push_back(gpu.queue.submit([commands]));
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = in_flight;
+        gpu.queue.submit([commands]);
     }
 }
 
