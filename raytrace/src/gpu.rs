@@ -96,9 +96,23 @@ pub fn media_problem(info: &three_d::wgpu::AdapterInfo) -> Option<String> {
 ///
 /// Why the preview takes the CPU on a device that could trace on the GPU: on Intel graphics of the 7th generation with
 /// wgpu over OpenGL the shaders compile on the thread that draws, which holds the image for seconds, and the GPU
-/// tracer ends up no faster than the CPU there.
+/// tracer ends up no faster than the CPU there. And in a browser that runs WebGPU in software: its compiler and the
+/// first frames take the browser's graphics process for tens of seconds, Chrome drops the page's WebGL contexts then.
 ///
 pub(crate) fn preview_problem(info: &three_d::wgpu::AdapterInfo) -> Option<String> {
+    if info.backend == three_d::wgpu::Backend::BrowserWebGpu {
+        let text = format!("{} {} {}", info.name, info.driver, info.driver_info).to_lowercase();
+        if ["swiftshader", "llvmpipe", "lavapipe"]
+            .iter()
+            .any(|software| text.contains(software))
+        {
+            return Some(
+                "The browser runs WebGPU in software (SwiftShader) here, which holds the browser's own graphics for \
+                 seconds; ray tracing runs on the CPU."
+                    .to_owned(),
+            );
+        }
+    }
     (info.backend == three_d::wgpu::Backend::Gl
         && is_intel_gen7(info.vendor, &info.name, &info.driver, &info.driver_info))
     .then(|| {
@@ -195,6 +209,21 @@ mod tests {
             ..info(three_d::wgpu::Backend::Gl)
         };
         assert!(preview_problem(&other).is_none());
+        // WebGPU in software in a browser, as three-d tells the browser's vendor and architecture
+        let software = three_d::wgpu::AdapterInfo {
+            name: String::new(),
+            vendor: 0,
+            driver: "google".to_owned(),
+            driver_info: "swiftshader".to_owned(),
+            ..info(three_d::wgpu::Backend::BrowserWebGpu)
+        };
+        assert!(preview_problem(&software).is_some());
+        // lavapipe natively is fine, the tests of the preview run there
+        let lavapipe = three_d::wgpu::AdapterInfo {
+            name: "llvmpipe (LLVM 21.1.8, 256 bits)".to_owned(),
+            ..info(three_d::wgpu::Backend::Vulkan)
+        };
+        assert!(preview_problem(&lavapipe).is_none());
     }
 
     #[test]

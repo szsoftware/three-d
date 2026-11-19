@@ -76,3 +76,84 @@ impl Drop for DeviceCapture {
         let _ = Function::new_with_args("sink", RESTORE).call1(&JsValue::NULL, &self.sink);
     }
 }
+
+///
+/// The power preference with which the browser offers a WebGPU adapter on the graphics card, `None` if it offers only
+/// software ones (SwiftShader, llvmpipe) or no WebGPU at all. The adapter without a preference comes first; browsers
+/// that know several adapters can give a software one there (Chrome with `--enable-unsafe-webgpu` on a laptop whose
+/// graphics card Chrome does not list as safe), and one on the graphics card for "low-power" or "high-performance".
+/// wgpu does not pass on whether an adapter is a fallback, so the browser is asked directly.
+///
+pub(crate) async fn hardware_power_preference() -> Option<wgpu::PowerPreference> {
+    for preference in [
+        wgpu::PowerPreference::None,
+        wgpu::PowerPreference::LowPower,
+        wgpu::PowerPreference::HighPerformance,
+    ] {
+        match adapter_is_software(preference).await {
+            Some(false) => return Some(preference),
+            Some(true) => {}
+            None => return None,
+        }
+    }
+    None
+}
+
+/// Whether the adapter the browser gives for the preference is a software one, `None` if it gives none.
+async fn adapter_is_software(preference: wgpu::PowerPreference) -> Option<bool> {
+    use wasm_bindgen::JsCast;
+    let get = |object: &JsValue, key: &str| Reflect::get(object, &JsValue::from_str(key)).ok();
+    let navigator = get(&js_sys::global(), "navigator")?;
+    let gpu = get(&navigator, "gpu").filter(|g| g.is_object())?;
+    let request = get(&gpu, "requestAdapter").and_then(|f| f.dyn_into::<Function>().ok())?;
+    let options = js_sys::Object::new();
+    let name = match preference {
+        wgpu::PowerPreference::LowPower => Some("low-power"),
+        wgpu::PowerPreference::HighPerformance => Some("high-performance"),
+        wgpu::PowerPreference::None => None,
+    };
+    if let Some(name) = name {
+        Reflect::set(
+            &options,
+            &JsValue::from_str("powerPreference"),
+            &JsValue::from_str(name),
+        )
+        .ok()?;
+    }
+    let promise = request
+        .call1(&gpu, &options)
+        .ok()?
+        .dyn_into::<js_sys::Promise>()
+        .ok()?;
+    let adapter = wasm_bindgen_futures::JsFuture::from(promise).await.ok()?;
+    if !adapter.is_object() {
+        return None;
+    }
+    let info = get(&adapter, "info").filter(|i| i.is_object());
+    let flag = |object: Option<&JsValue>| {
+        object
+            .and_then(|o| get(o, "isFallbackAdapter"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    };
+    let text = |key: &str| {
+        info.as_ref()
+            .and_then(|i| get(i, key))
+            .and_then(|a| a.as_string())
+            .unwrap_or_default()
+            .to_lowercase()
+    };
+    let names = format!(
+        "{} {} {}",
+        text("vendor"),
+        text("architecture"),
+        text("description")
+    );
+    Some(
+        flag(info.as_ref())
+            || flag(Some(&adapter))
+            || ["swiftshader", "llvmpipe", "lavapipe", "softpipe"]
+                .iter()
+                .any(|software| names.contains(software)),
+    )
+}
