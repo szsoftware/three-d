@@ -574,6 +574,8 @@ impl RaytracePreview {
                 return;
             }
         }
+        #[cfg(feature = "wgpu")]
+        let start = crate::compute::timing::now();
         let (engine, texture) = Self::engine(
             &self.context,
             tracer,
@@ -582,6 +584,23 @@ impl RaytracePreview {
             &self.settings,
             self.gpu_scale,
         );
+        #[cfg(feature = "wgpu")]
+        if let (true, Engine::Gpu { tracer, image }) = (crate::compute::timing::enabled(), &engine)
+        {
+            use crate::compute::timing;
+            timing::log(&format!(
+                "preview made its GPU image {}x{} in {:.0} ms on the CPU",
+                image.width(),
+                image.height(),
+                timing::now() - start
+            ));
+            tracer.gpu().queue.submit([]);
+            timing::when_gpu_done(
+                &tracer.gpu().queue,
+                start,
+                "the preview's GPU image".to_owned(),
+            );
+        }
         self.pace = Pace::default();
         let old_engine = std::mem::replace(&mut self.engine, engine);
         let old_texture = std::mem::replace(&mut self.texture, texture);

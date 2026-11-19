@@ -16,7 +16,7 @@ use three_d::wgpu as w;
 #[cfg(target_arch = "wasm32")]
 mod browser;
 mod denoise_gpu;
-mod timing;
+pub(crate) mod timing;
 use three_d_asset::prelude::*;
 use three_d_asset::ProjectionType;
 pub use timing::set_gpu_timing_log;
@@ -446,12 +446,27 @@ impl ComputeTracer {
         // The number of the call if it is logged
         let timed =
             (timing::enabled() && self.timed_calls < TIMED_CALLS).then_some(self.timed_calls + 1);
+        if let Some(call) = timed {
+            // What was queued before this call, by the tracer or the application (textures, frames, the image)
+            self.gpu.queue.submit([]);
+            timing::when_gpu_done(
+                &self.gpu.queue,
+                start,
+                format!("trace call {call}, work queued before it"),
+            );
+        }
         self.prepare(scene)?;
-        if timed.is_some() {
+        if let Some(call) = timed {
             timing::log(&format!(
                 "scene prepared (structures built and uploaded) in {:.0} ms on the CPU",
                 timing::now() - start
             ));
+            self.gpu.queue.submit([]);
+            timing::when_gpu_done(
+                &self.gpu.queue,
+                start,
+                format!("trace call {call}, scene structures"),
+            );
         }
         if scene.has_media() {
             if let Some(why) = self.media_problem() {

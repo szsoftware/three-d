@@ -16,12 +16,12 @@ pub fn set_gpu_timing_log(on: bool) {
     ON.store(on, Ordering::Relaxed);
 }
 
-pub(super) fn enabled() -> bool {
+pub(crate) fn enabled() -> bool {
     ON.load(Ordering::Relaxed)
 }
 
 /// Milliseconds since some moment, for differences.
-pub(super) fn now() -> f64 {
+pub(crate) fn now() -> f64 {
     #[cfg(target_arch = "wasm32")]
     return js_sys::Date::now();
     #[cfg(not(target_arch = "wasm32"))]
@@ -36,7 +36,7 @@ pub(super) fn now() -> f64 {
     }
 }
 
-pub(super) fn log(message: &str) {
+pub(crate) fn log(message: &str) {
     #[cfg(target_arch = "wasm32")]
     console_log(&format!("three-d-raytrace: {message}"));
     #[cfg(not(target_arch = "wasm32"))]
@@ -51,7 +51,7 @@ extern "C" {
 }
 
 /// Logs when the GPU has done all work queued so far, with the time since `start`.
-pub(super) fn when_gpu_done(queue: &three_d::wgpu::Queue, start: f64, what: String) {
+pub(crate) fn when_gpu_done(queue: &three_d::wgpu::Queue, start: f64, what: String) {
     queue.on_submitted_work_done(move || {
         log(&format!("{what}: GPU done after {:.0} ms", now() - start))
     });
