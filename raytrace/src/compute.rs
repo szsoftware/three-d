@@ -14,8 +14,10 @@ use three_d::wgpu as w;
 #[cfg(target_arch = "wasm32")]
 mod browser;
 mod denoise_gpu;
+mod timing;
 use three_d_asset::prelude::*;
 use three_d_asset::ProjectionType;
+pub use timing::set_gpu_timing_log;
 
 /// Size of a workgroup in both directions, as in the shaders.
 const WORKGROUP: u32 = 8;
@@ -142,7 +144,12 @@ pub struct ComputeTracer {
     /// [ComputeTracer::unfinished_calls]
     #[cfg(target_arch = "wasm32")]
     unfinished: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Calls of [ComputeTracer::trace_gpu] logged so far, see [set_gpu_timing_log]
+    timed_calls: u32,
 }
+
+/// The first calls of [ComputeTracer::trace_gpu] that [set_gpu_timing_log] logs.
+const TIMED_CALLS: u32 = 8;
 
 /// Submissions of the tracer the GPU may have queued at once; the tracer waits for the oldest before it adds another.
 /// GPUs that can not interrupt compute work (Intel graphics of the 7th generation) run everything queued before the
@@ -260,6 +267,7 @@ impl ComputeTracer {
             warm: None,
             #[cfg(target_arch = "wasm32")]
             unfinished: Default::default(),
+            timed_calls: 0,
         }
     }
 
@@ -294,16 +302,30 @@ impl ComputeTracer {
                 Some(device) => {
                     let info = context.wgpu_adapter_info()?;
                     let media = crate::media_problem(&info).is_none();
-                    Some(
-                        browser::compile(&device, media, &pipeline_constants(&info))
-                            .await
-                            .ok()?,
-                    )
+                    let start = timing::now();
+                    let compiled =
+                        browser::compile(&device, media, &pipeline_constants(&info)).await;
+                    if timing::enabled() {
+                        timing::log(&format!(
+                            "createComputePipelineAsync of the tracer and denoiser took {:.0} ms ({})",
+                            timing::now() - start,
+                            if compiled.is_ok() { "compiled" } else { "failed" }
+                        ));
+                    }
+                    Some(compiled.ok()?)
                 }
                 None => None,
             };
+            let start = timing::now();
             let mut tracer = Self::from_context(context)?;
             tracer.warm = warm;
+            if timing::enabled() {
+                timing::log(&format!(
+                    "made the tracer's pipelines with wgpu in {:.0} ms on the CPU",
+                    timing::now() - start
+                ));
+                timing::when_gpu_done(&tracer.gpu.queue, start, "making the tracer".to_owned());
+            }
             Some(tracer)
         }
         #[cfg(not(target_arch = "wasm32"))]
@@ -379,8 +401,24 @@ impl ComputeTracer {
             return Err(RtError::Gpu(format!("the GPU failed: {error}")));
         }
         let scopes = ErrorScopes::push(&self.gpu.device);
+        let start = timing::now();
         let result = self.trace_gpu_watched(scene, camera, image, settings);
         scopes.pop_into(&self.errors);
+        if timing::enabled() && self.timed_calls < TIMED_CALLS {
+            self.timed_calls += 1;
+            let what = format!(
+                "trace call {} at {}x{}, {} sample(s)",
+                self.timed_calls,
+                image.width,
+                image.height,
+                settings.samples_per_call.max(1)
+            );
+            timing::log(&format!(
+                "{what}: {:.0} ms on the CPU",
+                timing::now() - start
+            ));
+            timing::when_gpu_done(&self.gpu.queue, start, what);
+        }
         result
     }
 
@@ -391,7 +429,14 @@ impl ComputeTracer {
         image: &mut GpuRenderImage,
         settings: &TraceSettings,
     ) -> Result<(), RtError> {
+        let start = timing::now();
         self.prepare(scene)?;
+        if timing::enabled() && self.timed_calls < TIMED_CALLS {
+            timing::log(&format!(
+                "scene prepared (structures built and uploaded) in {:.0} ms on the CPU",
+                timing::now() - start
+            ));
+        }
         if scene.has_media() {
             if let Some(why) = self.media_problem() {
                 return Err(RtError::Gpu(why));
