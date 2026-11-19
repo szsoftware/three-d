@@ -6,6 +6,7 @@ use crate::ies::luminaire_angles;
 use crate::lens::Lens;
 use crate::light::*;
 use crate::medium::*;
+use crate::nesting::{Inside, Solid};
 use crate::photons::*;
 use crate::render_image::FEATURE_WORDS;
 use crate::sampling::*;
@@ -258,7 +259,9 @@ impl CpuReferenceTracer {
             height: render_image.height(),
             first_sample,
             caustics: None,
+            camera_inside: Inside::AIR,
         };
+        context.camera_inside = context.inside_at(camera.position());
         if settings.caustic_photons > 0 {
             if shoot {
                 let map = context.shoot_photons(first_sample);
@@ -424,6 +427,8 @@ struct PathContext<'a> {
     first_sample: u32,
     /// Photons through glass of this call, if caustics are on and photons landed.
     caustics: Option<std::sync::Arc<PhotonMap>>,
+    /// The solids the camera is in, such as smoke or water
+    camera_inside: Inside,
 }
 
 /// The surface at a hit, in world space.
@@ -437,16 +442,6 @@ struct Surface {
     front_face: bool,
     /// The material with its textures applied at the hit.
     material: RtMaterial,
-}
-
-/// Where a ray travels: in the air with the scene's fog, or inside a solid with its medium.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Inside {
-    Air,
-    Solid {
-        instance: u32,
-        medium: Option<RtMedium>,
-    },
 }
 
 /// What scatters light towards `v`: a surface or a medium.
@@ -490,16 +485,14 @@ impl Scatterer<'_> {
     }
 }
 
-/// Signed sums of the boundary hits of one solid along a shadow ray, to know how far the ray runs inside it.
-struct Crossings {
-    instance: u32,
-    medium: Option<RtMedium>,
-    /// Hits leaving minus hits entering
-    exits: i32,
-    /// Distances of the hits leaving minus of those entering
-    distance: f32,
-    /// The same for the depth of the fog
-    fog_depth: f32,
+/// A surface of a solid along a shadow ray.
+struct ShadowCrossing {
+    t: f32,
+    solid: Solid,
+    front_face: bool,
+    cos_i: f32,
+    /// Base color times transmission of the material at the hit.
+    color: Vec3,
 }
 
 impl PathContext<'_> {
@@ -568,7 +561,9 @@ impl PathContext<'_> {
         let mut glass_bent = false;
         let caustics = self.settings.caustic_photons > 0;
         let media = self.scene.has_media();
-        let mut inside = Inside::Air;
+        let mut inside = self.camera_inside;
+        // The solid just left and how close to the exit its surfaces do not count, for surfaces touching it
+        let mut skip = None;
         // Boundaries of media passed, which do not count as bounces
         let mut invisible = false;
         let mut passed = 0;
@@ -578,9 +573,13 @@ impl PathContext<'_> {
             let max_distance = light_hit
                 .as_ref()
                 .map_or(f32::INFINITY, |(_, h)| h.distance);
-            let hit = self
-                .accel
-                .intersect(self.scene, origin, direction, max_distance);
+            let hit = self.accel.intersect_skipping(
+                self.scene,
+                origin,
+                direction,
+                max_distance,
+                skip.take(),
+            );
             if media {
                 let end = hit.as_ref().map_or(max_distance, |h| h.t);
                 let (scattered, weight) = self.sample_medium(inside, origin, direction, end, rng);
@@ -667,6 +666,20 @@ impl PathContext<'_> {
             };
             let surface = self.surface(&hit, direction);
             let m = &surface.material;
+            let solid = Solid::of(hit.instance, m);
+            if let Some(solid) = solid {
+                let (after, boundary) = inside.cross(solid, surface.front_face);
+                if !boundary.seen {
+                    // Inside a solid of higher priority, or touching another: not there for light
+                    inside = after;
+                    (origin, skip) = past(&surface, hit.instance, direction);
+                    passed += 1;
+                    if passed > 64 {
+                        break;
+                    }
+                    continue;
+                }
+            }
             if bounce == 0 && passed == 0 {
                 *first = FirstHit::at(&surface, hit.t);
             }
@@ -682,11 +695,13 @@ impl PathContext<'_> {
             }
 
             if m.transmission > 0.0 && rng.next_f32() < m.transmission {
-                // Smooth glass: reflect or pass, chosen by the Fresnel term
-                let eta = if m.thin_walled || surface.front_face {
-                    m.index_of_refraction
-                } else {
-                    1.0 / m.index_of_refraction
+                // Smooth glass: reflect or pass, chosen by the Fresnel term; solids from the medium around them
+                let (after, eta) = match solid {
+                    Some(solid) => {
+                        let (after, boundary) = inside.cross(solid, surface.front_face);
+                        (after, boundary.eta)
+                    }
+                    None => (inside, m.index_of_refraction),
                 };
                 let cos_i = n.dot(v).clamp(0.0, 1.0);
                 let refracted = if m.thin_walled {
@@ -697,21 +712,16 @@ impl PathContext<'_> {
                 match refracted {
                     Some(refracted) if rng.next_f32() >= fresnel_dielectric(cos_i, eta) => {
                         // The boundary of a medium is no bounce, it is not seen
-                        invisible = media && !m.thin_walled && !bends_light(m);
+                        invisible = media && !m.thin_walled && eta == 1.0;
                         throughput = mul(throughput, m.base_color);
-                        if !m.thin_walled {
+                        if m.thin_walled {
+                            origin = offset(surface.position, -ng);
+                        } else {
                             direction = refracted;
-                            glass_bent |= bends_light(m);
-                            inside = if surface.front_face {
-                                Inside::Solid {
-                                    instance: hit.instance,
-                                    medium: m.medium,
-                                }
-                            } else {
-                                Inside::Air
-                            };
+                            glass_bent |= eta != 1.0;
+                            inside = after;
+                            (origin, skip) = past(&surface, hit.instance, direction);
                         }
-                        origin = offset(surface.position, -ng);
                     }
                     _ => {
                         // Reflected, also all of it inside the glass
@@ -787,10 +797,31 @@ impl PathContext<'_> {
 
     /// The medium the ray is in and how its density goes along the ray: fog, or homogeneous inside solids.
     fn medium_at(&self, inside: Inside) -> Option<(RtMedium, Option<&RtFog>)> {
-        match inside {
-            Inside::Air => self.scene.fog().map(|f| (f.medium, Some(f))),
-            Inside::Solid { medium, .. } => medium.filter(|m| !m.is_clear()).map(|m| (m, None)),
+        if inside.is_air() {
+            self.scene.fog().map(|f| (f.medium, Some(f)))
+        } else {
+            inside.medium().filter(|m| !m.is_clear()).map(|m| (m, None))
         }
+    }
+
+    ///
+    /// The solids that contain a point, such as the camera in smoke or under water: from the surfaces of solids a ray
+    /// from it to infinity hits.
+    ///
+    fn inside_at(&self, p: Vec3) -> Inside {
+        let direction = vec3(0.267, 0.873, 0.408).normalize();
+        let mut hits = Vec::new();
+        self.accel
+            .for_each_hit(self.scene, p, direction, f32::INFINITY, |hit| {
+                let instance = &self.scene.instances()[hit.instance as usize];
+                let m = &self.scene.materials()[instance.material.0 as usize];
+                if let Some(solid) = Solid::of(hit.instance, m) {
+                    hits.push((hit.t, solid, self.surface(hit, direction).front_face));
+                }
+                false
+            });
+        hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+        Inside::of_point(hits.into_iter().map(|(_, s, front)| (s, front)))
     }
 
     ///
@@ -913,12 +944,16 @@ impl PathContext<'_> {
     ) {
         let mut bent = false;
         let media = self.scene.has_media();
-        let mut inside = Inside::Air;
-        for _ in 0..self.settings.max_bounces.max(1) + 8 {
-            let Some(hit) = self
-                .accel
-                .intersect(self.scene, origin, direction, f32::INFINITY)
-            else {
+        let mut inside = Inside::AIR;
+        let mut skip = None;
+        for _ in 0..self.settings.max_bounces.max(1) + 72 {
+            let Some(hit) = self.accel.intersect_skipping(
+                self.scene,
+                origin,
+                direction,
+                f32::INFINITY,
+                skip.take(),
+            ) else {
                 return;
             };
             if media {
@@ -930,6 +965,19 @@ impl PathContext<'_> {
             }
             let surface = self.surface(&hit, direction);
             let m = &surface.material;
+            let solid = Solid::of(hit.instance, m);
+            let (after, boundary) = match solid {
+                Some(solid) => {
+                    let (after, boundary) = inside.cross(solid, surface.front_face);
+                    (after, Some(boundary))
+                }
+                None => (inside, None),
+            };
+            if boundary.is_some_and(|b| !b.seen) {
+                inside = after;
+                (origin, skip) = past(&surface, hit.instance, direction);
+                continue;
+            }
             let v = -direction;
             let ng = surface.geometric_normal;
             let mut n = surface.shading_normal;
@@ -938,11 +986,7 @@ impl PathContext<'_> {
             }
             if m.transmission > 0.0 && rng.next_f32() < m.transmission {
                 // The same choices as the paths from the camera
-                let eta = if m.thin_walled || surface.front_face {
-                    m.index_of_refraction
-                } else {
-                    1.0 / m.index_of_refraction
-                };
+                let eta = boundary.map_or(m.index_of_refraction, |b| b.eta);
                 let cos_i = n.dot(v).clamp(0.0, 1.0);
                 let refracted = if m.thin_walled {
                     Some(direction)
@@ -952,19 +996,14 @@ impl PathContext<'_> {
                 match refracted {
                     Some(refracted) if rng.next_f32() >= fresnel_dielectric(cos_i, eta) => {
                         power = mul(power, m.base_color);
-                        if !m.thin_walled {
+                        if m.thin_walled {
+                            origin = offset(surface.position, -ng);
+                        } else {
                             direction = refracted;
-                            bent |= bends_light(m);
-                            inside = if surface.front_face {
-                                Inside::Solid {
-                                    instance: hit.instance,
-                                    medium: m.medium,
-                                }
-                            } else {
-                                Inside::Air
-                            };
+                            bent |= eta != 1.0;
+                            inside = after;
+                            (origin, skip) = past(&surface, hit.instance, direction);
                         }
-                        origin = offset(surface.position, -ng);
                     }
                     _ => {
                         direction = reflect(v, n);
@@ -1229,19 +1268,10 @@ impl PathContext<'_> {
         inside: Inside,
     ) -> Vec3 {
         let mut t = vec3(1.0, 1.0, 1.0);
-        let media = self.scene.has_media();
         let fog = self.scene.fog();
         let fog_depth = |d: f32| fog.map_or(0.0, |f| f.depth(origin, direction, d));
-        let mut solids: Vec<Crossings> = Vec::new();
-        if let Inside::Solid { instance, medium } = inside {
-            solids.push(Crossings {
-                instance,
-                medium,
-                exits: 0,
-                distance: 0.0,
-                fog_depth: 0.0,
-            });
-        }
+        // Surfaces of solids in the order along the ray, which counts where solids overlap
+        let mut crossings: Vec<ShadowCrossing> = Vec::new();
         self.accel
             .for_each_hit(self.scene, origin, direction, distance, |hit| {
                 let instance = &self.scene.instances()[hit.instance as usize];
@@ -1253,60 +1283,81 @@ impl PathContext<'_> {
                 let s = self.surface(hit, direction);
                 let m = &s.material;
                 let cos_i = s.geometric_normal.dot(-direction).clamp(0.0, 1.0);
-                let f = fresnel_dielectric(cos_i, m.index_of_refraction);
-                t = mul(t, m.base_color * (m.transmission * (1.0 - f)));
-                if media && !m.thin_walled {
-                    let sign = if s.front_face { -1 } else { 1 };
-                    let index = match solids.iter().position(|c| c.instance == hit.instance) {
-                        Some(index) => index,
-                        None => {
-                            solids.push(Crossings {
-                                instance: hit.instance,
-                                medium: m.medium,
-                                exits: 0,
-                                distance: 0.0,
-                                fog_depth: 0.0,
-                            });
-                            solids.len() - 1
-                        }
-                    };
-                    let c = &mut solids[index];
-                    c.exits += sign;
-                    c.distance += sign as f32 * hit.t;
-                    c.fog_depth += sign as f32 * fog_depth(hit.t);
+                let color = m.base_color * m.transmission;
+                match Solid::of(hit.instance, m) {
+                    Some(solid) => crossings.push(ShadowCrossing {
+                        t: hit.t,
+                        solid,
+                        front_face: s.front_face,
+                        cos_i,
+                        color,
+                    }),
+                    None => {
+                        t = mul(
+                            t,
+                            color * (1.0 - fresnel_dielectric(cos_i, m.index_of_refraction)),
+                        )
+                    }
                 }
                 t.x.max(t.y).max(t.z) <= 0.0
             });
-        if !media || t == vec3(0.0, 0.0, 0.0) {
+        if t == vec3(0.0, 0.0, 0.0) {
             return t;
         }
-        // Inside each solid from its entries to its exits, and to the end if the ray ends inside
-        let mut fog_inside = 0.0;
+        crossings.sort_by(|a, b| a.t.total_cmp(&b.t));
         let mut depth = vec3(0.0, 0.0, 0.0);
-        for c in &solids {
-            let started_inside =
-                matches!(inside, Inside::Solid { instance, .. } if instance == c.instance);
-            let ends_inside = i32::from(started_inside) - c.exits > 0;
-            let (length, fog_part) = if ends_inside {
-                if distance.is_infinite() {
-                    // Open meshes: the medium does not end
-                    return vec3(0.0, 0.0, 0.0);
-                }
-                (c.distance + distance, c.fog_depth + fog_depth(distance))
+        // The light lost between two distances where the ray is
+        let segment = |inside: &Inside, from: f32, to: f32| -> Vec3 {
+            if inside.is_air() {
+                fog.map_or(vec3(0.0, 0.0, 0.0), |f| {
+                    f.medium.extinction() * (fog_depth(to) - fog_depth(from)).max(0.0)
+                })
             } else {
-                (c.distance, c.fog_depth)
-            };
-            if let Some(m) = c.medium {
-                depth += m.extinction() * length.max(0.0);
+                inside.medium().map_or(vec3(0.0, 0.0, 0.0), |m| {
+                    m.extinction() * (to - from).max(0.0)
+                })
             }
-            fog_inside += fog_part.max(0.0);
+        };
+        let mut inside = inside;
+        let mut from = 0.0;
+        for c in &crossings {
+            depth += segment(&inside, from, c.t);
+            let (after, boundary) = inside.cross(c.solid, c.front_face);
+            if boundary.seen {
+                // A shadow ray goes straight, so the reflection is the same both ways through a surface
+                let eta = if boundary.eta < 1.0 {
+                    1.0 / boundary.eta
+                } else {
+                    boundary.eta
+                };
+                t = mul(t, c.color * (1.0 - fresnel_dielectric(c.cos_i, eta)));
+            }
+            inside = after;
+            from = c.t;
         }
-        if let Some(f) = fog {
-            let total = fog_depth(distance);
-            if total.is_infinite() {
-                return vec3(0.0, 0.0, 0.0);
-            }
-            depth += f.medium.extinction() * (total - fog_inside).max(0.0);
+        if distance.is_infinite() {
+            // Open meshes and fog that does not thin out: the medium does not end
+            let open = |s: f32| if s > 0.0 { 0.0 } else { 1.0 };
+            let sigma = if inside.is_air() {
+                match fog {
+                    Some(f) if fog_depth(f32::INFINITY).is_infinite() => f.medium.extinction(),
+                    _ => vec3(0.0, 0.0, 0.0),
+                }
+            } else {
+                inside
+                    .medium()
+                    .map_or(vec3(0.0, 0.0, 0.0), |m| m.extinction())
+            };
+            t = mul(t, vec3(open(sigma.x), open(sigma.y), open(sigma.z)));
+        }
+        depth += segment(&inside, from, distance);
+        if !(depth.x.is_finite() && depth.y.is_finite() && depth.z.is_finite()) {
+            let keep = |d: f32| if d.is_finite() { 1.0 } else { 0.0 };
+            depth = vec3(
+                keep(depth.x) * depth.x,
+                keep(depth.y) * depth.y,
+                keep(depth.z) * depth.z,
+            );
         }
         mul(t, exp_neg(depth))
     }
@@ -1373,6 +1424,17 @@ fn tangent_frame(
 fn offset(p: Vec3, n: Vec3) -> Vec3 {
     let scale = 1.0f32.max(p.x.abs()).max(p.y.abs()).max(p.z.abs());
     p + n * (1e-4 * scale)
+}
+
+///
+/// Where a ray goes on after it passed a surface of a solid, with the solid's surfaces skipped close to that point: a
+/// little before the surface on the new way, so that another surface touching it there (a pane of glass lying on the
+/// floor) is hit and not jumped over.
+///
+fn past(surface: &Surface, instance: u32, direction: Vec3) -> (Vec3, Option<(u32, f32)>) {
+    let p = surface.position;
+    let gap = 1e-4 * 1.0f32.max(p.x.abs()).max(p.y.abs()).max(p.z.abs());
+    (p - direction * gap, Some((instance, 2.0 * gap)))
 }
 
 fn reflect(v: Vec3, n: Vec3) -> Vec3 {

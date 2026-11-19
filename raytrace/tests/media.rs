@@ -326,3 +326,209 @@ fn white_fog_over_the_scene_in_a_white_world_disappears() {
         assert!((l - 1000.0).abs() < 20.0, "{name}: {l}");
     }
 }
+
+/// A box from -size to size filled with an absorbing medium that light passes unbent.
+fn add_absorbing_box(scene: &mut RtScene, absorption: Vec3, size: f32, priority: u32) {
+    let material = scene.add_material(RtMaterial {
+        medium_priority: priority,
+        ..RtMaterial::medium_boundary(RtMedium {
+            absorption,
+            scattering: vec3(0.0, 0.0, 0.0),
+            anisotropy: 0.0,
+        })
+    });
+    let cube = scene.add_mesh(&CpuMesh::cube()).unwrap();
+    scene
+        .add_instance(cube, material, Mat4::from_scale(size))
+        .unwrap();
+}
+
+#[test]
+fn a_camera_inside_smoke_sees_through_it() {
+    let mut scene = empty(1000.0);
+    let sigma = vec3(0.2, 0.5, 1.0);
+    add_absorbing_box(&mut scene, sigma, 1.0, 0);
+    // From the middle along -z: 1 m to the wall
+    let camera = Camera::new_orthographic(
+        Viewport::new_at_origo(4, 4),
+        vec3(0.0, 0.0, 0.0),
+        vec3(0.0, 0.0, -1.0),
+        vec3(0.0, 1.0, 0.0),
+        0.05,
+        0.01,
+        100.0,
+    );
+    let expected = vec3((-sigma.x).exp(), (-sigma.y).exp(), (-sigma.z).exp()) * 1000.0;
+    for (name, mut tracer) in tracers() {
+        let mut image = RenderImage::new(4, 4);
+        tracer
+            .trace(&scene, &camera, &mut image, &TraceSettings::default())
+            .unwrap();
+        let p = image.pixel(1, 1);
+        let l = vec3(p.x, p.y, p.z);
+        assert!(
+            (l - expected).magnitude() < 0.01 * expected.magnitude(),
+            "{name}: {l:?} {expected:?}"
+        );
+    }
+}
+
+#[test]
+fn ice_in_water_by_priority() {
+    // A cube of water 2 m wide with one of ice 1 m wide in it, seen through the middle
+    let (water, ice) = (vec3(0.4, 0.1, 0.1), vec3(0.1, 0.1, 0.6));
+    for (ice_priority, expected_depth) in [
+        // The ice wins: 1 m of water, 1 m of ice
+        (1, water + ice),
+        // The water wins: the ice is not there
+        (0, water * 2.0),
+    ] {
+        let mut scene = empty(1000.0);
+        add_absorbing_box(
+            &mut scene,
+            water,
+            1.0,
+            if ice_priority == 1 { 0 } else { 1 },
+        );
+        add_absorbing_box(&mut scene, ice, 0.5, ice_priority);
+        let expected = vec3(
+            (-expected_depth.x).exp(),
+            (-expected_depth.y).exp(),
+            (-expected_depth.z).exp(),
+        ) * 1000.0;
+        for (name, mut tracer) in tracers() {
+            let l = through_the_middle(tracer.as_mut(), &scene, 0.2, 4, 4);
+            assert!(
+                (l - expected).magnitude() < 0.01 * expected.magnitude(),
+                "{name} ice priority {ice_priority}: {l:?} {expected:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_shadow_of_ice_in_water() {
+    // The boxes 2 m over a white floor in the sun from straight above, the floor seen from below the boxes
+    let (water, ice) = (vec3(0.3, 0.1, 0.1), vec3(0.1, 0.1, 0.5));
+    let floor_under = |boxes: bool| {
+        let mut scene = empty(0.0);
+        scene.add_light(RtLight::Directional {
+            direction: vec3(0.0, -1.0, 0.0),
+            color: vec3(1.0, 1.0, 1.0),
+            illuminance: 10_000.0,
+        });
+        let white = scene.add_material(RtMaterial::diffuse(vec3(0.8, 0.8, 0.8)));
+        let square = scene.add_mesh(&CpuMesh::square()).unwrap();
+        scene
+            .add_instance(
+                square,
+                white,
+                Mat4::from_translation(vec3(0.0, -3.0, 0.0))
+                    * Mat4::from_angle_x(degrees(-90.0))
+                    * Mat4::from_scale(50.0),
+            )
+            .unwrap();
+        if boxes {
+            add_absorbing_box(&mut scene, water, 1.0, 0);
+            add_absorbing_box(&mut scene, ice, 0.5, 1);
+        }
+        scene
+    };
+    let camera = Camera::new_orthographic(
+        Viewport::new_at_origo(4, 4),
+        vec3(0.0, -1.5, 0.0),
+        vec3(0.0, -2.5, 0.0),
+        vec3(0.0, 0.0, -1.0),
+        0.1,
+        0.01,
+        10.0,
+    );
+    let expected = water + ice;
+    for (name, mut tracer) in tracers() {
+        let mut lit = [vec3(0.0, 0.0, 0.0); 2];
+        for (i, boxes) in [false, true].into_iter().enumerate() {
+            let mut image = RenderImage::new(4, 4);
+            let settings = TraceSettings {
+                samples_per_call: 4,
+                max_bounces: 1,
+                ..Default::default()
+            };
+            tracer
+                .trace(&floor_under(boxes), &camera, &mut image, &settings)
+                .unwrap();
+            let p = image.pixel(1, 1);
+            lit[i] = vec3(p.x, p.y, p.z);
+        }
+        let ratio = vec3(
+            lit[1].x / lit[0].x,
+            lit[1].y / lit[0].y,
+            lit[1].z / lit[0].z,
+        );
+        let want = vec3(
+            (-expected.x).exp(),
+            (-expected.y).exp(),
+            (-expected.z).exp(),
+        );
+        assert!(
+            (ratio - want).magnitude() < 0.01,
+            "{name}: {ratio:?} {want:?}"
+        );
+    }
+}
+
+#[test]
+fn a_pane_of_glass_lying_on_a_black_floor_does_not_let_the_light_through() {
+    // A white world above and below a black floor, a 2 cm pane of glass lying on it without a gap
+    let mut scene = empty(1000.0);
+    let black = scene.add_material(RtMaterial::diffuse(vec3(0.0, 0.0, 0.0)));
+    let square = scene.add_mesh(&CpuMesh::square()).unwrap();
+    scene
+        .add_instance(
+            square,
+            black,
+            Mat4::from_angle_x(degrees(-90.0)) * Mat4::from_scale(10.0),
+        )
+        .unwrap();
+    let glass = scene.add_material(RtMaterial {
+        thin_walled: false,
+        ..RtMaterial::glass()
+    });
+    let cube = scene.add_mesh(&CpuMesh::cube()).unwrap();
+    scene
+        .add_instance(
+            cube,
+            glass,
+            Mat4::from_translation(vec3(0.0, 0.01, 0.0))
+                * Mat4::from_nonuniform_scale(1.0, 0.01, 1.0),
+        )
+        .unwrap();
+    // Looking down a little from the side, so the view does not go straight back up
+    let camera = Camera::new_perspective(
+        Viewport::new_at_origo(16, 16),
+        vec3(0.0, 2.0, 1.0),
+        vec3(0.0, 0.0, 0.0),
+        vec3(0.0, 1.0, 0.0),
+        degrees(10.0),
+        0.01,
+        10.0,
+    );
+    for (name, mut tracer) in tracers() {
+        let mut image = RenderImage::new(16, 16);
+        let settings = TraceSettings {
+            samples_per_call: 16,
+            max_bounces: 8,
+            ..Default::default()
+        };
+        tracer
+            .trace(&scene, &camera, &mut image, &settings)
+            .unwrap();
+        let mut mean = 0.0;
+        for y in 0..16 {
+            for x in 0..16 {
+                mean += image.pixel(x, y).y / 256.0;
+            }
+        }
+        // Only the reflections of the glass, a few percent of the world
+        assert!(mean < 120.0, "{name}: {mean}");
+    }
+}
