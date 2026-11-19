@@ -20,6 +20,8 @@ pub(crate) struct GlBackend {
     /// What has to live as long as the context if this backend created it.
     #[allow(dead_code)]
     pub(super) keep_alive: Option<KeepAlive>,
+    /// Whether the graphics card was reset, which is only noticed if the context was created for it (see [reset]).
+    pub(crate) lost: Arc<reset::DeviceLost>,
 }
 
 ///
@@ -67,6 +69,7 @@ impl GlBackend {
                 vao,
                 screen: std::sync::Mutex::new(None),
                 keep_alive: None,
+                lost: Default::default(),
             }
         };
         Ok(backend)
@@ -628,6 +631,7 @@ fn read_size(rect: ScissorBox, format: ReadFormat) -> usize {
 #[cfg(not(target_arch = "wasm32"))]
 struct PendingRead {
     context: Arc<crate::context::Context>,
+    lost: Arc<reset::DeviceLost>,
     /// `None` when the pixels have been handed out.
     resources: Option<(crate::context::Buffer, crate::context::Fence)>,
     /// Where the pixels go.
@@ -676,6 +680,8 @@ impl std::future::Future for PendingRead {
             self.resources = None;
             context.delete_buffer(buffer);
             context.delete_sync(fence);
+            // A lost context does nothing and reports every fence as signaled
+            self.lost.panic_if_lost();
             std::task::Poll::Ready(storage)
         }
     }
@@ -723,6 +729,8 @@ impl GlBackend {
                 destination,
             );
         }
+        // Pixels of a context that is lost are not what was drawn
+        self.lost.panic_if_lost();
     }
 }
 
@@ -860,9 +868,14 @@ impl BackendApi for GlBackend {
     }
 
     fn error_check(&self) -> Result<(), CoreError> {
+        self.lost.error()?;
         self.framebuffer_check()?;
         unsafe {
             let e = self.context.get_error();
+            if e == reset::CONTEXT_LOST {
+                self.lost.lose("the OpenGL context was lost");
+                self.lost.error()?;
+            }
             if e != crate::context::NO_ERROR {
                 Err(CoreError::ContextError(
                     match e {
@@ -882,6 +895,10 @@ impl BackendApi for GlBackend {
             }
         }
         Ok(())
+    }
+
+    fn is_lost(&self) -> bool {
+        self.lost.check().is_some()
     }
 
     fn max_samples(&self) -> u32 {
@@ -1260,6 +1277,7 @@ impl BackendApi for GlBackend {
             assert_eq!(storage.bytes().len(), size);
             Box::pin(PendingRead {
                 context: self.context.clone(),
+                lost: self.lost.clone(),
                 resources: Some((buffer, fence)),
                 storage: Some(storage),
             })

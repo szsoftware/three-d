@@ -20,6 +20,7 @@ pub(crate) mod gl;
 pub(crate) mod gl_headless;
 #[cfg(test)]
 pub(crate) mod null;
+pub(crate) mod reset;
 #[cfg(feature = "wgpu")]
 pub(crate) mod wgpu;
 
@@ -484,6 +485,10 @@ pub(crate) trait BackendApi {
     fn set_blend(&self, blend: Blend);
     fn set_render_states(&self, render_states: RenderStates);
     fn error_check(&self) -> Result<(), CoreError>;
+    /// Whether the graphics device is lost, see [Context::is_lost].
+    fn is_lost(&self) -> bool {
+        false
+    }
     /// The maximum number of samples for multisample targets.
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     fn max_samples(&self) -> u32;

@@ -72,6 +72,8 @@ pub(crate) struct WgpuBackend {
     gl: bool,
     /// Whether the device can render into textures of 32 bit floats. If not, see [TextureEntry::bits].
     pub(super) float32_renderable: bool,
+    /// Whether the device is lost, see [Context::is_lost]. Only known for a device that the backend created.
+    lost: Arc<reset::DeviceLost>,
 }
 
 // The backend only holds handles and plain data behind a mutex, a panic cannot leave it in a state that is unsafe to observe.
@@ -130,6 +132,7 @@ struct TargetFormats {
 /// Pixels that are on their way from the GPU into memory.
 struct PendingRead {
     device: w::Device,
+    lost: Arc<reset::DeviceLost>,
     buffer: w::Buffer,
     /// Whether the buffer is mapped, and who waits for that.
     mapped: Arc<Mutex<(bool, Option<std::task::Waker>)>>,
@@ -161,9 +164,7 @@ impl PendingRead {
     /// Blocks until the pixels are there and writes them to the bytes.
     #[cfg(not(target_arch = "wasm32"))]
     fn wait_into(self, bytes: &mut [u8]) {
-        self.device
-            .poll(w::PollType::wait_indefinitely())
-            .expect("failed to wait for the GPU");
+        self.wait_for_gpu();
         self.finish_into(bytes);
     }
 
@@ -190,10 +191,18 @@ impl PendingRead {
     /// Blocks until the pixels are there, which is not possible in a browser.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     fn wait(self) -> Vec<u8> {
-        self.device
-            .poll(w::PollType::wait_indefinitely())
-            .expect("failed to wait for the GPU");
+        self.wait_for_gpu();
         self.finish()
+    }
+
+    /// Blocks until the GPU is done. Panics if the device is lost, since the pixels would not be the ones that were drawn.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    fn wait_for_gpu(&self) {
+        let result = self.device.poll(w::PollType::wait_indefinitely());
+        self.lost.panic_if_lost();
+        if let Err(error) = result {
+            panic!("failed to wait for the GPU: {error}");
+        }
     }
 }
 
@@ -206,6 +215,8 @@ impl PendingRead {
         if !self.mapped.lock().unwrap_or_else(|e| e.into_inner()).0 {
             let _ = self.device.poll(w::PollType::Poll);
         }
+        // The buffer of a lost device is never mapped, and on OpenGL it may be mapped with pixels that are not the ones that were drawn
+        self.lost.panic_if_lost();
         let mut mapped = self.mapped.lock().unwrap_or_else(|e| e.into_inner());
         if mapped.0 {
             std::task::Poll::Ready(())
@@ -435,6 +446,7 @@ impl WgpuBackend {
             errors: None,
             device,
             queue,
+            lost: Default::default(),
         }
     }
 
@@ -886,6 +898,7 @@ impl WgpuBackend {
         });
         PendingRead {
             device: self.device.clone(),
+            lost: self.lost.clone(),
             buffer,
             mapped,
             padded,
@@ -1585,6 +1598,13 @@ impl BackendApi for WgpuBackend {
     fn set_render_states(&self, _render_states: RenderStates) {}
 
     fn error_check(&self) -> Result<(), CoreError> {
+        if self.is_lost() {
+            if let Some(errors) = &self.errors {
+                // What fails on a lost device is not interesting
+                errors.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            }
+            return self.lost.error();
+        }
         // Without the list, the device was created by the user of the crate and reports errors to the handler set there (by default it panics)
         let Some(errors) = &self.errors else {
             return Ok(());
@@ -1595,6 +1615,15 @@ impl BackendApi for WgpuBackend {
         } else {
             Err(CoreError::ContextError(errors.join("\n")))
         }
+    }
+
+    fn is_lost(&self) -> bool {
+        // wgpu tells in a poll, which on OpenGL also asks the patched wgpu-hal whether the graphics card was reset
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.lost.reason().is_none() {
+            let _ = self.device.poll(w::PollType::Poll);
+        }
+        self.lost.reason().is_some()
     }
 
     fn max_samples(&self) -> u32 {

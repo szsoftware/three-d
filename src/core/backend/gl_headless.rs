@@ -3,10 +3,11 @@
 //!
 
 use super::gl::{GlBackend, KeepAlive};
+use super::reset::DeviceLost;
 use crate::core::CoreError;
 use glutin::api::egl::{context::PossiblyCurrentContext, device::Device, display::Display};
 use glutin::config::{ConfigSurfaceTypes, ConfigTemplateBuilder};
-use glutin::context::{ContextApi, ContextAttributesBuilder, Version};
+use glutin::context::{ContextApi, ContextAttributesBuilder, Robustness, Version};
 use glutin::prelude::*;
 use std::sync::Arc;
 
@@ -56,24 +57,30 @@ pub(crate) fn new(hardware_only: bool) -> Result<(GlBackend, bool), CoreError> {
     }
 }
 
-fn load(display: &Display) -> crate::context::Context {
-    unsafe {
-        crate::context::Context::from_loader_function(|name| match std::ffi::CString::new(name) {
-            Ok(name) => display.get_proc_address(&name) as *const _,
-            Err(_) => std::ptr::null(),
-        })
+fn proc_address(display: &Display, name: &str) -> *const std::ffi::c_void {
+    match std::ffi::CString::new(name) {
+        Ok(name) => display.get_proc_address(&name) as *const _,
+        Err(_) => std::ptr::null(),
     }
+}
+
+fn load(display: &Display) -> crate::context::Context {
+    unsafe { crate::context::Context::from_loader_function(|name| proc_address(display, name)) }
 }
 
 fn backend(
     (gl, context, display): (crate::context::Context, PossiblyCurrentContext, Display),
 ) -> Result<GlBackend, CoreError> {
+    // Safety: the context is current on this thread, where it is used
+    let lost = unsafe { DeviceLost::of_gl_context(&gl, |name| proc_address(&display, name)) };
     let mut backend = GlBackend::new(Arc::new(gl))?;
     backend.keep_alive = Some(KeepAlive(Box::new((context, display))));
+    backend.lost = Arc::new(lost);
     Ok(backend)
 }
 
 /// A current context without a surface on the device: OpenGL 3.3 or newer, otherwise OpenGL ES 3.0 or newer.
+/// The context is lost when the graphics card is reset, so the reset is noticed (see [super::reset]), if the driver can do that.
 fn create(device: &Device) -> Result<(PossiblyCurrentContext, Display), String> {
     let error = |e: glutin::error::Error| e.to_string();
     let display = unsafe { Display::with_device(device, None) }.map_err(error)?;
@@ -85,18 +92,21 @@ fn create(device: &Device) -> Result<(PossiblyCurrentContext, Display), String> 
         .next()
         .ok_or("the graphics device has no configuration without a surface")?;
     let mut result = Err("no context".to_string());
-    for api in [
+    'apis: for api in [
         ContextApi::OpenGl(Some(Version::new(3, 3))),
         ContextApi::Gles(Some(Version::new(3, 0))),
     ] {
-        let attributes = ContextAttributesBuilder::new()
-            .with_context_api(api)
-            .build(None);
-        result = unsafe { display.create_context(&config, &attributes) }
-            .and_then(|context| context.make_current_surfaceless())
-            .map_err(error);
-        if result.is_ok() {
-            break;
+        for robustness in [Robustness::RobustLoseContextOnReset, Robustness::NotRobust] {
+            let attributes = ContextAttributesBuilder::new()
+                .with_context_api(api)
+                .with_robustness(robustness)
+                .build(None);
+            result = unsafe { display.create_context(&config, &attributes) }
+                .and_then(|context| context.make_current_surfaceless())
+                .map_err(error);
+            if result.is_ok() {
+                break 'apis;
+            }
         }
     }
     Ok((result?, display))
@@ -266,6 +276,41 @@ mod tests {
             };
             check(context, multisample);
         }
+    }
+
+    #[test]
+    fn a_reset_is_noticed_where_the_driver_can() {
+        let Some(context) = context(Context::new_headless_gl_with_screen, false) else {
+            return;
+        };
+        let gl = context.gl_backend();
+        // Mesa can, so the context is lost on a reset
+        let renderer = unsafe {
+            use crate::context::HasContext;
+            gl.context.get_parameter_string(crate::context::RENDERER)
+        };
+        if renderer.contains("llvmpipe") {
+            assert!(gl.lost.notices_resets(), "{renderer}");
+        }
+        let screen = RenderTarget::screen(&context, WIDTH, HEIGHT);
+        render(&context, &screen, WIDTH, HEIGHT);
+        assert!(!context.is_lost());
+        context.error_check().unwrap();
+        // What a reset makes the backend notice
+        gl.lost
+            .lose(crate::core::backend::reset::reset_reason(0x8253));
+        assert!(context.is_lost());
+        assert!(context
+            .error_check()
+            .unwrap_err()
+            .to_string()
+            .contains("hang"));
+        assert!(context.submit_offscreen_screen().is_err());
+        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            screen.read_color::<[u8; 4]>()
+        }));
+        assert!(read.is_err());
+        context.programs.write().unwrap().clear();
     }
 
     #[test]

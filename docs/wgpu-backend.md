@@ -85,6 +85,29 @@ What stays different from wgpu on Vulkan:
 - `textureSize` of a texture array with one layer, or with square layers whose number is a multiple of six, reports one layer more than the array has.
 - With your own device (`Context::from_wgpu`) that draws with OpenGL, enable the `wgpu-gl` feature as well. Without it, cube maps are not filtered across their sides and the depth of a multisample target reads as 1.
 
+## Lost devices
+
+A graphics card can be reset while it works, for example when a draw or compute call takes so long that the driver thinks the card hangs (graphics cards without preemption of compute shaders, such as Intel Gen7, do that after a few seconds). Everything computed since may be wrong. `three-d` reports that instead of handing out wrong pixels:
+
+- `context.is_lost()` returns `true` from then on. It is cheap, call it after every frame, and after reading results that you computed with `context.as_wgpu()` yourself, since wgpu cannot tell your own readback that its data is wrong.
+- `context.error_check()` and `context.submit_offscreen_screen()` return an error that says the graphics device is lost.
+- Reading pixels (`read_color`, `read_depth`, the asynchronous variants) panics with the same message.
+- Nothing works on a lost context anymore. Create a new one.
+
+Where a reset is noticed:
+
+- wgpu on Vulkan, Metal and DirectX 12, for contexts that `three-d` created (wgpu itself reports the lost device there, also to your own `as_wgpu()` code).
+- **wgpu on top of OpenGL only with the patched wgpu-hal in `vendor/wgpu-hal`.** wgpu-hal creates its OpenGL contexts without reset notification, and such a context is never told about a reset: it goes on and returns wrong results without an error. The patch creates the context with `EGL_CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY = EGL_LOSE_CONTEXT_ON_RESET` where the driver supports it (EGL 1.5 or `EGL_EXT_create_context_robustness`, as Mesa does) and asks `glGetGraphicsResetStatus` after every submission and while waiting for the card, so wgpu reports a lost device as on Vulkan. This repository uses it, an application has to add the same entry to its own `Cargo.toml`, since cargo ignores the patches of dependencies:
+
+  ```toml
+  [patch.crates-io]
+  wgpu-hal = { git = "https://github.com/szsoftware/three-d", branch = "master" }
+  ```
+
+  Without that entry, everything works as before and resets on OpenGL stay unnoticed. EGL only (Linux, Android), not WGL on Windows. The patch is for wgpu-hal 29.0.4. The changes are marked with `Patched (three-d)`.
+- The OpenGL backend in a context without a window (`Context::new_headless_gl_with_screen`), which `three-d` creates with the same strategy where the driver can.
+- Every other OpenGL context (a window, `Context::from_gl_context`) only if it was created with that strategy (`GL_KHR_robustness`), and then once `context.error_check()` has seen `GL_CONTEXT_LOST`.
+
 ## What works
 
 Everything in the `core` and `renderer` modules, the window and the GUI:
