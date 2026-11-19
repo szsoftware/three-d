@@ -12,7 +12,6 @@ use crate::{
 use three_d::wgpu as w;
 
 mod denoise_gpu;
-use three_d::wgpu::util::DeviceExt;
 use three_d_asset::prelude::*;
 use three_d_asset::ProjectionType;
 
@@ -292,9 +291,10 @@ impl ComputeTracer {
             );
         }
 
-        let params = device.create_buffer_init(&w::util::BufferInitDescriptor {
-            label: Some("ray tracing parameters"),
-            contents: &params_bytes(
+        let params = filled_buffer(
+            &self.gpu,
+            "ray tracing parameters",
+            &params_bytes(
                 scene,
                 camera,
                 image.width,
@@ -302,8 +302,8 @@ impl ComputeTracer {
                 settings,
                 caustics.as_ref(),
             ),
-            usage: w::BufferUsages::UNIFORM,
-        });
+            w::BufferUsages::UNIFORM,
+        );
 
         // One entry per dispatch: a tile and the sample it adds
         let stride = TILE_BYTES.max(device.limits().min_uniform_buffer_offset_alignment as u64);
@@ -342,11 +342,12 @@ impl ComputeTracer {
                 }
             }
         }
-        let tile_buffer = device.create_buffer_init(&w::util::BufferInitDescriptor {
-            label: Some("ray tracing tiles"),
-            contents: &tile_data,
-            usage: w::BufferUsages::UNIFORM,
-        });
+        let tile_buffer = filled_buffer(
+            &self.gpu,
+            "ray tracing tiles",
+            &tile_data,
+            w::BufferUsages::UNIFORM,
+        );
 
         let bind_group = device.create_bind_group(&w::BindGroupDescriptor {
             label: Some("ray tracing"),
@@ -488,6 +489,27 @@ impl ComputeTracer {
     }
 }
 
+///
+/// A buffer with the bytes, written through the queue. Not mapped at creation: browsers refuse that for some sizes on
+/// some GPUs, and wgpu panics then.
+///
+fn filled_buffer(gpu: &GpuDevice, label: &str, bytes: &[u8], usage: w::BufferUsages) -> w::Buffer {
+    // Copies need a multiple of four bytes, and a binding at least one word
+    let size = (bytes.len() as u64).div_ceil(4).max(1) * 4;
+    let buffer = gpu.device.create_buffer(&w::BufferDescriptor {
+        label: Some(label),
+        size,
+        usage: usage | w::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    if !bytes.is_empty() {
+        let mut padded = bytes.to_vec();
+        padded.resize(size as usize, 0);
+        gpu.queue.write_buffer(&buffer, 0, &padded);
+    }
+    buffer
+}
+
 /// Submits work after waiting for the oldest submission when [MAX_SUBMISSIONS_IN_FLIGHT] may still run.
 fn submit(
     gpu: &GpuDevice,
@@ -536,7 +558,7 @@ impl Tracer for ComputeTracer {
             .is_some_and(|b| b.revision == scene.revision());
         if rebuilt || !current {
             self.buffers = Some(SceneBuffers::new(
-                &self.gpu.device,
+                &self.gpu,
                 scene,
                 self.accel.as_ref().expect("built"),
             ));
@@ -1100,7 +1122,8 @@ impl Words {
 }
 
 impl SceneBuffers {
-    fn new(device: &w::Device, scene: &RtScene, accel: &CpuAccel) -> Self {
+    fn new(gpu: &GpuDevice, scene: &RtScene, accel: &CpuAccel) -> Self {
+        let device = &gpu.device;
         let limits = device.limits();
         let max_bytes = limits
             .max_storage_buffer_binding_size
@@ -1300,11 +1323,7 @@ impl SceneBuffers {
         }
 
         let storage = |label, words: &Words| {
-            device.create_buffer_init(&w::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: &words.bytes(),
-                usage: w::BufferUsages::STORAGE,
-            })
+            filled_buffer(gpu, label, &words.bytes(), w::BufferUsages::STORAGE)
         };
         let texels = texel_words(scene.textures(), max_bytes);
         Self {
