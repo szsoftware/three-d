@@ -96,9 +96,20 @@ pub fn media_problem(info: &three_d::wgpu::AdapterInfo) -> Option<String> {
 ///
 /// Why the preview takes the CPU on a device that could trace on the GPU: on Intel graphics of the 7th generation with
 /// wgpu over OpenGL the shaders compile on the thread that draws, which holds the image for seconds, and the GPU
-/// tracer ends up no faster than the CPU there.
+/// tracer ends up no faster than the CPU there. In a browser on these chips: Chrome's Vulkan driver (Mesa's hasvk in
+/// Chrome's own Mesa 26.0.3) crashes while it compiles the tracer from Dawn's shader, Chrome's whole graphics process
+/// with it, so every WebGL and WebGPU context of the page is lost.
 ///
 pub(crate) fn preview_problem(info: &three_d::wgpu::AdapterInfo) -> Option<String> {
+    if info.backend == three_d::wgpu::Backend::BrowserWebGpu
+        && is_intel_gen7(info.vendor, &info.name, &info.driver, &info.driver_info)
+    {
+        return Some(format!(
+            "The browser's driver for this graphics card ({}) crashes while it compiles the ray tracing shaders, which \
+             takes all graphics of the page with it; ray tracing runs on the CPU.",
+            info.name
+        ));
+    }
     (info.backend == three_d::wgpu::Backend::Gl
         && is_intel_gen7(info.vendor, &info.name, &info.driver, &info.driver_info))
     .then(|| {
@@ -195,6 +206,22 @@ mod tests {
             ..info(three_d::wgpu::Backend::Gl)
         };
         assert!(preview_problem(&other).is_none());
+        // In Chrome, with the name from WebGL and what Chrome tells about the WebGPU adapter
+        let chrome = three_d::wgpu::AdapterInfo {
+            name: "ANGLE (Intel, Mesa Intel(R) HD Graphics 4000 (IVB GT2), OpenGL ES 3.2)"
+                .to_owned(),
+            vendor: 0,
+            driver: "google".to_owned(),
+            driver_info: "swiftshader".to_owned(),
+            ..info(three_d::wgpu::Backend::BrowserWebGpu)
+        };
+        assert!(preview_problem(&chrome).is_some());
+        let newer = three_d::wgpu::AdapterInfo {
+            name: "ANGLE (Intel, Mesa Intel(R) UHD Graphics 620 (KBL GT2), OpenGL ES 3.2)"
+                .to_owned(),
+            ..chrome.clone()
+        };
+        assert!(preview_problem(&newer).is_none());
     }
 
     #[test]

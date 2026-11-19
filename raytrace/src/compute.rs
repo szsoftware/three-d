@@ -300,6 +300,13 @@ impl ComputeTracer {
             if RaytraceSupport::of(context) < RaytraceSupport::Compute {
                 return None;
             }
+            // The browser's driver for Intel graphics of the 7th generation crashes on the shaders, see preview_problem
+            if context
+                .wgpu_adapter_info()
+                .is_some_and(|info| crate::gpu::preview_problem(&info).is_some())
+            {
+                return None;
+            }
             let warm = match context.webgpu_device() {
                 Some(device) => {
                     let info = context.wgpu_adapter_info()?;

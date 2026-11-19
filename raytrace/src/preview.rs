@@ -753,6 +753,15 @@ impl RaytracePreview {
             });
         }
         #[cfg(feature = "wgpu")]
+        if matches!(self.engine, Engine::Gpu { .. }) && self.context.is_lost() {
+            // A lost device does nothing and tells that it is done at once
+            self.availability = PreviewAvailability::CpuOnly(
+                "The graphics device was lost (a driver crash or reset); ray tracing runs on the CPU.".to_owned(),
+            );
+            self.rebuild();
+            return self.update(scene, camera);
+        }
+        #[cfg(feature = "wgpu")]
         if let Engine::Gpu { tracer, .. } = &self.engine {
             if scene.has_media() {
                 if let Some(why) = tracer.media_problem() {

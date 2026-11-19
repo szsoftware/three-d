@@ -11,6 +11,8 @@ use wasm_bindgen::JsValue;
 pub(crate) struct BrowserDevice {
     pub device: JsValue,
     pub info: JsValue,
+    /// The graphics card as the browser's WebGL names it, see [webgl_renderer].
+    pub renderer: String,
 }
 
 impl BrowserDevice {
@@ -67,7 +69,11 @@ impl DeviceCapture {
             .filter(|i| i.is_object())
             .or_else(|| Reflect::get(&device, &JsValue::from_str("adapterInfo")).ok())
             .unwrap_or(JsValue::NULL);
-        Some(BrowserDevice { device, info })
+        Some(BrowserDevice {
+            device,
+            info,
+            renderer: webgl_renderer(),
+        })
     }
 }
 
@@ -156,4 +162,32 @@ async fn adapter_is_software(preference: wgpu::PowerPreference) -> Option<bool> 
                 .iter()
                 .any(|software| names.contains(software)),
     )
+}
+
+const RENDERER: &str = "
+    let canvas = null;
+    if (typeof OffscreenCanvas !== 'undefined') canvas = new OffscreenCanvas(1, 1);
+    else if (typeof document !== 'undefined') canvas = document.createElement('canvas');
+    if (!canvas) return '';
+    const gl = canvas.getContext('webgl');
+    if (!gl) return '';
+    const debug = gl.getExtension('WEBGL_debug_renderer_info');
+    const renderer = debug ? gl.getParameter(debug.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+    const lose = gl.getExtension('WEBGL_lose_context');
+    if (lose) lose.loseContext();
+    return typeof renderer === 'string' ? renderer : '';
+";
+
+///
+/// The graphics card as the browser's WebGL names it (`UNMASKED_RENDERER_WEBGL`), for example
+/// "ANGLE (Intel, Mesa Intel(R) HD Graphics 4000 (IVB GT2), OpenGL ES 3.2)", empty if the browser does not tell.
+/// Browsers tell less about their WebGPU adapter: Chrome on Linux gave "google" and "swiftshader" as vendor and
+/// architecture for work that ran on an Intel HD Graphics 4000. The temporary WebGL context is released at once.
+///
+fn webgl_renderer() -> String {
+    Function::new_no_args(RENDERER)
+        .call0(&JsValue::NULL)
+        .ok()
+        .and_then(|r| r.as_string())
+        .unwrap_or_default()
 }

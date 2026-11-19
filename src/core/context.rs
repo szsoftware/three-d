@@ -298,7 +298,10 @@ impl Context {
     ///
     /// What the wgpu adapter of this context is, `None` with another backend. In the browser wgpu only passes on the
     /// description as name; the browser's vendor and architecture of the adapter are added as `driver` and
-    /// `driver_info` (for example "intel" and "gen-7"), when the context created the device itself.
+    /// `driver_info` (for example "intel" and "gen-7"), when the context created the device itself. Without a
+    /// description the name is the graphics card as the browser's WebGL names it (`UNMASKED_RENDERER_WEBGL`), because
+    /// browsers may keep the WebGPU adapter's vendor and architecture to themselves (Chrome told "google" and
+    /// "swiftshader" for an Intel HD Graphics 4000).
     ///
     #[cfg(feature = "wgpu")]
     #[cfg_attr(docsrs, doc(cfg(feature = "wgpu")))]
@@ -314,6 +317,10 @@ impl Context {
             info.driver_info = browser.info("architecture");
             if info.name.is_empty() {
                 info.name = browser.info("description");
+            }
+            // What WebGL tells about the graphics card, which browsers keep from WebGPU
+            if info.name.is_empty() {
+                info.name = browser.renderer.clone();
             }
         }
         Some(info)
