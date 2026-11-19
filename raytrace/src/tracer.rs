@@ -2,10 +2,16 @@
 //! Tracers add samples of the scene to a render image. Every tracer uses the same scene, render image and material model.
 //!
 
+use crate::ies::luminaire_angles;
+use crate::lens::Lens;
+use crate::light::*;
+use crate::medium::*;
+use crate::photons::*;
+use crate::render_image::FEATURE_WORDS;
 use crate::sampling::*;
 use crate::{
-    AccelBuilder, Camera, CpuAccel, CpuBvhBuilder, Hit, RenderImage, RtEnvironment, RtError,
-    RtLight, RtMaterial, RtScene,
+    AccelBuilder, Camera, CpuAccel, CpuBvhBuilder, DepthOfField, Hit, RenderImage, RtEnvironment,
+    RtError, RtLight, RtMaterial, RtScene,
 };
 use std::f32::consts::PI;
 use three_d_asset::prelude::*;
@@ -38,6 +44,21 @@ pub struct TraceSettings {
     /// Brightest value a single sample may add after the first bounce, in cd/m². Removes the rare very bright
     /// pixels (fireflies) at the cost of a little energy. `None` keeps every sample as it is.
     pub indirect_clamp: Option<f32>,
+    ///
+    /// Photons shot per call from the sun, directional and point lights at solid glass (transmissive and not thin
+    /// walled), for caustics: the light such glass bends onto surfaces. 0 leaves caustics out and lets shadow rays
+    /// pass solid glass straight, which is faster but shows neither the focused light nor the true shadow.
+    /// The `ComputeTracer` keeps at most as many as fit into the largest buffer the device binds.
+    ///
+    pub caustic_photons: u32,
+    ///
+    /// Radius in scene units within which photons light a point, for the first call. It shrinks with every call
+    /// (progressive photon mapping), so caustics get sharp and the image converges to the right result.
+    ///
+    pub caustic_radius: f32,
+    /// Blur in front of and behind the focus distance of a perspective camera, `None` for a pinhole camera that
+    /// shows everything sharp.
+    pub depth_of_field: Option<DepthOfField>,
 }
 
 impl Default for TraceSettings {
@@ -47,6 +68,9 @@ impl Default for TraceSettings {
             max_bounces: 8,
             seed: 0,
             indirect_clamp: None,
+            caustic_photons: 0,
+            caustic_radius: 0.02,
+            depth_of_field: None,
         }
     }
 }
@@ -83,14 +107,17 @@ pub trait Tracer {
 ///
 /// It is the reference for the GPU tracers: unbiased apart from what is listed here, deterministic for a seed, and
 /// written for clarity over speed. Paths sample the sun, directional and point lights at every diffuse or glossy
-/// bounce and the sky by the material. Not included: caustics (light focused by glass or mirrors onto a surface) and
-/// light through solid glass, which is approximated by letting shadow rays through transmissive surfaces.
+/// bounce and the sky by the material. Caustics through solid glass come from photons when
+/// [TraceSettings::caustic_photons] is set, which makes the result consistent rather than unbiased; without them,
+/// light through solid glass is approximated by letting shadow rays through. Not included: caustics of mirrors.
 ///
 #[derive(Debug, Default)]
 pub struct CpuReferenceTracer {
     builder: CpuBvhBuilder,
     accel: Option<CpuAccel>,
     threads: Option<usize>,
+    /// The photons of the sample traced in bands, see [CpuReferenceTracer::trace_rows]
+    band_photons: Option<std::sync::Arc<PhotonMap>>,
 }
 
 impl CpuReferenceTracer {
@@ -146,32 +173,103 @@ impl Tracer for CpuReferenceTracer {
         settings: &TraceSettings,
     ) -> Result<(), RtError> {
         render_image.check_not_empty()?;
+        let first_sample = render_image.sample_count();
+        let rows = 0..render_image.height();
+        self.render(
+            scene,
+            camera,
+            render_image,
+            settings,
+            first_sample,
+            rows,
+            true,
+        )?;
+        render_image.add_samples(settings.samples_per_call);
+        Ok(())
+    }
+}
+
+impl CpuReferenceTracer {
+    ///
+    /// Traces the rows of one sample, the `sample`th, into the render image without counting the sample, so a sample
+    /// can be traced in parts over several calls ([TraceSettings::samples_per_call] is ignored). The image is complete
+    /// once all rows are traced, then [RenderImage::add_samples] counts it. Caustic photons are shot when the first
+    /// row is traced and kept for the other rows.
+    ///
+    #[cfg_attr(not(feature = "three-d"), allow(dead_code))]
+    pub(crate) fn trace_rows(
+        &mut self,
+        scene: &RtScene,
+        camera: &Camera,
+        render_image: &mut RenderImage,
+        settings: &TraceSettings,
+        sample: u32,
+        rows: std::ops::Range<u32>,
+    ) -> Result<(), RtError> {
+        render_image.check_not_empty()?;
+        let settings = TraceSettings {
+            samples_per_call: 1,
+            ..*settings
+        };
+        let shoot = rows.start == 0;
+        self.render(scene, camera, render_image, &settings, sample, rows, shoot)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render(
+        &mut self,
+        scene: &RtScene,
+        camera: &Camera,
+        render_image: &mut RenderImage,
+        settings: &TraceSettings,
+        first_sample: u32,
+        rows: std::ops::Range<u32>,
+        shoot: bool,
+    ) -> Result<(), RtError> {
         self.prepare(scene)?;
         let accel = self.accel.as_ref().expect("prepared");
-        let context = PathContext {
+        let mut context = PathContext {
             scene,
             accel,
-            rays: CameraRays::new(camera),
+            rays: CameraRays::new(camera, settings.depth_of_field),
             settings: *settings,
             width: render_image.width(),
             height: render_image.height(),
-            first_sample: render_image.sample_count(),
+            first_sample,
+            caustics: None,
         };
+        if settings.caustic_photons > 0 {
+            if shoot {
+                let map = context.shoot_photons(first_sample);
+                self.band_photons = (!map.is_empty()).then(|| std::sync::Arc::new(map));
+            }
+            context.caustics = self.band_photons.clone();
+        }
+        let context = context;
         let width = render_image.width() as usize;
-        let threads = self
-            .thread_count()
-            .min(render_image.height() as usize)
-            .max(1);
-        let rows = render_image.rows_mut();
+        let rows = rows.start.min(render_image.height())..rows.end.min(render_image.height());
+        let threads = self.thread_count().min(rows.len()).max(1);
+        let (sums, features) = render_image.rows_and_features_mut();
+        let mut row_slices: Vec<RowSlice> = match features {
+            Some(f) => sums
+                .chunks_mut(width)
+                .zip(f.chunks_mut(width))
+                .map(|(r, f)| (r, Some(f)))
+                .collect(),
+            None => sums.chunks_mut(width).map(|r| (r, None)).collect(),
+        };
+        let first_row = rows.start as usize;
+        let mut row_slices: Vec<RowSlice> =
+            row_slices.drain(first_row..rows.end as usize).collect();
         if threads == 1 {
-            for (y, row) in rows.chunks_mut(width).enumerate() {
-                context.render_row(y as u32, row);
+            for (i, (row, features)) in row_slices.iter_mut().enumerate() {
+                context.render_row((first_row + i) as u32, row, features.as_deref_mut());
             }
         } else {
             // Rows are handed out one at a time, so threads stay busy where the scene is uneven
             let next = std::sync::atomic::AtomicUsize::new(0);
-            let row_slices: Vec<std::sync::Mutex<&mut [[f32; 3]]>> =
-                rows.chunks_mut(width).map(std::sync::Mutex::new).collect();
+            let row_slices: Vec<std::sync::Mutex<_>> =
+                row_slices.into_iter().map(std::sync::Mutex::new).collect();
             std::thread::scope(|s| {
                 for _ in 0..threads {
                     s.spawn(|| loop {
@@ -179,15 +277,26 @@ impl Tracer for CpuReferenceTracer {
                         if y >= row_slices.len() {
                             break;
                         }
-                        let mut row = row_slices[y].lock().unwrap();
-                        context.render_row(y as u32, &mut row);
+                        let mut guard = row_slices[y].lock().unwrap();
+                        let (row, features) = &mut *guard;
+                        context.render_row((first_row + y) as u32, row, features.as_deref_mut());
                     });
                 }
             });
         }
-        render_image.add_samples(settings.samples_per_call);
         Ok(())
     }
+}
+
+/// Intensity of a luminaire's profile towards `direction` (from the luminaire).
+pub(crate) fn profile_intensity(
+    profile: &crate::IesProfile,
+    down: Vec3,
+    front: Vec3,
+    direction: Vec3,
+) -> f32 {
+    let (vertical, horizontal) = luminaire_angles(direction, down, front);
+    profile.intensity(vertical, horizontal)
 }
 
 /// Primary rays of a camera.
@@ -195,10 +304,11 @@ struct CameraRays {
     camera: Camera,
     /// For perspective cameras: from normalized device coordinates to a direction in world space.
     screen_to_direction: Option<Mat4>,
+    lens: Option<Lens>,
 }
 
 impl CameraRays {
-    fn new(camera: &Camera) -> Self {
+    fn new(camera: &Camera, depth_of_field: Option<DepthOfField>) -> Self {
         let screen_to_direction = match camera.projection_type() {
             ProjectionType::Perspective { .. } => {
                 let mut view = camera.view();
@@ -210,6 +320,7 @@ impl CameraRays {
         Self {
             camera: camera.clone(),
             screen_to_direction,
+            lens: Lens::of(camera, depth_of_field),
         }
     }
 
@@ -230,6 +341,47 @@ impl CameraRays {
     }
 }
 
+/// The sums of one row and, if collected, its feature sums.
+type RowSlice<'a> = (&'a mut [[f32; 3]], Option<&'a mut [[f32; FEATURE_WORDS]]>);
+
+/// What a camera ray hits first, for the features of a denoiser.
+struct FirstHit {
+    albedo: Vec3,
+    normal: Vec3,
+    distance: f32,
+}
+
+/// The distance given to the sky in the features.
+pub(crate) const SKY_DISTANCE: f32 = 1e9;
+
+impl FirstHit {
+    fn sky(direction: Vec3) -> Self {
+        Self {
+            albedo: vec3(1.0, 1.0, 1.0),
+            normal: -direction,
+            distance: SKY_DISTANCE,
+        }
+    }
+
+    fn at(surface: &Surface, distance: f32) -> Self {
+        let m = &surface.material;
+        Self {
+            albedo: feature_albedo(m),
+            normal: surface.shading_normal,
+            distance,
+        }
+    }
+}
+
+/// The albedo a denoiser divides by: one where the surface shows what lies behind or in front of it.
+pub(crate) fn feature_albedo(m: &RtMaterial) -> Vec3 {
+    if m.transmission > 0.0 || (m.metallic > 0.5 && m.roughness < 0.2) {
+        vec3(1.0, 1.0, 1.0)
+    } else {
+        m.base_color
+    }
+}
+
 /// Everything one call of trace shares between threads.
 struct PathContext<'a> {
     scene: &'a RtScene,
@@ -239,6 +391,8 @@ struct PathContext<'a> {
     width: u32,
     height: u32,
     first_sample: u32,
+    /// Photons through glass of this call, if caustics are on and photons landed.
+    caustics: Option<std::sync::Arc<PhotonMap>>,
 }
 
 /// The surface at a hit, in world space.
@@ -254,46 +408,237 @@ struct Surface {
     material: RtMaterial,
 }
 
+/// Where a ray travels: in the air with the scene's fog, or inside a solid with its medium.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Inside {
+    Air,
+    Solid {
+        instance: u32,
+        medium: Option<RtMedium>,
+    },
+}
+
+/// What scatters light towards `v`: a surface or a medium.
+enum Scatterer<'a> {
+    Surface {
+        m: &'a RtMaterial,
+        v: Vec3,
+        n: Vec3,
+        ng: Vec3,
+    },
+    Medium {
+        anisotropy: f32,
+        v: Vec3,
+    },
+}
+
+impl Scatterer<'_> {
+    /// Reflected luminance per luminance arriving from `l`, with the cosine of surfaces.
+    fn evaluate(&self, l: Vec3) -> Vec3 {
+        match self {
+            Scatterer::Surface { m, v, n, ng } => {
+                let cos = n.dot(l);
+                if cos <= 0.0 || ng.dot(l) <= 0.0 {
+                    return vec3(0.0, 0.0, 0.0);
+                }
+                evaluate_material(m, *v, l, *n) * cos
+            }
+            Scatterer::Medium { anisotropy, v } => {
+                let p = phase(*anisotropy, -l.dot(*v));
+                vec3(p, p, p)
+            }
+        }
+    }
+
+    /// Density of the directions the path draws itself.
+    fn pdf(&self, l: Vec3) -> f32 {
+        match self {
+            Scatterer::Surface { m, v, n, .. } => material_pdf(m, *v, l, *n),
+            Scatterer::Medium { anisotropy, v } => phase(*anisotropy, -l.dot(*v)),
+        }
+    }
+}
+
+/// Signed sums of the boundary hits of one solid along a shadow ray, to know how far the ray runs inside it.
+struct Crossings {
+    instance: u32,
+    medium: Option<RtMedium>,
+    /// Hits leaving minus hits entering
+    exits: i32,
+    /// Distances of the hits leaving minus of those entering
+    distance: f32,
+    /// The same for the depth of the fog
+    fog_depth: f32,
+}
+
 impl PathContext<'_> {
-    fn render_row(&self, y: u32, row: &mut [[f32; 3]]) {
+    fn render_row(
+        &self,
+        y: u32,
+        row: &mut [[f32; 3]],
+        mut features: Option<&mut [[f32; FEATURE_WORDS]]>,
+    ) {
         for (x, sum) in row.iter_mut().enumerate() {
             for s in 0..self.settings.samples_per_call {
                 let sample = self.first_sample + s;
                 let mut rng = Rng::for_pixel(self.settings.seed, x as u32, y, sample);
                 let u = (x as f32 + rng.next_f32()) / self.width as f32;
                 let v = 1.0 - (y as f32 + rng.next_f32()) / self.height as f32;
-                let (origin, direction) = self.rays.ray(u, v);
-                let l = self.radiance(origin, direction, &mut rng);
+                let (mut origin, mut direction) = self.rays.ray(u, v);
+                if let Some(lens) = &self.rays.lens {
+                    (origin, direction) =
+                        lens.ray(origin, direction, rng.next_f32(), rng.next_f32());
+                }
+                let mut first = FirstHit::sky(direction);
+                let mut l = self.radiance(origin, direction, &mut rng, &mut first);
                 // A broken sample must not spoil the pixel for good
-                if l.x.is_finite() && l.y.is_finite() && l.z.is_finite() {
-                    sum[0] += l.x;
-                    sum[1] += l.y;
-                    sum[2] += l.z;
+                if !(l.x.is_finite() && l.y.is_finite() && l.z.is_finite()) {
+                    l = vec3(0.0, 0.0, 0.0);
+                }
+                sum[0] += l.x;
+                sum[1] += l.y;
+                sum[2] += l.z;
+                if let Some(features) = features.as_deref_mut() {
+                    let f = &mut features[x];
+                    f[0] += first.albedo.x;
+                    f[1] += first.albedo.y;
+                    f[2] += first.albedo.z;
+                    f[3] += first.normal.x;
+                    f[4] += first.normal.y;
+                    f[5] += first.normal.z;
+                    f[6] += first.distance;
+                    let lum = luminance(l);
+                    f[7] += lum * lum;
                 }
             }
         }
     }
 
     /// Luminance arriving along the ray, by following one path.
-    fn radiance(&self, mut origin: Vec3, mut direction: Vec3, rng: &mut Rng) -> Vec3 {
+    fn radiance(
+        &self,
+        mut origin: Vec3,
+        mut direction: Vec3,
+        rng: &mut Rng,
+        first: &mut FirstHit,
+    ) -> Vec3 {
         let mut result = vec3(0.0, 0.0, 0.0);
         let mut throughput = vec3(1.0, 1.0, 1.0);
         // Lights that can not be hit by chance (the sun disc) are seen directly only after camera rays and mirrors
         let mut last_was_delta = true;
+        // Density of the last direction drawn from a material, for weighting area lights hit by chance
+        let mut last_pdf = 0.0;
+        // What happened since the last diffuse or glossy bounce, to count light only once: either the light sampled
+        // there directly (straight through thin glass, and through solid glass without caustics) or the photons
+        // through glass, or the light the path hits now
+        let mut diffuse_seen = false;
+        let mut diffuse_origin = origin;
+        let mut glass_reflected = false;
+        let mut glass_bent = false;
+        let caustics = self.settings.caustic_photons > 0;
+        let media = self.scene.has_media();
+        let mut inside = Inside::Air;
+        // Boundaries of media passed, which do not count as bounces
+        let mut invisible = false;
+        let mut passed = 0;
         let mut bounce = 0;
         loop {
-            let Some(hit) = self
+            let light_hit = self.nearest_area_light(origin, direction);
+            let max_distance = light_hit
+                .as_ref()
+                .map_or(f32::INFINITY, |(_, h)| h.distance);
+            let hit = self
                 .accel
-                .intersect(self.scene, origin, direction, f32::INFINITY)
-            else {
+                .intersect(self.scene, origin, direction, max_distance);
+            if media {
+                let end = hit.as_ref().map_or(max_distance, |h| h.t);
+                let (scattered, weight) = self.sample_medium(inside, origin, direction, end, rng);
+                throughput = mul(throughput, weight);
+                if let Some((t, anisotropy)) = scattered {
+                    if bounce >= self.settings.max_bounces {
+                        break;
+                    }
+                    // Light scattered in the medium: the light sources directly, then a new direction
+                    if bounce == 0 && passed == 0 {
+                        *first = FirstHit {
+                            albedo: vec3(1.0, 1.0, 1.0),
+                            normal: -direction,
+                            distance: t,
+                        };
+                    }
+                    let p = origin + direction * t;
+                    let v = -direction;
+                    let scatterer = Scatterer::Medium { anisotropy, v };
+                    result += self.add(
+                        bounce,
+                        mul(throughput, self.direct_light(p, &scatterer, inside, rng)),
+                    );
+                    let l = sample_phase(anisotropy, direction, rng.next_f32(), rng.next_f32());
+                    last_pdf = scatterer.pdf(l);
+                    direction = l;
+                    origin = p;
+                    last_was_delta = false;
+                    diffuse_seen = true;
+                    diffuse_origin = p;
+                    glass_reflected = false;
+                    glass_bent = false;
+                    bounce += 1;
+                    if bounce >= 3 && !self.roulette(&mut throughput, rng) {
+                        break;
+                    }
+                    continue;
+                }
+                if throughput == vec3(0.0, 0.0, 0.0) {
+                    break;
+                }
+            }
+            let Some(hit) = hit else {
+                if let Some((light, light_hit)) = light_hit {
+                    // Area lights end the path; their light was also sampled directly, so both share it
+                    let weight = if !last_was_delta {
+                        power_heuristic(
+                            last_pdf,
+                            area_light_pdf(light, origin, direction, light_hit.distance),
+                        )
+                    } else if !diffuse_seen || glass_reflected {
+                        // Seen in glass from the camera, or by a way the light was not sampled
+                        1.0
+                    } else if !glass_bent {
+                        // Straight through thin glass, the direction drawn at the last diffuse bounce
+                        let at = origin + direction * light_hit.distance;
+                        power_heuristic(
+                            last_pdf,
+                            area_light_pdf(
+                                light,
+                                diffuse_origin,
+                                direction,
+                                (at - diffuse_origin).magnitude(),
+                            ),
+                        )
+                    } else {
+                        // Through solid glass the light was sampled straight already
+                        0.0
+                    };
+                    result += self.add(bounce, mul(throughput, light_hit.radiance) * weight);
+                    break;
+                }
                 result += self.add(
                     bounce,
-                    mul(throughput, self.environment(direction, last_was_delta)),
+                    mul(
+                        throughput,
+                        self.environment(
+                            direction,
+                            last_was_delta && (!diffuse_seen || (glass_reflected && !caustics)),
+                        ),
+                    ),
                 );
                 break;
             };
             let surface = self.surface(&hit, direction);
             let m = &surface.material;
+            if bounce == 0 && passed == 0 {
+                *first = FirstHit::at(&surface, hit.t);
+            }
             result += self.add(bounce, mul(throughput, m.emission));
             if bounce >= self.settings.max_bounces {
                 break;
@@ -313,28 +658,60 @@ impl PathContext<'_> {
                     1.0 / m.index_of_refraction
                 };
                 let cos_i = n.dot(v).clamp(0.0, 1.0);
-                if rng.next_f32() < fresnel_dielectric(cos_i, eta) {
-                    direction = reflect(v, n);
-                    origin = offset(surface.position, ng);
+                let refracted = if m.thin_walled {
+                    Some(direction)
                 } else {
-                    throughput = mul(throughput, m.base_color);
-                    if !m.thin_walled {
-                        direction = refract(v, n, 1.0 / eta).unwrap_or_else(|| reflect(v, n));
+                    refract(v, n, 1.0 / eta)
+                };
+                match refracted {
+                    Some(refracted) if rng.next_f32() >= fresnel_dielectric(cos_i, eta) => {
+                        // The boundary of a medium is no bounce, it is not seen
+                        invisible = media && !m.thin_walled && !bends_light(m);
+                        throughput = mul(throughput, m.base_color);
+                        if !m.thin_walled {
+                            direction = refracted;
+                            glass_bent |= bends_light(m);
+                            inside = if surface.front_face {
+                                Inside::Solid {
+                                    instance: hit.instance,
+                                    medium: m.medium,
+                                }
+                            } else {
+                                Inside::Air
+                            };
+                        }
+                        origin = offset(surface.position, -ng);
                     }
-                    origin = offset(surface.position, -ng);
+                    _ => {
+                        // Reflected, also all of it inside the glass
+                        direction = reflect(v, n);
+                        origin = offset(surface.position, ng);
+                        glass_reflected = true;
+                        glass_bent = true;
+                    }
                 }
                 last_was_delta = true;
             } else {
                 // Diffuse and glossy reflection: light sources directly, then a new direction from the material
                 let p = offset(surface.position, ng);
+                let scatterer = Scatterer::Surface { m, v, n, ng };
                 result += self.add(
                     bounce,
-                    mul(throughput, self.direct_light(p, v, n, ng, m, rng)),
+                    mul(throughput, self.direct_light(p, &scatterer, inside, rng)),
                 );
+                if let Some(map) = &self.caustics {
+                    let mut gathered = vec3(0.0, 0.0, 0.0);
+                    map.gather(surface.position, ng, |photon| {
+                        gathered +=
+                            mul(evaluate_material(m, v, -photon.direction, n), photon.power);
+                    });
+                    result += self.add(bounce, mul(throughput, gathered / map.area()));
+                }
 
-                let Some((l, weight)) = sample_material(m, v, n, rng) else {
+                let Some((l, weight, pdf)) = sample_material(m, v, n, rng) else {
                     break;
                 };
+                last_pdf = pdf;
                 if l.dot(ng) <= 0.0 {
                     break;
                 }
@@ -342,23 +719,239 @@ impl PathContext<'_> {
                 direction = l;
                 origin = p;
                 last_was_delta = false;
+                diffuse_seen = true;
+                diffuse_origin = p;
+                glass_reflected = false;
+                glass_bent = false;
             }
 
-            bounce += 1;
-            if bounce >= 3 {
-                // Russian roulette ends dark paths early without changing the expected value
-                let q = throughput
-                    .x
-                    .max(throughput.y)
-                    .max(throughput.z)
-                    .clamp(0.05, 0.95);
-                if rng.next_f32() > q {
+            if std::mem::take(&mut invisible) {
+                passed += 1;
+                if passed > 64 {
                     break;
                 }
-                throughput /= q;
+                continue;
+            }
+            bounce += 1;
+            if bounce >= 3 && !self.roulette(&mut throughput, rng) {
+                break;
             }
         }
         result
+    }
+
+    /// Russian roulette ends dark paths early without changing the expected value. Returns whether the path goes on.
+    fn roulette(&self, throughput: &mut Vec3, rng: &mut Rng) -> bool {
+        let q = throughput
+            .x
+            .max(throughput.y)
+            .max(throughput.z)
+            .clamp(0.05, 0.95);
+        if rng.next_f32() > q {
+            return false;
+        }
+        *throughput /= q;
+        true
+    }
+
+    /// The medium the ray is in and how its density goes along the ray: fog, or homogeneous inside solids.
+    fn medium_at(&self, inside: Inside) -> Option<(RtMedium, Option<&RtFog>)> {
+        match inside {
+            Inside::Air => self.scene.fog().map(|f| (f.medium, Some(f))),
+            Inside::Solid { medium, .. } => medium.filter(|m| !m.is_clear()).map(|m| (m, None)),
+        }
+    }
+
+    ///
+    /// Where light along the ray scatters in the medium before `end`, chosen by the extinction of a random color
+    /// channel, and the weight of the path: the scattering there or the light passing to `end`, over the mean density
+    /// of the three channels. Returns the distance and the anisotropy if it scatters.
+    ///
+    fn sample_medium(
+        &self,
+        inside: Inside,
+        origin: Vec3,
+        direction: Vec3,
+        end: f32,
+        rng: &mut Rng,
+    ) -> (Option<(f32, f32)>, Vec3) {
+        let one = vec3(1.0, 1.0, 1.0);
+        let Some((medium, fog)) = self.medium_at(inside) else {
+            return (None, one);
+        };
+        let sigma = medium.extinction();
+        let depth_at = |t: f32| match fog {
+            Some(fog) => fog.depth(origin, direction, t),
+            None => t,
+        };
+        let transmittance = |d: f32| {
+            if d.is_infinite() {
+                let open = |s: f32| if s > 0.0 { 0.0 } else { 1.0 };
+                vec3(open(sigma.x), open(sigma.y), open(sigma.z))
+            } else {
+                exp_neg(sigma * d)
+            }
+        };
+        if medium.scattering == vec3(0.0, 0.0, 0.0) {
+            // Only absorbing, as tinted glass: the light left, without noise
+            return (None, transmittance(depth_at(end)));
+        }
+        let channel = ((rng.next_f32() * 3.0) as usize).min(2);
+        let depth = -(1.0 - rng.next_f32()).ln() / sigma[channel];
+        let t = match fog {
+            Some(fog) => fog.distance_to_depth(origin, direction, depth),
+            None => Some(depth),
+        }
+        .filter(|t| t.is_finite() && *t < end);
+        let mean = |v: Vec3| (v.x + v.y + v.z) / 3.0;
+        match t {
+            Some(t) => {
+                let tr = exp_neg(sigma * depth_at(t));
+                // The density at t cancels between scattering and the density of t
+                let pdf = mean(mul(sigma, tr));
+                if pdf <= 0.0 {
+                    return (None, vec3(0.0, 0.0, 0.0));
+                }
+                (
+                    Some((t, medium.anisotropy)),
+                    mul(medium.scattering, tr) / pdf,
+                )
+            }
+            None => {
+                let tr = transmittance(depth_at(end));
+                let p = mean(tr);
+                if p <= 0.0 {
+                    return (None, vec3(0.0, 0.0, 0.0));
+                }
+                (None, tr / p)
+            }
+        }
+    }
+
+    ///
+    /// The photons of one call, the `pass`th: from the lights that cast caustics through solid glass to the first
+    /// surface behind it that is not glass. Light that only passed thin glass is left out, shadow rays find it.
+    ///
+    fn shoot_photons(&self, pass: u32) -> PhotonMap {
+        let radius = gather_radius(self.settings.caustic_radius, pass);
+        let spheres = glass_spheres(self.scene);
+        let sources = caustic_sources(self.scene);
+        let scene_box = scene_box(self.accel);
+        if spheres.is_empty() || sources.is_empty() || scene_box.is_none() {
+            return PhotonMap::new(Vec::new(), radius);
+        }
+        let (center, extent) = scene_box.expect("a box");
+        let per_source = (self.settings.caustic_photons / sources.len() as u32).max(1);
+        let mut photons = Vec::new();
+        for (s, source) in sources.iter().enumerate() {
+            let mut rng = Rng::new(
+                self.settings.seed ^ pass.wrapping_mul(0x9e37_79b9),
+                0x5eed_0000_0000 ^ ((s as u64) << 32) ^ pass as u64,
+            );
+            for _ in 0..per_source {
+                let Some(emission) = source.emit(&spheres, per_source, &mut rng) else {
+                    break;
+                };
+                // Parallel light starts outside the scene
+                let origin = if matches!(source, CausticSource::Parallel { .. }) {
+                    let point = emission.origin;
+                    point - emission.direction * ((point - center).magnitude() + extent)
+                } else {
+                    emission.origin
+                };
+                self.trace_photon(
+                    origin,
+                    emission.direction,
+                    emission.power,
+                    &mut rng,
+                    &mut photons,
+                );
+            }
+        }
+        PhotonMap::new(photons, radius)
+    }
+
+    /// Follows a photon through glass and keeps it where it lands, if the glass bent it.
+    fn trace_photon(
+        &self,
+        mut origin: Vec3,
+        mut direction: Vec3,
+        mut power: Vec3,
+        rng: &mut Rng,
+        photons: &mut Vec<Photon>,
+    ) {
+        let mut bent = false;
+        let media = self.scene.has_media();
+        let mut inside = Inside::Air;
+        for _ in 0..self.settings.max_bounces.max(1) + 8 {
+            let Some(hit) = self
+                .accel
+                .intersect(self.scene, origin, direction, f32::INFINITY)
+            else {
+                return;
+            };
+            if media {
+                // Light scattered out of the photon reaches the surfaces by the paths through the medium
+                if let Some((medium, fog)) = self.medium_at(inside) {
+                    let depth = fog.map_or(hit.t, |f| f.depth(origin, direction, hit.t));
+                    power = mul(power, exp_neg(medium.extinction() * depth));
+                }
+            }
+            let surface = self.surface(&hit, direction);
+            let m = &surface.material;
+            let v = -direction;
+            let ng = surface.geometric_normal;
+            let mut n = surface.shading_normal;
+            if n.dot(v) <= 0.0 {
+                n = ng;
+            }
+            if m.transmission > 0.0 && rng.next_f32() < m.transmission {
+                // The same choices as the paths from the camera
+                let eta = if m.thin_walled || surface.front_face {
+                    m.index_of_refraction
+                } else {
+                    1.0 / m.index_of_refraction
+                };
+                let cos_i = n.dot(v).clamp(0.0, 1.0);
+                let refracted = if m.thin_walled {
+                    Some(direction)
+                } else {
+                    refract(v, n, 1.0 / eta)
+                };
+                match refracted {
+                    Some(refracted) if rng.next_f32() >= fresnel_dielectric(cos_i, eta) => {
+                        power = mul(power, m.base_color);
+                        if !m.thin_walled {
+                            direction = refracted;
+                            bent |= bends_light(m);
+                            inside = if surface.front_face {
+                                Inside::Solid {
+                                    instance: hit.instance,
+                                    medium: m.medium,
+                                }
+                            } else {
+                                Inside::Air
+                            };
+                        }
+                        origin = offset(surface.position, -ng);
+                    }
+                    _ => {
+                        direction = reflect(v, n);
+                        origin = offset(surface.position, ng);
+                        bent = true;
+                    }
+                }
+            } else {
+                if bent {
+                    photons.push(Photon {
+                        position: surface.position,
+                        direction,
+                        power,
+                    });
+                }
+                return;
+            }
+        }
     }
 
     /// Contribution clamped after the first bounce if asked for.
@@ -454,17 +1047,10 @@ impl PathContext<'_> {
         }
     }
 
-    /// Light from the sun and the light sources reaching the point and reflected towards `v`.
-    fn direct_light(
-        &self,
-        p: Vec3,
-        v: Vec3,
-        n: Vec3,
-        ng: Vec3,
-        m: &RtMaterial,
-        rng: &mut Rng,
-    ) -> Vec3 {
+    /// Light from the sun and the light sources reaching the point and scattered towards the viewer.
+    fn direct_light(&self, p: Vec3, scatterer: &Scatterer, inside: Inside, rng: &mut Rng) -> Vec3 {
         let mut result = vec3(0.0, 0.0, 0.0);
+        let photons = self.settings.caustic_photons > 0;
         if let RtEnvironment::Sky(sky) = self.scene.environment() {
             if sky.sun_illuminance() > 0.0 {
                 let (t, b) = orthonormal_basis(sky.sun_direction());
@@ -472,13 +1058,12 @@ impl PathContext<'_> {
                 let l = (t * c.x + b * c.y + sky.sun_direction() * c.z).normalize();
                 result += self.light_from(
                     p,
-                    v,
-                    n,
-                    ng,
-                    m,
+                    scatterer,
+                    inside,
                     l,
                     f32::INFINITY,
                     sky.sun_color() * sky.sun_illuminance(),
+                    photons,
                 );
             }
         }
@@ -490,8 +1075,15 @@ impl PathContext<'_> {
                     illuminance,
                 } => {
                     let l = -direction.normalize();
-                    result +=
-                        self.light_from(p, v, n, ng, m, l, f32::INFINITY, *color * *illuminance);
+                    result += self.light_from(
+                        p,
+                        scatterer,
+                        inside,
+                        l,
+                        f32::INFINITY,
+                        *color * *illuminance,
+                        photons,
+                    );
                 }
                 RtLight::Point {
                     position,
@@ -505,13 +1097,52 @@ impl PathContext<'_> {
                         let l = to_light / d;
                         result += self.light_from(
                             p,
-                            v,
-                            n,
-                            ng,
-                            m,
+                            scatterer,
+                            inside,
                             l,
                             d * (1.0 - 1e-4),
                             *color * (*intensity / d2),
+                            photons,
+                        );
+                    }
+                }
+                RtLight::Luminaire {
+                    position,
+                    down,
+                    front,
+                    color,
+                    profile,
+                    scale,
+                } => {
+                    let to_light = *position - p;
+                    let d2 = to_light.magnitude2();
+                    if d2 > 0.0 {
+                        let d = d2.sqrt();
+                        let l = to_light / d;
+                        result += self.light_from(
+                            p,
+                            scatterer,
+                            inside,
+                            l,
+                            d * (1.0 - 1e-4),
+                            *color * (*scale * profile_intensity(profile, *down, *front, -l) / d2),
+                            photons,
+                        );
+                    }
+                }
+                RtLight::Rect { .. } | RtLight::Sphere { .. } => {
+                    let (u1, u2) = (rng.next_f32(), rng.next_f32());
+                    if let Some(s) = sample_area_light(light, p, u1, u2) {
+                        // Shared with the material's own samples that hit the light
+                        let weight = power_heuristic(s.pdf, scatterer.pdf(s.direction)) / s.pdf;
+                        result += self.light_from(
+                            p,
+                            scatterer,
+                            inside,
+                            s.direction,
+                            s.distance * (1.0 - 1e-4),
+                            s.radiance * weight,
+                            false,
                         );
                     }
                 }
@@ -520,39 +1151,71 @@ impl PathContext<'_> {
         result
     }
 
+    /// The nearest area light along a ray, ignoring the scene.
+    fn nearest_area_light(&self, origin: Vec3, direction: Vec3) -> Option<(&RtLight, LightHit)> {
+        let mut nearest: Option<(&RtLight, LightHit)> = None;
+        for light in self.scene.lights().iter().filter(|l| l.is_area()) {
+            let max = nearest.as_ref().map_or(f32::INFINITY, |(_, h)| h.distance);
+            if let Some(hit) = hit_area_light(light, origin, direction, max) {
+                nearest = Some((light, hit));
+            }
+        }
+        nearest
+    }
+
     /// Reflected luminance for illuminance `e` (lux, on a surface facing the light) from direction `l`.
     #[allow(clippy::too_many_arguments)]
     fn light_from(
         &self,
         p: Vec3,
-        v: Vec3,
-        n: Vec3,
-        ng: Vec3,
-        m: &RtMaterial,
+        scatterer: &Scatterer,
+        inside: Inside,
         l: Vec3,
         distance: f32,
         e: Vec3,
+        photons: bool,
     ) -> Vec3 {
-        let cos = n.dot(l);
-        if cos <= 0.0 || ng.dot(l) <= 0.0 {
-            return vec3(0.0, 0.0, 0.0);
-        }
-        let f = evaluate_material(m, v, l, n);
+        let f = scatterer.evaluate(l);
         if f == vec3(0.0, 0.0, 0.0) {
             return f;
         }
-        let transmittance = self.transmittance(p, l, distance);
-        mul(mul(f, e), transmittance) * cos
+        let transmittance = self.transmittance(p, l, distance, photons, inside);
+        mul(mul(f, e), transmittance)
     }
 
     /// How much light passes along a shadow ray: nothing through opaque surfaces, some through glass.
-    fn transmittance(&self, origin: Vec3, direction: Vec3, distance: f32) -> Vec3 {
+    ///
+    /// With `photons` the light comes as photons through solid glass, which then casts a full shadow.
+    ///
+    /// The ray starts `inside` a solid or in the air; media along it absorb and scatter light out of it.
+    ///
+    fn transmittance(
+        &self,
+        origin: Vec3,
+        direction: Vec3,
+        distance: f32,
+        photons: bool,
+        inside: Inside,
+    ) -> Vec3 {
         let mut t = vec3(1.0, 1.0, 1.0);
+        let media = self.scene.has_media();
+        let fog = self.scene.fog();
+        let fog_depth = |d: f32| fog.map_or(0.0, |f| f.depth(origin, direction, d));
+        let mut solids: Vec<Crossings> = Vec::new();
+        if let Inside::Solid { instance, medium } = inside {
+            solids.push(Crossings {
+                instance,
+                medium,
+                exits: 0,
+                distance: 0.0,
+                fog_depth: 0.0,
+            });
+        }
         self.accel
             .for_each_hit(self.scene, origin, direction, distance, |hit| {
                 let instance = &self.scene.instances()[hit.instance as usize];
                 let m = &self.scene.materials()[instance.material.0 as usize];
-                if m.transmission <= 0.0 {
+                if m.transmission <= 0.0 || (photons && bends_light(m)) {
                     t = vec3(0.0, 0.0, 0.0);
                     return true;
                 }
@@ -561,9 +1224,60 @@ impl PathContext<'_> {
                 let cos_i = s.geometric_normal.dot(-direction).clamp(0.0, 1.0);
                 let f = fresnel_dielectric(cos_i, m.index_of_refraction);
                 t = mul(t, m.base_color * (m.transmission * (1.0 - f)));
+                if media && !m.thin_walled {
+                    let sign = if s.front_face { -1 } else { 1 };
+                    let index = match solids.iter().position(|c| c.instance == hit.instance) {
+                        Some(index) => index,
+                        None => {
+                            solids.push(Crossings {
+                                instance: hit.instance,
+                                medium: m.medium,
+                                exits: 0,
+                                distance: 0.0,
+                                fog_depth: 0.0,
+                            });
+                            solids.len() - 1
+                        }
+                    };
+                    let c = &mut solids[index];
+                    c.exits += sign;
+                    c.distance += sign as f32 * hit.t;
+                    c.fog_depth += sign as f32 * fog_depth(hit.t);
+                }
                 t.x.max(t.y).max(t.z) <= 0.0
             });
-        t
+        if !media || t == vec3(0.0, 0.0, 0.0) {
+            return t;
+        }
+        // Inside each solid from its entries to its exits, and to the end if the ray ends inside
+        let mut fog_inside = 0.0;
+        let mut depth = vec3(0.0, 0.0, 0.0);
+        for c in &solids {
+            let started_inside =
+                matches!(inside, Inside::Solid { instance, .. } if instance == c.instance);
+            let ends_inside = i32::from(started_inside) - c.exits > 0;
+            let (length, fog_part) = if ends_inside {
+                if distance.is_infinite() {
+                    // Open meshes: the medium does not end
+                    return vec3(0.0, 0.0, 0.0);
+                }
+                (c.distance + distance, c.fog_depth + fog_depth(distance))
+            } else {
+                (c.distance, c.fog_depth)
+            };
+            if let Some(m) = c.medium {
+                depth += m.extinction() * length.max(0.0);
+            }
+            fog_inside += fog_part.max(0.0);
+        }
+        if let Some(f) = fog {
+            let total = fog_depth(distance);
+            if total.is_infinite() {
+                return vec3(0.0, 0.0, 0.0);
+            }
+            depth += f.medium.extinction() * (total - fog_inside).max(0.0);
+        }
+        mul(t, exp_neg(depth))
     }
 }
 
@@ -711,7 +1425,7 @@ fn material_pdf(m: &RtMaterial, v: Vec3, l: Vec3, n: Vec3) -> f32 {
 }
 
 ///
-/// A new direction from the material and the weight f·cos/pdf, sampling the glossy part by its visible normals and the
+/// A new direction from the material, the weight f·cos/pdf and the pdf, sampling the glossy part by its visible normals and the
 /// diffuse part by the cosine, combined by their probabilities.
 ///
 pub(crate) fn sample_material(
@@ -719,7 +1433,7 @@ pub(crate) fn sample_material(
     v: Vec3,
     n: Vec3,
     rng: &mut Rng,
-) -> Option<(Vec3, Vec3)> {
+) -> Option<(Vec3, Vec3, f32)> {
     let n_dot_v = n.dot(v);
     if n_dot_v <= 0.0 {
         return None;
@@ -744,7 +1458,7 @@ pub(crate) fn sample_material(
     if pdf <= 0.0 {
         return None;
     }
-    Some((l, evaluate_material(m, v, l, n) * (n_dot_l / pdf)))
+    Some((l, evaluate_material(m, v, l, n) * (n_dot_l / pdf), pdf))
 }
 
 #[cfg(test)]
@@ -759,7 +1473,7 @@ mod tests {
         let count = 200_000;
         let mut sum = 0.0;
         for _ in 0..count {
-            if let Some((_, w)) = sample_material(m, v, n, &mut rng) {
+            if let Some((_, w, _)) = sample_material(m, v, n, &mut rng) {
                 sum += luminance(w);
             }
         }

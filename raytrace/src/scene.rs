@@ -2,7 +2,7 @@
 //! The scene description, independent of any backend.
 //!
 
-use crate::{RtError, RtTexture, Sky, TextureId};
+use crate::{RtError, RtFog, RtMedium, RtTexture, Sky, TextureId};
 use three_d_asset::prelude::*;
 use three_d_asset::{Geometry, Model, PbrMaterial, TriMesh};
 
@@ -138,6 +138,11 @@ pub struct RtMaterial {
     pub emission_texture: Option<TextureId>,
     /// Multiplies the transmission (red).
     pub transmission_texture: Option<TextureId>,
+    ///
+    /// What fills a closed mesh of a transmissive material that is not [RtMaterial::thin_walled]: depth color of glass
+    /// and water, smoke or fog. See [RtMaterial::medium_boundary] for a mesh that only holds a medium.
+    ///
+    pub medium: Option<RtMedium>,
 }
 
 impl Default for RtMaterial {
@@ -159,6 +164,7 @@ impl Default for RtMaterial {
             normal_scale: 1.0,
             emission_texture: None,
             transmission_texture: None,
+            medium: None,
         }
     }
 }
@@ -175,6 +181,23 @@ impl RtMaterial {
             base_color: color,
             roughness: 1.0,
             specular: 0.0,
+            ..Default::default()
+        }
+    }
+
+    ///
+    /// The invisible boundary of a medium such as fog or smoke in a closed mesh: light passes it unchanged and the
+    /// medium acts inside.
+    ///
+    pub fn medium_boundary(medium: RtMedium) -> Self {
+        Self {
+            base_color: vec3(1.0, 1.0, 1.0),
+            roughness: 0.0,
+            specular: 0.0,
+            transmission: 1.0,
+            index_of_refraction: 1.0,
+            thin_walled: false,
+            medium: Some(medium),
             ..Default::default()
         }
     }
@@ -340,6 +363,146 @@ pub enum RtLight {
         /// Luminous intensity in cd, about 80 for a 1000 lm bulb.
         intensity: f32,
     },
+    ///
+    /// A luminaire with a measured light distribution from an IES file, small enough to be a point, with hard shadows.
+    /// See [RtLight::luminaire] and [RtLight::luminaire_with_flux].
+    ///
+    Luminaire {
+        /// Position in world coordinates.
+        position: Vec3,
+        /// The direction of the vertical angle 0° of the profile, straight down for a downlight.
+        down: Vec3,
+        /// The direction of the horizontal angle 0° (C0), perpendicular to `down`.
+        front: Vec3,
+        /// Linear color, scaled by the intensities of the profile and `scale`.
+        color: Vec3,
+        /// The light distribution, shared by luminaires of the same kind.
+        profile: std::sync::Arc<crate::IesProfile>,
+        /// Factor on the intensities of the profile, for example for dimming.
+        scale: f32,
+    },
+    ///
+    /// A glowing parallelogram, for example a ceiling panel or a window seen as a light, with soft shadows. It shines
+    /// from the side `edge_u × edge_v` points to, and from both sides if `two_sided`. Every point emits the same
+    /// luminance in every direction, so a one sided light of area A sends out π·A·luminance lumen.
+    ///
+    /// Area lights are seen by camera rays and reflections but do not cast shadows themselves.
+    ///
+    Rect {
+        /// One corner in world coordinates.
+        corner: Vec3,
+        /// The edge from the corner along the first side.
+        edge_u: Vec3,
+        /// The edge from the corner along the second side.
+        edge_v: Vec3,
+        /// Linear color, scaled by the luminance.
+        color: Vec3,
+        /// Luminance in cd/m².
+        luminance: f32,
+        /// Shines from both sides.
+        two_sided: bool,
+    },
+    ///
+    /// A glowing ball, for example a bulb, with soft shadows. A sphere of radius r sends out 4π²·r²·luminance lumen.
+    /// Like [RtLight::Rect] it is seen but casts no shadows.
+    ///
+    Sphere {
+        /// Center in world coordinates.
+        center: Vec3,
+        /// Radius in meters.
+        radius: f32,
+        /// Linear color, scaled by the luminance.
+        color: Vec3,
+        /// Luminance in cd/m².
+        luminance: f32,
+    },
+}
+
+impl RtLight {
+    /// A ball of the given radius that sends out `flux` lumen, like a bulb of that many lumen.
+    pub fn sphere_with_flux(center: Vec3, radius: f32, color: Vec3, flux: f32) -> Self {
+        Self::Sphere {
+            center,
+            radius,
+            color,
+            luminance: flux / (4.0 * std::f32::consts::PI.powi(2) * radius * radius),
+        }
+    }
+
+    /// A one sided panel that sends out `flux` lumen.
+    pub fn rect_with_flux(
+        corner: Vec3,
+        edge_u: Vec3,
+        edge_v: Vec3,
+        color: Vec3,
+        flux: f32,
+    ) -> Self {
+        let area = edge_u.cross(edge_v).magnitude();
+        Self::Rect {
+            corner,
+            edge_u,
+            edge_v,
+            color,
+            luminance: flux / (std::f32::consts::PI * area.max(1e-12)),
+            two_sided: false,
+        }
+    }
+
+    ///
+    /// A white luminaire with the intensities of the profile as they are, at `position`, its 0° pointing `down` and C0
+    /// towards `front` (made perpendicular to `down`).
+    ///
+    pub fn luminaire(
+        position: Vec3,
+        down: Vec3,
+        front: Vec3,
+        profile: std::sync::Arc<crate::IesProfile>,
+    ) -> Self {
+        let down = down.normalize();
+        let front = (front - down * front.dot(down)).normalize();
+        Self::Luminaire {
+            position,
+            down,
+            front,
+            color: vec3(1.0, 1.0, 1.0),
+            profile,
+            scale: 1.0,
+        }
+    }
+
+    /// Like [RtLight::luminaire], scaled so that it sends out `flux` lumen.
+    pub fn luminaire_with_flux(
+        position: Vec3,
+        down: Vec3,
+        front: Vec3,
+        profile: std::sync::Arc<crate::IesProfile>,
+        flux: f32,
+    ) -> Self {
+        let scale = flux / profile.flux().max(1e-12);
+        match Self::luminaire(position, down, front, profile) {
+            Self::Luminaire {
+                position,
+                down,
+                front,
+                color,
+                profile,
+                ..
+            } => Self::Luminaire {
+                position,
+                down,
+                front,
+                color,
+                profile,
+                scale,
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    /// Whether the light has an area, so it is sampled and can be hit by rays.
+    pub fn is_area(&self) -> bool {
+        matches!(self, Self::Rect { .. } | Self::Sphere { .. })
+    }
 }
 
 ///
@@ -384,6 +547,7 @@ pub struct RtScene {
     instances: Vec<RtInstance>,
     lights: Vec<RtLight>,
     environment: RtEnvironment,
+    fog: Option<RtFog>,
     instance_revision: u64,
     revision: u64,
 }
@@ -398,6 +562,7 @@ impl Default for RtScene {
             instances: Vec::new(),
             lights: Vec::new(),
             environment: RtEnvironment::default(),
+            fog: None,
             instance_revision: 0,
             revision: 0,
         }
@@ -599,6 +764,25 @@ impl RtScene {
     pub fn set_environment(&mut self, environment: RtEnvironment) {
         self.environment = environment;
         self.revision = next_revision();
+    }
+
+    /// Sets haze or fog over the whole scene, `None` for clear air.
+    pub fn set_fog(&mut self, fog: Option<RtFog>) {
+        self.fog = fog.filter(|f| !f.medium.is_clear());
+        self.revision = next_revision();
+    }
+
+    /// The fog over the whole scene.
+    pub fn fog(&self) -> Option<&RtFog> {
+        self.fog.as_ref()
+    }
+
+    /// Whether light is absorbed or scattered on its way through the scene, by fog or inside solids.
+    pub fn has_media(&self) -> bool {
+        self.fog.is_some()
+            || self.materials.iter().any(|m| {
+                m.medium.is_some_and(|m| !m.is_clear()) && m.transmission > 0.0 && !m.thin_walled
+            })
     }
 
     /// The meshes.

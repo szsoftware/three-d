@@ -26,11 +26,21 @@ mod accel;
 mod bvh;
 #[cfg(feature = "wgpu")]
 mod compute;
+mod denoise;
 #[cfg(feature = "three-d")]
 mod display;
 mod error;
 #[cfg(feature = "wgpu")]
 mod gpu;
+mod ies;
+mod lens;
+mod light;
+mod medium;
+mod photons;
+#[cfg(feature = "three-d")]
+mod preview;
+#[cfg(all(feature = "three-d", not(target_arch = "wasm32")))]
+mod preview_worker;
 mod render_image;
 mod sampling;
 mod scene;
@@ -43,9 +53,15 @@ pub use accel::*;
 pub use bvh::{Bvh, BvhNode};
 #[cfg(feature = "wgpu")]
 pub use compute::*;
+pub use denoise::*;
 pub use error::*;
 #[cfg(feature = "wgpu")]
 pub use gpu::*;
+pub use ies::IesProfile;
+pub use lens::DepthOfField;
+pub use medium::{RtFog, RtMedium};
+#[cfg(feature = "three-d")]
+pub use preview::*;
 pub use render_image::*;
 pub use scene::*;
 pub use sky::*;

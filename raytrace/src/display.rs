@@ -8,8 +8,8 @@ use three_d::{Context, Interpolation, Texture2D, Wrapping};
 impl RenderImage {
     ///
     /// A three-d texture with the linear average of every pixel in cd/m² (32 bit floats), for example to show it with a
-    /// tone mapping of three-d or to combine it with the raster view. The bottom row of the image is at texture
-    /// coordinate v = 0, as three-d expects.
+    /// tone mapping of three-d or to combine it with the raster view. The first row of the texture data is the top of
+    /// the image, as with every texture of three-d, so it shows upright.
     ///
     pub fn to_three_d_texture(&self, context: &Context) -> Texture2D {
         let texture = Texture2D::new_empty::<[f32; 4]>(
@@ -37,13 +37,12 @@ impl RenderImage {
             texture.width() == self.width() && texture.height() == self.height(),
             "the texture has another size than the render_image"
         );
-        texture.fill(&self.bottom_up_rgba());
+        texture.fill(&self.rgba());
     }
 
-    /// The average of every pixel with alpha one, bottom row first.
-    pub(crate) fn bottom_up_rgba(&self) -> Vec<[f32; 4]> {
+    /// The average of every pixel with alpha one, top row first.
+    pub(crate) fn rgba(&self) -> Vec<[f32; 4]> {
         (0..self.height())
-            .rev()
             .flat_map(|y| (0..self.width()).map(move |x| (x, y)))
             .map(|(x, y)| {
                 let p = self.pixel(x, y);

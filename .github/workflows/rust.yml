@@ -64,6 +64,12 @@ jobs:
       - if: startsWith(matrix.os, 'ubuntu')
         run: sudo apt-get install -y mesa-vulkan-drivers libegl1 libegl-mesa0 libgl1-mesa-dri && echo "THREE_D_EXPECT_BACKEND=vulkan" >> $GITHUB_ENV
 
+      # Only lavapipe for the Vulkan loader: with all Mesa drivers it loads and unloads the ones without a device while
+      # other test threads create their instances, and the loader of Ubuntu 26.04 crashes in that race (SIGSEGV in
+      # vkEnumeratePhysicalDevices next to dlclose)
+      - if: startsWith(matrix.os, 'ubuntu')
+        run: echo "VK_ICD_FILENAMES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -1)" >> $GITHUB_ENV
+
       # macOS tests the wgpu backend on Metal and Windows on DirectX 12 (software adapter), both against what OpenGL returned on Linux
       - if: startsWith(matrix.os, 'macos')
         run: echo "THREE_D_EXPECT_BACKEND=metal" >> $GITHUB_ENV

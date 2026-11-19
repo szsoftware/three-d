@@ -1,7 +1,7 @@
 // Average of every pixel with alpha one, in rows padded for copying into a texture.
 
 struct Resolve {
-    // x: width, y: height, z: row pitch in pixels
+    // x: width, y: height, z: row pitch in pixels, w: vec4 per pixel in the sums
     size: vec4<u32>,
     // x: one over the number of samples
     scale: vec4<f32>,
@@ -17,6 +17,7 @@ fn resolve(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= size.x || id.y >= size.y {
         return;
     }
-    let sum = sums[id.y * size.x + id.x];
-    averages[id.y * size.z + id.x] = vec4<f32>(sum.rgb * resolve_params.scale.x, 1.0);
+    let sum = sums[(id.y * size.x + id.x) * size.w];
+    // three-d keeps the bottom row of the image first in the memory of a texture
+    averages[(size.y - 1u - id.y) * size.z + id.x] = vec4<f32>(sum.rgb * resolve_params.scale.x, 1.0);
 }

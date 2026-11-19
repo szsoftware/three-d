@@ -18,7 +18,7 @@ targets = ["x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows
 
 [features]
 default = ["window"]
-window = ["glutin", "winit", "raw-window-handle", "wasm-bindgen", "serde", "serde-wasm-bindgen", "web-sys"] # Window module
+window = ["glutin", "winit", "raw-window-handle", "wasm-bindgen", "serde", "serde-wasm-bindgen", "web-sys", "js-sys", "wasm-bindgen-futures"] # Window module
 egui-gui = ["egui_glow", "egui"] # Additional GUI features 
 text = ["swash", "lyon"] # Text mesh generation features
 wgpu = ["dep:wgpu", "dep:naga", "dep:pollster"] # Additional wgpu backend (see docs/wgpu-backend.md), OpenGL/WebGL stays the default
@@ -51,6 +51,9 @@ wasm-bindgen = {version = "0.2", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde-wasm-bindgen = { version = "0.6", optional = true }
 web-sys = { version = "0.3", features = ['Document', 'HtmlCollection', 'HtmlCanvasElement', 'Window'], optional = true }
+# To ask the browser whether its WebGPU adapter is a software fallback, which wgpu does not tell
+js-sys = { version = "0.3", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
 web-time = "1.1"
 # WebGPU checks more than wgpu does natively, the shaders are handed over as WGSL text with that check turned off (see the wgpu backend)
 wgpu = { version = "29", optional = true, default-features = false, features = ["wgsl"] }

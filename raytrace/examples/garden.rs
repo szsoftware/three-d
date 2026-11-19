@@ -1,5 +1,5 @@
 //!
-//! Renders the garden scene with the CPU reference tracer and writes a PNG and an OpenEXR file.
+//! Renders the garden scene with the CPU reference tracer and writes a PNG and an OpenEXR file, and a denoised PNG.
 //!
 //! cargo run --release -p three-d-raytrace --example garden -- [samples] [width] [height] [output name]
 //!
@@ -27,7 +27,7 @@ fn main() {
     );
 
     let mut tracer = CpuReferenceTracer::new();
-    let mut render_image = RenderImage::new(width, height);
+    let mut render_image = RenderImage::with_features(width, height);
     let start = std::time::Instant::now();
     tracer.prepare(&scene).unwrap();
     println!("Acceleration structure built in {:.2?}", start.elapsed());
@@ -53,5 +53,11 @@ fn main() {
         .save_png(format!("{name}.png"), &tone_mapping)
         .unwrap();
     render_image.save_exr(format!("{name}.exr")).unwrap();
-    println!("Wrote {name}.png and {name}.exr");
+    let start = std::time::Instant::now();
+    let denoised = AtrousDenoiser::default().denoise(&render_image).unwrap();
+    println!("Denoised in {:.2?}", start.elapsed());
+    denoised
+        .save_png(format!("{name}_denoised.png"), &tone_mapping)
+        .unwrap();
+    println!("Wrote {name}.png, {name}.exr and {name}_denoised.png");
 }

@@ -3,12 +3,15 @@
 //! the sums of the samples in a buffer on the GPU.
 //!
 
+use crate::render_image::FEATURE_WORDS;
 use crate::{
     AccelBuilder, Camera, CpuAccel, CpuBvhBuilder, GpuDevice, RaytraceSupport, RenderImage,
     RtEnvironment, RtError, RtLight, RtScene, RtTexture, RtWrapping, TextureId, TraceSettings,
     Tracer, TracerKind,
 };
 use three_d::wgpu as w;
+
+mod denoise_gpu;
 use three_d::wgpu::util::DeviceExt;
 use three_d_asset::prelude::*;
 use three_d_asset::ProjectionType;
@@ -42,9 +45,29 @@ pub struct ComputeTracer {
     buffers: Option<SceneBuffers>,
     layout: w::BindGroupLayout,
     pipeline: w::ComputePipeline,
+    /// The tracer with participating media (MEDIA in trace.wgsl), made for the first scene with media: larger, so the
+    /// tracer for scenes without stays small for the compilers of small GPUs
+    media_pipeline: Option<w::ComputePipeline>,
+    module: w::ShaderModule,
+    pipeline_layout: w::PipelineLayout,
+    /// The passes of caustic photons: shoot, count per cell, find where cells start, sort
+    photon_layout: w::BindGroupLayout,
+    photon_pipelines: [w::ComputePipeline; 4],
+    /// The lights and, with caustics, the photons and their grid (binding 7)
+    extras: Option<w::Buffer>,
     tile_size: u32,
     scratch: Option<GpuRenderImage>,
+    /// Submissions that may still run, oldest first, see [MAX_SUBMISSIONS_IN_FLIGHT]
+    in_flight: std::collections::VecDeque<w::SubmissionIndex>,
 }
+
+/// Submissions of the tracer the GPU may have queued at once; the tracer waits for the oldest before it adds another.
+/// GPUs that can not interrupt compute work (Intel graphics of the 7th generation) run everything queued before the
+/// driver's check that the GPU is alive, and Linux resets the GPU when that waits a few seconds. One tile and sample per
+/// submission and few of them keep the queue short. In the browser the tracer can not wait; there the queue is not
+/// limited.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_SUBMISSIONS_IN_FLIGHT: usize = 2;
 
 impl ComputeTracer {
     ///
@@ -104,6 +127,42 @@ impl ComputeTracer {
             compilation_options: Default::default(),
             cache: None,
         });
+        // Without the render image, with the photons written
+        let photon_layout = device.create_bind_group_layout(&w::BindGroupLayoutDescriptor {
+            label: Some("caustic photons"),
+            entries: &[
+                uniform(0, false, 0),
+                uniform(1, true, TILE_BYTES),
+                storage(2, true),
+                storage(3, true),
+                storage(4, true),
+                storage(5, true),
+                storage(6, true),
+                storage(7, false),
+                storage(9, true),
+            ],
+        });
+        let photon_pipeline_layout = device.create_pipeline_layout(&w::PipelineLayoutDescriptor {
+            label: Some("caustic photons"),
+            bind_group_layouts: &[Some(&photon_layout)],
+            immediate_size: 0,
+        });
+        let photon_pipelines = [
+            "shoot_photons",
+            "count_photons",
+            "find_cell_starts",
+            "sort_photons",
+        ]
+        .map(|entry| {
+            device.create_compute_pipeline(&w::ComputePipelineDescriptor {
+                label: Some(entry),
+                layout: Some(&photon_pipeline_layout),
+                module: &module,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        });
         Self {
             gpu: gpu.clone(),
             builder: CpuBvhBuilder::default(),
@@ -111,8 +170,15 @@ impl ComputeTracer {
             buffers: None,
             layout,
             pipeline,
+            media_pipeline: None,
+            module,
+            pipeline_layout,
+            photon_layout,
+            photon_pipelines,
+            extras: None,
             tile_size: 256,
             scratch: None,
+            in_flight: std::collections::VecDeque::new(),
         }
     }
 
@@ -138,6 +204,14 @@ impl ComputeTracer {
         self.tile_size
     }
 
+    ///
+    /// Why the tracer can not trace scenes with participating media on its device (fog, smoke, tinted glass), `None`
+    /// if it can. [ComputeTracer::trace_gpu] returns [RtError::Gpu] for such scenes there; trace them on the CPU.
+    ///
+    pub fn media_problem(&self) -> Option<String> {
+        crate::media_problem(&self.gpu.device.adapter_info())
+    }
+
     /// The device the tracer runs on.
     pub fn gpu(&self) -> &GpuDevice {
         &self.gpu
@@ -158,12 +232,76 @@ impl ComputeTracer {
             return Err(RtError::EmptyImage);
         }
         self.prepare(scene)?;
-        let buffers = self.buffers.as_ref().expect("prepared");
+        if scene.has_media() {
+            if let Some(why) = self.media_problem() {
+                return Err(RtError::Gpu(why));
+            }
+        }
+        if scene.has_media() && self.media_pipeline.is_none() {
+            self.media_pipeline = Some(self.gpu.device.create_compute_pipeline(
+                &w::ComputePipelineDescriptor {
+                    label: Some("ray tracing with media"),
+                    layout: Some(&self.pipeline_layout),
+                    module: &self.module,
+                    entry_point: Some("trace"),
+                    compilation_options: w::PipelineCompilationOptions {
+                        constants: &[("MEDIA", 1.0)],
+                        ..Default::default()
+                    },
+                    cache: None,
+                },
+            ));
+        }
+        let pipeline = match &self.media_pipeline {
+            Some(pipeline) if scene.has_media() => pipeline,
+            _ => &self.pipeline,
+        };
         let device = &self.gpu.device;
+        let buffers = self.buffers.as_ref().expect("prepared");
+        let caustics = CausticPlan::new(
+            scene,
+            self.accel.as_ref().expect("prepared"),
+            settings,
+            buffers.lights.0.len() as u32,
+            device.limits().max_storage_buffer_binding_size,
+        );
+
+        // The lights and the room for the photons, written before the passes of this call
+        let light_bytes = buffers.lights.bytes();
+        let extras_size = match &caustics {
+            Some(plan) => 4 * plan.words as u64,
+            None => light_bytes.len().max(16) as u64,
+        };
+        if self.extras.as_ref().is_none_or(|b| b.size() < extras_size) {
+            self.extras = Some(device.create_buffer(&w::BufferDescriptor {
+                label: Some("ray tracing lights and photons"),
+                size: extras_size,
+                usage: w::BufferUsages::STORAGE | w::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        let extras = self.extras.as_ref().expect("created");
+        if !light_bytes.is_empty() {
+            self.gpu.queue.write_buffer(extras, 0, &light_bytes);
+        }
+        if let Some(plan) = &caustics {
+            self.gpu.queue.write_buffer(
+                extras,
+                4 * plan.sources as u64,
+                &plan.emitter_bytes(&buffers.profiles),
+            );
+        }
 
         let params = device.create_buffer_init(&w::util::BufferInitDescriptor {
             label: Some("ray tracing parameters"),
-            contents: &params_bytes(scene, camera, image.width, image.height, settings),
+            contents: &params_bytes(
+                scene,
+                camera,
+                image.width,
+                image.height,
+                settings,
+                caustics.as_ref(),
+            ),
             usage: w::BufferUsages::UNIFORM,
         });
 
@@ -193,8 +331,11 @@ impl ComputeTracer {
                     rect[3],
                     image.samples + s,
                     1,
-                    0,
-                    0,
+                    u32::from(image.features),
+                    caustics.as_ref().map_or(0, |_| {
+                        crate::photons::gather_radius(settings.caustic_radius, image.samples + s)
+                            .to_bits()
+                    }),
                 ];
                 for (i, word) in words.iter().enumerate() {
                     tile_data[at + 4 * i..at + 4 * i + 4].copy_from_slice(&word.to_le_bytes());
@@ -245,7 +386,7 @@ impl ComputeTracer {
                 },
                 w::BindGroupEntry {
                     binding: 7,
-                    resource: buffers.lights.as_entire_binding(),
+                    resource: extras.as_entire_binding(),
                 },
                 w::BindGroupEntry {
                     binding: 8,
@@ -258,18 +399,79 @@ impl ComputeTracer {
             ],
         });
 
-        // One submission per sample, so the GPU can go on with other work between them
+        let photon_bind_group = caustics.as_ref().map(|_| {
+            fn entry(binding: u32, buffer: &w::Buffer) -> w::BindGroupEntry<'_> {
+                w::BindGroupEntry {
+                    binding,
+                    resource: buffer.as_entire_binding(),
+                }
+            }
+            device.create_bind_group(&w::BindGroupDescriptor {
+                label: Some("caustic photons"),
+                layout: &self.photon_layout,
+                entries: &[
+                    entry(0, &params),
+                    w::BindGroupEntry {
+                        binding: 1,
+                        resource: w::BindingResource::Buffer(w::BufferBinding {
+                            buffer: &tile_buffer,
+                            offset: 0,
+                            size: std::num::NonZeroU64::new(TILE_BYTES),
+                        }),
+                    },
+                    entry(2, &buffers.nodes),
+                    entry(3, &buffers.triangles),
+                    entry(4, &buffers.vertices),
+                    entry(5, &buffers.instances),
+                    entry(6, &buffers.materials),
+                    entry(7, extras),
+                    entry(9, &buffers.texels),
+                ],
+            })
+        });
+
+        // One submission per sample and tile, so the GPU can go on with other work between them, and only a few at a time
         for s in 0..samples {
             let mut encoder = device.create_command_encoder(&w::CommandEncoderDescriptor {
                 label: Some("ray tracing"),
             });
-            {
+            if let (Some(plan), Some(bind_group)) = (&caustics, &photon_bind_group) {
+                // The photons of this sample: shot, counted per cell, sorted by cell
+                encoder.clear_buffer(
+                    extras,
+                    4 * plan.counter as u64,
+                    Some(4 * (plan.counts + PHOTON_CELLS - plan.counter) as u64),
+                );
                 let mut pass = encoder.begin_compute_pass(&w::ComputePassDescriptor {
-                    label: Some("ray tracing"),
+                    label: Some("caustic photons"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.pipeline);
-                for (t, rect) in tiles.iter().enumerate() {
+                let offset = (s as u64 * tiles.len() as u64 * stride) as u32;
+                pass.set_bind_group(0, bind_group, &[offset]);
+                let groups = plan.capacity().div_ceil(64);
+                for (pipeline, groups) in self
+                    .photon_pipelines
+                    .iter()
+                    .zip([groups, groups, 1, groups])
+                {
+                    pass.set_pipeline(pipeline);
+                    pass.dispatch_workgroups(groups, 1, 1);
+                }
+            }
+            let mut first = Some(encoder);
+            for (t, rect) in tiles.iter().enumerate() {
+                // The photons go with the first tile
+                let mut encoder = first.take().unwrap_or_else(|| {
+                    device.create_command_encoder(&w::CommandEncoderDescriptor {
+                        label: Some("ray tracing"),
+                    })
+                });
+                {
+                    let mut pass = encoder.begin_compute_pass(&w::ComputePassDescriptor {
+                        label: Some("ray tracing"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(pipeline);
                     let offset = (s as u64 * tiles.len() as u64 + t as u64) * stride;
                     pass.set_bind_group(0, &bind_group, &[offset as u32]);
                     pass.dispatch_workgroups(
@@ -278,11 +480,36 @@ impl ComputeTracer {
                         1,
                     );
                 }
+                submit(&self.gpu, &mut self.in_flight, encoder.finish());
             }
-            self.gpu.queue.submit([encoder.finish()]);
         }
         image.samples += samples;
         Ok(())
+    }
+}
+
+/// Submits work after waiting for the oldest submission when [MAX_SUBMISSIONS_IN_FLIGHT] may still run.
+fn submit(
+    gpu: &GpuDevice,
+    in_flight: &mut std::collections::VecDeque<w::SubmissionIndex>,
+    commands: w::CommandBuffer,
+) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        while in_flight.len() >= MAX_SUBMISSIONS_IN_FLIGHT {
+            let oldest = in_flight.pop_front().unwrap();
+            // An error (a lost device) shows when the work is read back
+            let _ = gpu.device.poll(w::PollType::Wait {
+                submission_index: Some(oldest),
+                timeout: None,
+            });
+        }
+        in_flight.push_back(gpu.queue.submit([commands]));
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = in_flight;
+        gpu.queue.submit([commands]);
     }
 }
 
@@ -337,8 +564,10 @@ impl Tracer for ComputeTracer {
             ));
         }
         let (width, height) = (render_image.width(), render_image.height());
+        let features = render_image.has_features();
         let mut scratch = match self.scratch.take() {
-            Some(s) if s.width == width && s.height == height => s,
+            Some(s) if s.width == width && s.height == height && s.features == features => s,
+            _ if features => GpuRenderImage::with_features(&self.gpu, width, height),
             _ => GpuRenderImage::new(&self.gpu, width, height),
         };
         scratch.reset();
@@ -346,7 +575,11 @@ impl Tracer for ComputeTracer {
         scratch.samples = render_image.sample_count();
         let result = self.trace_gpu(scene, camera, &mut scratch, settings);
         if result.is_ok() {
-            render_image.accumulate(&scratch.read_sums(), settings.samples_per_call);
+            scratch.add_to(
+                render_image,
+                &scratch.read_sums(),
+                settings.samples_per_call,
+            );
         }
         self.scratch = Some(scratch);
         result
@@ -364,15 +597,36 @@ pub struct GpuRenderImage {
     height: u32,
     samples: u32,
     sums: w::Buffer,
+    /// Three words per pixel with the features for a denoiser instead of one.
+    features: bool,
     resolve: Option<Resolve>,
+    denoise: Option<Box<denoise_gpu::GpuDenoise>>,
 }
 
 impl GpuRenderImage {
     /// A black render image with the given size.
     pub fn new(gpu: &GpuDevice, width: u32, height: u32) -> Self {
+        Self::create(gpu, width, height, false)
+    }
+
+    ///
+    /// A black render image that also collects the features for denoising, like [RenderImage::with_features]. Costs 32
+    /// more bytes per pixel.
+    ///
+    pub fn with_features(gpu: &GpuDevice, width: u32, height: u32) -> Self {
+        Self::create(gpu, width, height, true)
+    }
+
+    /// Whether the image collects features.
+    pub fn has_features(&self) -> bool {
+        self.features
+    }
+
+    fn create(gpu: &GpuDevice, width: u32, height: u32, features: bool) -> Self {
+        let words = if features { 3 } else { 1 };
         let sums = gpu.device.create_buffer(&w::BufferDescriptor {
             label: Some("render image"),
-            size: (width.max(1) as u64) * (height.max(1) as u64) * 16,
+            size: (width.max(1) as u64) * (height.max(1) as u64) * 16 * words,
             usage: w::BufferUsages::STORAGE | w::BufferUsages::COPY_SRC | w::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -382,7 +636,9 @@ impl GpuRenderImage {
             height,
             samples: 0,
             sums,
+            features,
             resolve: None,
+            denoise: None,
         }
     }
 
@@ -416,7 +672,43 @@ impl GpuRenderImage {
 
     /// Changes the size and forgets all samples.
     pub fn resize(&mut self, width: u32, height: u32) {
-        *self = Self::new(&self.gpu, width, height);
+        *self = Self::create(&self.gpu, width, height, self.features);
+    }
+
+    /// A render image of the CPU for the sums read back, with features if collected.
+    fn empty_render_image(&self) -> RenderImage {
+        if self.features {
+            RenderImage::with_features(self.width, self.height)
+        } else {
+            RenderImage::new(self.width, self.height)
+        }
+    }
+
+    /// Adds sums read back from this image to a render image.
+    fn add_to(&self, render_image: &mut RenderImage, sums: &[[f32; 4]], samples: u32) {
+        if self.features {
+            let features: Vec<[f32; FEATURE_WORDS]> = sums
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|p| {
+                    [
+                        p[1][0], p[1][1], p[1][2], p[2][0], p[2][1], p[2][2], p[1][3], p[0][3],
+                    ]
+                })
+                .collect();
+            render_image.accumulate_features(&features);
+            let colors: Vec<[f32; 3]> = sums
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|p| [p[0][0], p[0][1], p[0][2]])
+                .collect();
+            render_image.accumulate(&colors, samples);
+        } else {
+            let colors: Vec<[f32; 3]> = sums.iter().map(|p| [p[0], p[1], p[2]]).collect();
+            render_image.accumulate(&colors, samples);
+        }
     }
 
     ///
@@ -425,20 +717,20 @@ impl GpuRenderImage {
     ///
     #[cfg(not(target_arch = "wasm32"))]
     pub fn read(&self) -> RenderImage {
-        let mut render_image = RenderImage::new(self.width, self.height);
-        render_image.accumulate(&self.read_sums(), self.samples);
+        let mut render_image = self.empty_render_image();
+        self.add_to(&mut render_image, &self.read_sums(), self.samples);
         render_image
     }
 
     /// Copies the samples into a [RenderImage] once the GPU is done, also in a browser.
     pub async fn read_async(&self) -> RenderImage {
         let sums = self.start_read().await;
-        let mut render_image = RenderImage::new(self.width, self.height);
-        render_image.accumulate(&sums, self.samples);
+        let mut render_image = self.empty_render_image();
+        self.add_to(&mut render_image, &sums, self.samples);
         render_image
     }
 
-    fn read_sums(&self) -> Vec<[f32; 3]> {
+    fn read_sums(&self) -> Vec<[f32; 4]> {
         let pending = self.start_read();
         #[cfg(not(target_arch = "wasm32"))]
         let _ = self.gpu.device.poll(w::PollType::wait_indefinitely());
@@ -475,7 +767,7 @@ impl GpuRenderImage {
         PendingSums {
             device: self.gpu.device.clone(),
             buffer: staging,
-            pixels: (self.width * self.height) as usize,
+            words: (self.width * self.height) as usize * if self.features { 3 } else { 1 },
             state,
         }
     }
@@ -503,7 +795,7 @@ impl GpuRenderImage {
             self.width,
             self.height,
             pitch,
-            0,
+            if self.features { 3 } else { 1 },
             (1.0 / self.samples.max(1) as f32).to_bits(),
             0,
             0,
@@ -548,29 +840,45 @@ impl GpuRenderImage {
                 1,
             );
         }
-        // Rows of wgpu textures start at the top like the render image, which three-d shows upright
-        encoder.copy_buffer_to_texture(
-            w::TexelCopyBufferInfo {
-                buffer: &resolve.averages,
-                layout: w::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(pitch * 16),
-                    rows_per_image: Some(self.height),
-                },
-            },
-            w::TexelCopyTextureInfo {
-                texture: &target,
-                mip_level: 0,
-                origin: w::Origin3d::ZERO,
-                aspect: w::TextureAspect::All,
-            },
-            w::Extent3d {
-                width: self.width,
-                height: self.height,
-                depth_or_array_layers: 1,
-            },
+        copy_rows_to_texture(
+            &mut encoder,
+            &resolve.averages,
+            pitch,
+            self.width,
+            self.height,
+            &target,
         );
         self.gpu.queue.submit([encoder.finish()]);
+    }
+
+    ///
+    /// Like [GpuRenderImage::write_to_three_d_texture], but denoised on the GPU by the filter of `denoiser`.
+    ///
+    /// # Panics
+    /// If the image collects no features (see [GpuRenderImage::with_features]), or as
+    /// [GpuRenderImage::write_to_three_d_texture].
+    ///
+    pub fn write_denoised_to_three_d_texture(
+        &mut self,
+        texture: &three_d::Texture2D,
+        denoiser: &crate::AtrousDenoiser,
+    ) {
+        assert!(self.features, "the render image collects no features");
+        assert!(
+            texture.width() == self.width && texture.height() == self.height,
+            "the texture has another size than the render image"
+        );
+        let target = texture
+            .as_wgpu()
+            .expect("the texture is not from the wgpu backend");
+        let denoise = self.denoise.get_or_insert_with(|| {
+            Box::new(denoise_gpu::GpuDenoise::new(
+                &self.gpu.device,
+                self.width,
+                self.height,
+            ))
+        });
+        denoise.run(&self.gpu, &self.sums, self.samples, denoiser, &target);
     }
 
     /// A three-d texture with the average of every pixel, see [GpuRenderImage::write_to_three_d_texture].
@@ -588,6 +896,39 @@ impl GpuRenderImage {
         self.write_to_three_d_texture(&texture);
         texture
     }
+}
+
+/// Copies rows of RGBA floats with `pitch` pixels each into a texture, in the order of its memory: three-d keeps the
+/// bottom row of an image first there, as OpenGL does.
+fn copy_rows_to_texture(
+    encoder: &mut w::CommandEncoder,
+    buffer: &w::Buffer,
+    pitch: u32,
+    width: u32,
+    height: u32,
+    target: &w::Texture,
+) {
+    encoder.copy_buffer_to_texture(
+        w::TexelCopyBufferInfo {
+            buffer,
+            layout: w::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(pitch * 16),
+                rows_per_image: Some(height),
+            },
+        },
+        w::TexelCopyTextureInfo {
+            texture: target,
+            mip_level: 0,
+            origin: w::Origin3d::ZERO,
+            aspect: w::TextureAspect::All,
+        },
+        w::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
 }
 
 /// The pipeline and buffers that turn the sums into averages in rows a texture copy accepts.
@@ -645,12 +986,13 @@ struct PendingSums {
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     device: w::Device,
     buffer: w::Buffer,
-    pixels: usize,
+    /// Number of vec4 to read.
+    words: usize,
     state: std::sync::Arc<std::sync::Mutex<MapState>>,
 }
 
 impl PendingSums {
-    fn finish(&self) -> Vec<[f32; 3]> {
+    fn finish(&self) -> Vec<[f32; 4]> {
         let ok = self
             .state
             .lock()
@@ -659,7 +1001,7 @@ impl PendingSums {
             .unwrap_or(false);
         if !ok {
             // The device was lost: no samples
-            return vec![[0.0; 3]; self.pixels];
+            return vec![[0.0; 4]; self.words];
         }
         let data = self.buffer.slice(..).get_mapped_range();
         let floats: Vec<f32> = data
@@ -674,14 +1016,14 @@ impl PendingSums {
             .as_chunks::<4>()
             .0
             .iter()
-            .take(self.pixels)
-            .map(|p| [p[0], p[1], p[2]])
+            .take(self.words)
+            .copied()
             .collect()
     }
 }
 
 impl std::future::Future for PendingSums {
-    type Output = Vec<[f32; 3]>;
+    type Output = Vec<[f32; 4]>;
 
     fn poll(
         self: std::pin::Pin<&mut Self>,
@@ -718,12 +1060,16 @@ struct SceneBuffers {
     vertices: w::Buffer,
     instances: w::Buffer,
     materials: w::Buffer,
-    lights: w::Buffer,
+    /// Four vec4 per light and the tables of their profiles, written into the buffer of lights and photons with every
+    /// call
+    lights: Words,
+    /// The profiles of luminaires and the words where their tables start
+    profiles: Vec<(std::sync::Arc<crate::IesProfile>, u32)>,
     texels: w::Buffer,
 }
 
 /// Words of a buffer, floats by their bits.
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct Words(Vec<u32>);
 
 impl Words {
@@ -854,7 +1200,37 @@ impl SceneBuffers {
             materials.u(NONE);
             materials.u(NONE);
         }
+        // The media inside solids as entries after the materials: absorption and anisotropy, scattering
+        let count = scene.materials().len();
+        for (i, m) in scene.materials().iter().enumerate() {
+            let Some(medium) = m
+                .medium
+                .filter(|md| !md.is_clear() && m.transmission > 0.0 && !m.thin_walled)
+            else {
+                continue;
+            };
+            let entry = materials.0.len() as u32 / MATERIAL_WORDS;
+            materials.0[i * MATERIAL_WORDS as usize + 21] = entry;
+            materials.v3(medium.absorption, medium.anisotropy);
+            materials.v3(medium.scattering, 0.0);
+            (0..4 * 4).for_each(|_| materials.f(0.0));
+        }
+        debug_assert!(materials.0.len() >= count * MATERIAL_WORDS as usize);
 
+        // The lights, then the tables of their profiles, one per distinct profile
+        let mut profiles: Vec<(std::sync::Arc<crate::IesProfile>, u32)> = Vec::new();
+        let mut table_word = 16 * scene.lights().len() as u32;
+        for light in scene.lights() {
+            if let RtLight::Luminaire { profile, .. } = light {
+                if !profiles
+                    .iter()
+                    .any(|(p, _)| std::sync::Arc::ptr_eq(p, profile))
+                {
+                    profiles.push((profile.clone(), table_word));
+                    table_word += profile.table().0.len() as u32;
+                }
+            }
+        }
         let mut lights = Words::default();
         for light in scene.lights() {
             match light {
@@ -865,6 +1241,8 @@ impl SceneBuffers {
                 } => {
                     lights.v3(*direction, 0.0);
                     lights.v3(*color * *illuminance, 0.0);
+                    lights.v3(Vec3::zero(), 0.0);
+                    lights.v3(Vec3::zero(), 0.0);
                 }
                 RtLight::Point {
                     position,
@@ -873,8 +1251,52 @@ impl SceneBuffers {
                 } => {
                     lights.v3(*position, 1.0);
                     lights.v3(*color * *intensity, 0.0);
+                    lights.v3(Vec3::zero(), 0.0);
+                    lights.v3(Vec3::zero(), 0.0);
+                }
+                RtLight::Luminaire {
+                    position,
+                    down,
+                    front,
+                    color,
+                    profile,
+                    scale,
+                } => {
+                    // A point light with the word of its table plus one and the rows of the table
+                    let (table, rows) = profile_table(&profiles, profile);
+                    lights.v3(*position, 1.0);
+                    lights.v3(*color * *scale, 0.0);
+                    lights.v3(*down, (table + 1) as f32);
+                    lights.v3(*front, rows as f32);
+                }
+                RtLight::Rect {
+                    corner,
+                    edge_u,
+                    edge_v,
+                    color,
+                    luminance,
+                    two_sided,
+                } => {
+                    lights.v3(*corner, 2.0);
+                    lights.v3(*color * *luminance, 0.0);
+                    lights.v3(*edge_u, if *two_sided { 1.0 } else { 0.0 });
+                    lights.v3(*edge_v, 0.0);
+                }
+                RtLight::Sphere {
+                    center,
+                    radius,
+                    color,
+                    luminance,
+                } => {
+                    lights.v3(*center, 3.0);
+                    lights.v3(*color * *luminance, 0.0);
+                    lights.v3(vec3(*radius, 0.0, 0.0), 0.0);
+                    lights.v3(Vec3::zero(), 0.0);
                 }
             }
+        }
+        for (profile, _) in &profiles {
+            profile.table().0.iter().for_each(|v| lights.f(*v));
         }
 
         let storage = |label, words: &Words| {
@@ -892,10 +1314,140 @@ impl SceneBuffers {
             vertices: storage("ray tracing vertices", &vertices),
             instances: storage("ray tracing instances", &instances),
             materials: storage("ray tracing materials", &materials),
-            lights: storage("ray tracing lights", &lights),
+            lights,
+            profiles,
             texels: storage("ray tracing textures", &texels),
         }
     }
+}
+
+/// Words of a material in trace.wgsl.
+const MATERIAL_WORDS: u32 = 24;
+
+/// Cells of the hashed photon grid, PHOTON_CELLS in trace.wgsl.
+const PHOTON_CELLS: u32 = 65536;
+/// Words of a photon, PHOTON_WORDS in trace.wgsl.
+const PHOTON_WORDS: u32 = 12;
+
+///
+/// Where the caustic photons of a call live in the buffer of lights and photons, in words (layout in trace.wgsl).
+///
+struct CausticPlan {
+    source_list: Vec<crate::photons::CausticSource>,
+    sphere_list: Vec<(Vec3, f32)>,
+    per_source: u32,
+    center: Vec3,
+    extent: f32,
+    counter: u32,
+    counts: u32,
+    sources: u32,
+    spheres: u32,
+    raw: u32,
+    words: u32,
+}
+
+impl CausticPlan {
+    /// The plan if caustics are asked for and the scene has solid glass and lights that cast them.
+    fn new(
+        scene: &RtScene,
+        accel: &CpuAccel,
+        settings: &TraceSettings,
+        light_words: u32,
+        max_binding: u64,
+    ) -> Option<Self> {
+        if settings.caustic_photons == 0 {
+            return None;
+        }
+        let sphere_list = crate::photons::glass_spheres(scene);
+        let source_list = crate::photons::caustic_sources(scene);
+        let (center, extent) = crate::photons::scene_box(accel)?;
+        if sphere_list.is_empty() || source_list.is_empty() {
+            return None;
+        }
+        let counter = light_words.next_multiple_of(4);
+        let counts = counter + 4;
+        let sources = counts + 3 * PHOTON_CELLS;
+        let spheres = sources + 16 * source_list.len() as u32;
+        let raw = spheres + 4 * sphere_list.len() as u32;
+        // Shot and sorted photons, as many as the largest buffer the device binds takes
+        let room = (max_binding / 4).saturating_sub(raw as u64) / (2 * PHOTON_WORDS as u64);
+        let photons = (settings.caustic_photons as u64).min(room);
+        let per_source = (photons / source_list.len() as u64).max(1) as u32;
+        let words = raw + 2 * PHOTON_WORDS * per_source * source_list.len() as u32;
+        Some(Self {
+            source_list,
+            sphere_list,
+            per_source,
+            center,
+            extent,
+            counter,
+            counts,
+            sources,
+            spheres,
+            raw,
+            words,
+        })
+    }
+
+    fn capacity(&self) -> u32 {
+        self.per_source * self.source_list.len() as u32
+    }
+
+    /// The sources and the glass spheres, written at `sources`.
+    fn emitter_bytes(&self, profiles: &[(std::sync::Arc<crate::IesProfile>, u32)]) -> Vec<u8> {
+        use crate::photons::CausticSource;
+        let mut words = Words::default();
+        for source in &self.source_list {
+            // Four vec4 each: kind and position or direction, light, the profile's down and front as for lights
+            match source {
+                CausticSource::Parallel {
+                    direction,
+                    light,
+                    cos_radius,
+                } => {
+                    words.v3(*direction, 0.0);
+                    words.v3(*light, *cos_radius);
+                    words.v3(Vec3::zero(), 0.0);
+                    words.v3(Vec3::zero(), 0.0);
+                }
+                CausticSource::Point {
+                    position,
+                    light,
+                    profile,
+                } => {
+                    words.v3(*position, 1.0);
+                    words.v3(*light, 1.0);
+                    match profile {
+                        Some((profile, down, front)) => {
+                            let (table, rows) = profile_table(profiles, profile);
+                            words.v3(*down, (table + 1) as f32);
+                            words.v3(*front, rows as f32);
+                        }
+                        None => {
+                            words.v3(Vec3::zero(), 0.0);
+                            words.v3(Vec3::zero(), 0.0);
+                        }
+                    }
+                }
+            }
+        }
+        for (center, radius) in &self.sphere_list {
+            words.v3(*center, *radius);
+        }
+        words.bytes()
+    }
+}
+
+/// Word of a profile's table in the buffer of lights and the number of its rows.
+fn profile_table(
+    profiles: &[(std::sync::Arc<crate::IesProfile>, u32)],
+    profile: &std::sync::Arc<crate::IesProfile>,
+) -> (u32, u32) {
+    let word = profiles
+        .iter()
+        .find(|(p, _)| std::sync::Arc::ptr_eq(p, profile))
+        .map_or(0, |(_, w)| *w);
+    (word, profile.table().1 as u32)
 }
 
 /// Texture id meaning no texture, as in trace.wgsl.
@@ -981,6 +1533,7 @@ fn params_bytes(
     width: u32,
     height: u32,
     settings: &TraceSettings,
+    caustics: Option<&CausticPlan>,
 ) -> Vec<u8> {
     let mut p = Words::default();
     let perspective = matches!(camera.projection_type(), ProjectionType::Perspective { .. });
@@ -1038,6 +1591,47 @@ fn params_bytes(
         }
         None => (0..4 * 11).for_each(|_| p.f(0.0)),
     }
+    match crate::lens::Lens::of(camera, settings.depth_of_field) {
+        Some(lens) => {
+            p.v3(lens.u, lens.focus_distance);
+            p.v3(lens.v, 1.0);
+            p.v3(lens.view, 0.0);
+        }
+        None => (0..12).for_each(|_| p.f(0.0)),
+    }
+    match caustics {
+        Some(plan) => {
+            p.f(0.0);
+            p.f(1.0);
+            p.f(plan.extent);
+            p.f(0.0);
+            p.v3(plan.center, 0.0);
+            p.u(plan.counter);
+            p.u(plan.counts);
+            p.u(plan.sources);
+            p.u(plan.spheres);
+            p.u(plan.source_list.len() as u32);
+            p.u(plan.sphere_list.len() as u32);
+            p.u(plan.per_source);
+            p.u(plan.raw);
+        }
+        None => (0..16).for_each(|_| p.f(0.0)),
+    }
+    match scene.fog() {
+        Some(fog) => {
+            p.v3(fog.medium.absorption, fog.medium.anisotropy);
+            p.v3(fog.medium.scattering, fog.height);
+            p.f(if fog.scale_height.is_finite() {
+                1.0 / fog.scale_height
+            } else {
+                0.0
+            });
+            p.f(1.0);
+        }
+        None => (0..10).for_each(|_| p.f(0.0)),
+    }
+    p.f(if scene.has_media() { 1.0 } else { 0.0 });
+    p.f(0.0);
     p.bytes()
 }
 
@@ -1065,6 +1659,7 @@ mod tests {
         for (name, source) in [
             ("trace.wgsl", include_str!("compute/trace.wgsl")),
             ("resolve.wgsl", include_str!("compute/resolve.wgsl")),
+            ("denoise.wgsl", include_str!("compute/denoise.wgsl")),
         ] {
             let module = naga::front::wgsl::parse_str(source)
                 .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(source)));

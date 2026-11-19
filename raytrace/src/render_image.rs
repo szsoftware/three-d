@@ -75,6 +75,26 @@ pub struct RenderImage {
     height: u32,
     sum: Vec<[f32; 3]>,
     samples: u32,
+    /// Sums of the features per pixel for a denoiser, see [RenderImage::with_features].
+    features: Option<Vec<[f32; FEATURE_WORDS]>>,
+}
+
+/// Words per pixel of the feature sums: albedo (3), normal (3), distance (1) and squared luminance (1).
+pub(crate) const FEATURE_WORDS: usize = 8;
+
+///
+/// What the camera sees first in a pixel, averaged over the samples, for a denoiser to tell edges from noise.
+///
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PixelFeatures {
+    /// Color of the surface; one for the sky, glass and mirrors.
+    pub albedo: Vec3,
+    /// Normal of the surface facing the camera, in world space, not normalized after averaging.
+    pub normal: Vec3,
+    /// Distance from the camera, large for the sky.
+    pub distance: f32,
+    /// Average squared luminance of the samples, for their variance.
+    pub luminance_squared: f32,
 }
 
 impl RenderImage {
@@ -85,7 +105,36 @@ impl RenderImage {
             height,
             sum: vec![[0.0; 3]; (width * height) as usize],
             samples: 0,
+            features: None,
         }
+    }
+
+    ///
+    /// A black render image that also collects the features a denoiser needs: albedo, normal and distance of what the
+    /// camera sees first, and the variance of the samples. Costs 32 more bytes per pixel.
+    ///
+    pub fn with_features(width: u32, height: u32) -> Self {
+        Self {
+            features: Some(vec![[0.0; FEATURE_WORDS]; (width * height) as usize]),
+            ..Self::new(width, height)
+        }
+    }
+
+    /// Whether the image collects features, see [RenderImage::with_features].
+    pub fn has_features(&self) -> bool {
+        self.features.is_some()
+    }
+
+    /// The averaged features of a pixel, x from the left and y from the top, if collected.
+    pub fn features(&self, x: u32, y: u32) -> Option<PixelFeatures> {
+        let f = self.features.as_ref()?[(y * self.width + x) as usize];
+        let n = self.samples.max(1) as f32;
+        Some(PixelFeatures {
+            albedo: vec3(f[0], f[1], f[2]) / n,
+            normal: vec3(f[3], f[4], f[5]) / n,
+            distance: f[6] / n,
+            luminance_squared: f[7] / n,
+        })
     }
 
     /// Width in pixels.
@@ -101,12 +150,19 @@ impl RenderImage {
     /// Forgets all samples, for example after the camera or the scene changed.
     pub fn reset(&mut self) {
         self.sum.iter_mut().for_each(|p| *p = [0.0; 3]);
+        if let Some(f) = &mut self.features {
+            f.iter_mut().for_each(|p| *p = [0.0; FEATURE_WORDS]);
+        }
         self.samples = 0;
     }
 
-    /// Changes the size and forgets all samples.
+    /// Changes the size and forgets all samples. Keeps collecting features if it did.
     pub fn resize(&mut self, width: u32, height: u32) {
-        *self = Self::new(width, height);
+        *self = if self.has_features() {
+            Self::with_features(width, height)
+        } else {
+            Self::new(width, height)
+        };
     }
 
     /// Number of samples every pixel has.
@@ -129,6 +185,19 @@ impl RenderImage {
             s[2] += a[2];
         }
         self.samples += samples;
+    }
+
+    /// Adds sums of features traced elsewhere, before the matching [RenderImage::accumulate]. Ignored without features.
+    #[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
+    pub(crate) fn accumulate_features(&mut self, sums: &[[f32; FEATURE_WORDS]]) {
+        if let Some(f) = &mut self.features {
+            assert_eq!(sums.len(), f.len(), "one feature sum per pixel");
+            for (s, a) in f.iter_mut().zip(sums) {
+                for i in 0..FEATURE_WORDS {
+                    s[i] += a[i];
+                }
+            }
+        }
     }
 
     /// Average luminance (linear sRGB, cd/m²) of a pixel, x from the left and y from the top.
@@ -238,12 +307,48 @@ impl RenderImage {
     }
 
     /// The sums of all pixels, row by row from the top, for a tracer to add to.
+    #[cfg(test)]
     pub(crate) fn rows_mut(&mut self) -> &mut [[f32; 3]] {
         &mut self.sum
     }
 
+    /// The sums and, if collected, the feature sums of all pixels.
+    pub(crate) fn rows_and_features_mut(
+        &mut self,
+    ) -> (&mut [[f32; 3]], Option<&mut [[f32; FEATURE_WORDS]]>) {
+        (&mut self.sum, self.features.as_deref_mut())
+    }
+
+    /// An image holding the given averages as if from one sample, without features.
+    pub(crate) fn from_averages(width: u32, height: u32, pixels: Vec<[f32; 3]>) -> Self {
+        Self {
+            width,
+            height,
+            sum: pixels,
+            samples: 1,
+            features: None,
+        }
+    }
+
     pub(crate) fn add_samples(&mut self, count: u32) {
         self.samples += count;
+    }
+
+    /// Adds the sums of an image of the same size (and features, where both have them), not its samples.
+    #[cfg_attr(not(feature = "three-d"), allow(dead_code))]
+    pub(crate) fn add_image(&mut self, other: &RenderImage) {
+        for (a, b) in self.sum.iter_mut().zip(&other.sum) {
+            for c in 0..3 {
+                a[c] += b[c];
+            }
+        }
+        if let (Some(a), Some(b)) = (&mut self.features, &other.features) {
+            for (a, b) in a.iter_mut().zip(b) {
+                for c in 0..FEATURE_WORDS {
+                    a[c] += b[c];
+                }
+            }
+        }
     }
 }
 
