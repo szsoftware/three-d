@@ -61,6 +61,19 @@ the frame rate of the application does not depend on the tracer; `update` shows 
 names devices whose drivers crash with the tracer (none known at the moment); `RaytraceSupport::of` reports `Cpu` for
 them and the preview says why.
 
+On the GPU the preview watches the time between updates while it traces (`PreviewSettings::gpu_frame_time`, 40 ms by
+default, not in the browser). After three slower frames in a row it halves the resolution, down to a quarter, and then
+goes on with the CPU, with the reason in `availability`. A frame five times slower (under 5 fps) goes at once to the
+resolution that would be fast enough, or to the CPU. Weak GPUs such as the Intel HD 4000 trace no faster than four
+CPU cores (about 0.5 million samples per second on the T430) but hold up every frame of the application while they do;
+the CPU traces beside the frames. `gpu_downscale` sets the starting resolution, `RaytracePreview::gpu_downscale` tells
+the current one. The texture is then smaller than the viewport; call `resize` only when the viewport changes, it
+starts again (and does nothing for the same size).
+
+The shaders of the GPU compile on another thread (not in the browser), which takes about 8 s on the HD 4000; the CPU
+traces meanwhile and the preview goes on with the GPU in the first `update` after (`is_compiling`, `wait_for_gpu`).
+With wgpu on OpenGL the driver may still hold the context while it compiles.
+
 Textures are shared with wgpu through `Texture2D::as_wgpu` in three-d, which keeps the order of three-d's work and the
 tracer's on the queue.
 
