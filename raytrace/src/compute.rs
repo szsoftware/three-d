@@ -83,7 +83,11 @@ fn probe_constants() -> Vec<(&'static str, f64)> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    vec![("MEDIA", 1.0), ("PROBE", f64::from(probe))]
+    let mut constants = vec![("MEDIA", 1.0), ("PROBE", f64::from(probe))];
+    if probe & 128 != 0 {
+        constants.push(("CONTACT", 0.0));
+    }
+    constants
 }
 
 /// The constants of all pipelines on the adapter: without CONTACT where the tracer would get too large (Intel graphics

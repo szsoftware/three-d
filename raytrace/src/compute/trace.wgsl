@@ -1729,6 +1729,9 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
             }
         }
         let hit = walk(ray_origin, ray_direction, light_distance, shadow);
+        if (PROBE & 4096u) != 0u {
+            return vec3<f32>(4.0, hit.t, f32(hit.instance == NONE));
+        }
         if CONTACT && !shadow {
             skip_instance = NONE;
         }
@@ -1753,6 +1756,9 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
                     end = hit.t;
                 }
                 let step = sample_medium(origin, direction, end);
+                if (PROBE & 1024u) != 0u {
+                    return vec3<f32>(9.0, step.weight.x, step.t);
+                }
                 throughput *= step.weight;
                 if step.t >= 0.0 {
                     if bounce >= params.camera.w {
@@ -1799,6 +1805,9 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
                 }
                 break;
             } else if hit.instance == NONE {
+                if (PROBE & 2048u) != 0u {
+                    return vec3<f32>(8.0, throughput.x, environment(direction, true).x);
+                }
                 result += clamped(bounce, throughput * environment(direction, last_was_delta && (!diffuse_seen || (glass_reflected && params.caustics.y == 0.0))));
                 if bounce == 0u {
                     add_features(vec3<f32>(1.0), -direction, SKY_DISTANCE);
