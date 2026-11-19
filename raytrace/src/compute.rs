@@ -45,6 +45,11 @@ pub struct ComputeTracer {
     buffers: Option<SceneBuffers>,
     layout: w::BindGroupLayout,
     pipeline: w::ComputePipeline,
+    /// The tracer with participating media (MEDIA in trace.wgsl), made for the first scene with media: larger, so the
+    /// tracer for scenes without stays small for the compilers of small GPUs
+    media_pipeline: Option<w::ComputePipeline>,
+    module: w::ShaderModule,
+    pipeline_layout: w::PipelineLayout,
     /// The passes of caustic photons: shoot, count per cell, find where cells start, sort
     photon_layout: w::BindGroupLayout,
     photon_pipelines: [w::ComputePipeline; 4],
@@ -165,6 +170,9 @@ impl ComputeTracer {
             buffers: None,
             layout,
             pipeline,
+            media_pipeline: None,
+            module,
+            pipeline_layout,
             photon_layout,
             photon_pipelines,
             extras: None,
@@ -216,6 +224,25 @@ impl ComputeTracer {
             return Err(RtError::EmptyImage);
         }
         self.prepare(scene)?;
+        if scene.has_media() && self.media_pipeline.is_none() {
+            self.media_pipeline = Some(self.gpu.device.create_compute_pipeline(
+                &w::ComputePipelineDescriptor {
+                    label: Some("ray tracing with media"),
+                    layout: Some(&self.pipeline_layout),
+                    module: &self.module,
+                    entry_point: Some("trace"),
+                    compilation_options: w::PipelineCompilationOptions {
+                        constants: &[("MEDIA", 1.0)],
+                        ..Default::default()
+                    },
+                    cache: None,
+                },
+            ));
+        }
+        let pipeline = match &self.media_pipeline {
+            Some(pipeline) if scene.has_media() => pipeline,
+            _ => &self.pipeline,
+        };
         let device = &self.gpu.device;
         let buffers = self.buffers.as_ref().expect("prepared");
         let caustics = CausticPlan::new(
@@ -431,7 +458,7 @@ impl ComputeTracer {
                         label: Some("ray tracing"),
                         timestamp_writes: None,
                     });
-                    pass.set_pipeline(&self.pipeline);
+                    pass.set_pipeline(pipeline);
                     let offset = (s as u64 * tiles.len() as u64 + t as u64) * stride;
                     pass.set_bind_group(0, &bind_group, &[offset as u32]);
                     pass.dispatch_workgroups(
@@ -1160,6 +1187,22 @@ impl SceneBuffers {
             materials.u(NONE);
             materials.u(NONE);
         }
+        // The media inside solids as entries after the materials: absorption and anisotropy, scattering
+        let count = scene.materials().len();
+        for (i, m) in scene.materials().iter().enumerate() {
+            let Some(medium) = m
+                .medium
+                .filter(|md| !md.is_clear() && m.transmission > 0.0 && !m.thin_walled)
+            else {
+                continue;
+            };
+            let entry = materials.0.len() as u32 / MATERIAL_WORDS;
+            materials.0[i * MATERIAL_WORDS as usize + 21] = entry;
+            materials.v3(medium.absorption, medium.anisotropy);
+            materials.v3(medium.scattering, 0.0);
+            (0..4 * 4).for_each(|_| materials.f(0.0));
+        }
+        debug_assert!(materials.0.len() >= count * MATERIAL_WORDS as usize);
 
         // The lights, then the tables of their profiles, one per distinct profile
         let mut profiles: Vec<(std::sync::Arc<crate::IesProfile>, u32)> = Vec::new();
@@ -1264,6 +1307,9 @@ impl SceneBuffers {
         }
     }
 }
+
+/// Words of a material in trace.wgsl.
+const MATERIAL_WORDS: u32 = 24;
 
 /// Cells of the hashed photon grid, PHOTON_CELLS in trace.wgsl.
 const PHOTON_CELLS: u32 = 65536;
@@ -1558,6 +1604,21 @@ fn params_bytes(
         }
         None => (0..16).for_each(|_| p.f(0.0)),
     }
+    match scene.fog() {
+        Some(fog) => {
+            p.v3(fog.medium.absorption, fog.medium.anisotropy);
+            p.v3(fog.medium.scattering, fog.height);
+            p.f(if fog.scale_height.is_finite() {
+                1.0 / fog.scale_height
+            } else {
+                0.0
+            });
+            p.f(1.0);
+        }
+        None => (0..10).for_each(|_| p.f(0.0)),
+    }
+    p.f(if scene.has_media() { 1.0 } else { 0.0 });
+    p.f(0.0);
     p.bytes()
 }
 

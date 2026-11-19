@@ -45,6 +45,12 @@ struct Params {
     caustic_layout: vec4<u32>,
     // x sources, y glass spheres, z photons per source, w word index of the photons as shot (sorted after them)
     caustic_counts: vec4<u32>,
+    // Fog over the scene (medium.rs): absorption per meter and anisotropy, scattering and the height of these values,
+    // x: one over the scale height (0 for the same density everywhere), y: 1 if there is fog, z: 1 if the scene has
+    // media at all
+    fog_absorption: vec4<f32>,
+    fog_scattering: vec4<f32>,
+    fog_shape: vec4<f32>,
 }
 
 struct Tile {
@@ -90,7 +96,8 @@ struct Material {
     flags: vec4<f32>,
     // Textures (NONE without): base color, metallic and roughness, normals, emission
     textures: vec4<u32>,
-    // x: transmission texture
+    // x: transmission texture, y: the medium inside, NONE without: the entry of materials after the materials whose
+    // base_color is the absorption per meter with the anisotropy, whose params are the scattering
     more_textures: vec4<u32>,
 }
 
@@ -124,6 +131,179 @@ struct Light {
 fn light_at(i: u32) -> Light {
     let b = 4u * i;
     return Light(extras[b], extras[b + 1u], extras[b + 2u], extras[b + 3u]);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Participating media (medium.rs). Only the pipeline for scenes with media sets MEDIA: in the other one the compiler
+// drops all of it, so the shader stays as small as before for the compilers of small GPUs.
+override MEDIA: bool = false;
+
+// The material of the solid the path is in, NONE in the air with the fog
+var<private> path_medium: u32;
+// Whether the shadow rays are for a point in a medium, and its anisotropy
+var<private> medium_event: bool;
+var<private> scatter_g: f32;
+// Over the boundaries of solids a shadow ray crosses, plus leaving and minus entering: extinction times distance,
+// extinction, depth of the fog and count (tracer.rs transmittance)
+var<private> crossed_depth: vec3<f32>;
+var<private> crossed_extinction: vec3<f32>;
+var<private> crossed_fog: f32;
+var<private> crossed_count: f32;
+var<private> shadow_origin: vec3<f32>;
+
+fn fog_density(y: f32) -> f32 {
+    return min(exp(-(y - params.fog_scattering.w) * params.fog_shape.x), 1e12);
+}
+
+// The density of the fog integrated along the ray up to t, BIG where it does not end
+fn fog_depth(o: vec3<f32>, d: vec3<f32>, t: f32) -> f32 {
+    let rho = fog_density(o.y);
+    let k = d.y * params.fog_shape.x;
+    if t >= 0.5 * BIG {
+        if k > 1e-7 {
+            return rho / k;
+        }
+        return BIG;
+    }
+    let kt = k * t;
+    if abs(kt) < 1e-3 {
+        return rho * t * (1.0 - 0.5 * kt);
+    }
+    return rho * (1.0 - exp(-kt)) / k;
+}
+
+// Where the integrated density reaches depth, BIG if never
+fn fog_distance(o: vec3<f32>, d: vec3<f32>, depth: f32) -> f32 {
+    let rho = fog_density(o.y);
+    if rho <= 0.0 {
+        return BIG;
+    }
+    let k = d.y * params.fog_shape.x;
+    if abs(k) < 1e-7 {
+        return depth / rho;
+    }
+    let x = 1.0 - depth * k / rho;
+    if x <= 0.0 {
+        return BIG;
+    }
+    return -log(x) / k;
+}
+
+fn henyey_greenstein(g: f32, c: f32) -> f32 {
+    let d = 1.0 + g * g - 2.0 * g * c;
+    return (1.0 - g * g) / (4.0 * PI * d * sqrt(d));
+}
+
+fn sample_phase(g: f32, forward: vec3<f32>, u1: f32, u2: f32) -> vec3<f32> {
+    var c = 1.0 - 2.0 * u1;
+    if abs(g) >= 1e-3 {
+        let s = (1.0 - g * g) / (1.0 - g + 2.0 * g * u1);
+        c = clamp((1.0 + g * g - s * s) / (2.0 * g), -1.0, 1.0);
+    }
+    let si = sqrt(max(1.0 - c * c, 0.0));
+    let phi = 2.0 * PI * u2;
+    return normalize(orthonormal_t(forward) * (si * cos(phi)) + orthonormal_b(forward) * (si * sin(phi)) + forward * c);
+}
+
+// Extinction of the medium in a material, zero without
+fn material_extinction(m: Material) -> vec3<f32> {
+    let at = m.more_textures.y;
+    if at == NONE {
+        return vec3<f32>(0.0);
+    }
+    return materials[at].base_color.rgb + materials[at].params.rgb;
+}
+
+struct MediumStep {
+    weight: vec3<f32>,
+    // Where the light scatters, negative if it passes
+    t: f32,
+    anisotropy: f32,
+}
+
+fn passing(sigma: vec3<f32>, depth: f32) -> vec3<f32> {
+    if depth >= 0.5 * BIG {
+        return select(vec3<f32>(1.0), vec3<f32>(0.0), sigma > vec3<f32>(0.0));
+    }
+    return exp(-sigma * depth);
+}
+
+// Where light scatters in the path's medium before end, by the extinction of a random channel (PathContext::sample_medium)
+fn sample_medium(o: vec3<f32>, d: vec3<f32>, end: f32) -> MediumStep {
+    var a = vec4<f32>(0.0);
+    var s = vec4<f32>(0.0);
+    let fog = path_medium == NONE;
+    if fog {
+        if params.fog_shape.y == 0.0 {
+            return MediumStep(vec3<f32>(1.0), -1.0, 0.0);
+        }
+        a = params.fog_absorption;
+        s = params.fog_scattering;
+    } else {
+        let at = materials[path_medium].more_textures.y;
+        if at == NONE {
+            return MediumStep(vec3<f32>(1.0), -1.0, 0.0);
+        }
+        a = materials[at].base_color;
+        s = materials[at].params;
+    }
+    let sigma = a.rgb + s.rgb;
+    var depth_end = end;
+    if fog {
+        depth_end = fog_depth(o, d, end);
+    }
+    if all(s.rgb == vec3<f32>(0.0)) {
+        return MediumStep(passing(sigma, depth_end), -1.0, 0.0);
+    }
+    let channel = min(u32(next_f32() * 3.0), 2u);
+    let depth = -log(1.0 - next_f32()) / sigma[channel];
+    var t = depth;
+    if fog {
+        t = fog_distance(o, d, depth);
+    }
+    if t < end && t < 0.5 * BIG {
+        var depth_t = t;
+        if fog {
+            depth_t = fog_depth(o, d, t);
+        }
+        let tr = exp(-sigma * depth_t);
+        let pdf = dot(sigma * tr, vec3<f32>(1.0 / 3.0));
+        if pdf <= 0.0 {
+            return MediumStep(vec3<f32>(0.0), -1.0, 0.0);
+        }
+        return MediumStep(s.rgb * tr / pdf, t, a.w);
+    }
+    let tr = passing(sigma, depth_end);
+    let p = dot(tr, vec3<f32>(1.0 / 3.0));
+    if p <= 0.0 {
+        return MediumStep(vec3<f32>(0.0), -1.0, 0.0);
+    }
+    return MediumStep(tr / p, -1.0, 0.0);
+}
+
+// What the media along a shadow ray let through, from the sums of shadow_hit
+fn crossed_transmittance(o: vec3<f32>, d: vec3<f32>, distance: f32) -> vec3<f32> {
+    let finite = distance < 0.5 * BIG;
+    var start = vec3<f32>(0.0);
+    if path_medium != NONE {
+        start = material_extinction(materials[path_medium]);
+    }
+    var depth = crossed_depth;
+    if finite {
+        depth += distance * (start - crossed_extinction);
+    }
+    if params.fog_shape.y > 0.0 {
+        let total = fog_depth(o, d, distance);
+        if total >= 0.5 * BIG {
+            return vec3<f32>(0.0);
+        }
+        var in_solids = crossed_fog;
+        if finite {
+            in_solids += total * (select(0.0, 1.0, path_medium != NONE) - crossed_count);
+        }
+        depth += (params.fog_absorption.rgb + params.fog_scattering.rgb) * max(total - in_solids, 0.0);
+    }
+    return exp(-max(depth, vec3<f32>(0.0)));
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -374,15 +554,26 @@ fn face_normal_in_world(index: u32, p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f32>)
 }
 
 // A triangle hit on a shadow ray, m with the textures for base color and transmission: true if nothing passes any more
-fn shadow_hit(index: u32, m: Material, p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f32>) -> bool {
-    if m.params.w <= 0.0 || (block_solid_glass && m.flags.x == 0.0) {
+fn shadow_hit(index: u32, m: Material, p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f32>, t: f32) -> bool {
+    if m.params.w <= 0.0 || (block_solid_glass && m.flags.x == 0.0 && m.emission.w != 1.0) {
         transmittance = vec3<f32>(0.0);
         return true;
     }
     let transmission = m.params.w;
-    let cos_i = clamp(abs(dot(face_normal_in_world(index, p0, p1, p2), shadow_direction)), 0.0, 1.0);
+    let face = face_normal_in_world(index, p0, p1, p2);
+    let cos_i = clamp(abs(dot(face, shadow_direction)), 0.0, 1.0);
     let f = fresnel_dielectric(cos_i, m.emission.w);
     transmittance = transmittance * m.base_color.rgb * (transmission * (1.0 - f));
+    if MEDIA && m.flags.x == 0.0 {
+        let sign = select(-1.0, 1.0, dot(face, shadow_direction) > 0.0);
+        let extinction = material_extinction(m);
+        crossed_depth += sign * t * extinction;
+        crossed_extinction += sign * extinction;
+        if params.fog_shape.y > 0.0 {
+            crossed_fog += sign * fog_depth(shadow_origin, shadow_direction, t);
+        }
+        crossed_count += sign;
+    }
     return max(max(transmittance.x, transmittance.y), transmittance.z) <= 0.0;
 }
 
@@ -423,7 +614,7 @@ fn walk_mesh(index: u32, o: vec3<f32>, d: vec3<f32>, t_max: ptr<function, f32>, 
                         continue;
                     }
                     if shadow {
-                        if shadow_hit(index, m, p0, p1, p2) {
+                        if shadow_hit(index, m, p0, p1, p2, r.x) {
                             return true;
                         }
                     } else {
@@ -962,12 +1153,24 @@ fn next_shadow_ray(first: u32, p: vec3<f32>, v: vec3<f32>, n: vec3<f32>, ng: vec
                 let ls = sample_area_light(light, p, u1, u2);
                 if ls.pdf > 0.0 {
                     // Shared with the material's own samples that hit the light
-                    let weight = power_heuristic(ls.pdf, material_pdf(m, v, ls.direction, n)) / ls.pdf;
+                    var own = 0.0;
+                    if MEDIA && medium_event {
+                        own = henyey_greenstein(scatter_g, -dot(ls.direction, v));
+                    } else {
+                        own = material_pdf(m, v, ls.direction, n);
+                    }
+                    let weight = power_heuristic(ls.pdf, own) / ls.pdf;
                     l = ls.direction;
                     distance = ls.distance * (1.0 - 1e-4);
                     e = light.color.rgb * weight;
                 }
             }
+        }
+        if MEDIA && medium_event {
+            if any(e != vec3<f32>(0.0)) {
+                return ShadowRay(j + 1u, l, distance, e * henyey_greenstein(scatter_g, -dot(l, v)));
+            }
+            continue;
         }
         let c = dot(n, l);
         if any(e != vec3<f32>(0.0)) && c > 0.0 && dot(ng, l) > 0.0 {
@@ -1203,6 +1406,12 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
     var surface_base_color = vec3<f32>(0.0);
     var surface_params = vec3<f32>(0.0);
     var direct = vec3<f32>(0.0);
+    // Boundaries of media passed, which are no bounce
+    var passes = 0u;
+    if MEDIA {
+        path_medium = NONE;
+        medium_event = false;
+    }
     loop {
         // The only traversal in the shader: a shadow ray while lights of a surface are tested, else the path's next ray
         let shadow = shadow_ray.next != NONE;
@@ -1221,6 +1430,13 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
             // as photons
             let tested = shadow_ray.next - 1u;
             block_solid_glass = params.caustics.y > 0.0 && (tested == 0u || light_at(tested - 1u).position.w < 2.0);
+            if MEDIA {
+                crossed_depth = vec3<f32>(0.0);
+                crossed_extinction = vec3<f32>(0.0);
+                crossed_fog = 0.0;
+                crossed_count = 0.0;
+                shadow_origin = origin;
+            }
         } else {
             for (var i = 0u; i < params.settings.y; i++) {
                 if light_at(i).position.w >= 2.0 {
@@ -1236,14 +1452,49 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
         // A diffuse or glossy surface whose lights are all tested: continue the path with a direction from its material
         var lit = false;
         if shadow {
-            direct += shadow_ray.contribution * transmittance;
+            var through = transmittance;
+            if MEDIA {
+                through *= crossed_transmittance(origin, shadow_ray.direction, shadow_ray.distance);
+            }
+            direct += shadow_ray.contribution * through;
             shadow_ray = next_shadow_ray(shadow_ray.next, origin, -direction, surface_n, surface_ng, reflecting(surface_base_color, surface_params));
             if shadow_ray.next != NONE {
                 continue;
             }
             lit = true;
         } else {
-            if hit.instance == NONE && light_index != NONE {
+            var scattered = false;
+            if MEDIA {
+                var end = light_distance;
+                if hit.instance != NONE {
+                    end = hit.t;
+                }
+                let step = sample_medium(origin, direction, end);
+                throughput *= step.weight;
+                if step.t >= 0.0 {
+                    if bounce >= params.camera.w {
+                        break;
+                    }
+                    // Light scattered in the medium: the lights directly with shadow rays, then a new direction
+                    scattered = true;
+                    if bounce == 0u && passes == 0u {
+                        add_features(vec3<f32>(1.0), -direction, step.t);
+                    }
+                    origin = origin + direction * step.t;
+                    medium_event = true;
+                    scatter_g = step.anisotropy;
+                    direct = vec3<f32>(0.0);
+                    shadow_ray = next_shadow_ray(0u, origin, -direction, surface_n, surface_ng, reflecting(surface_base_color, surface_params));
+                    if shadow_ray.next != NONE {
+                        continue;
+                    }
+                    lit = true;
+                } else if all(throughput == vec3<f32>(0.0)) {
+                    break;
+                }
+            }
+            if scattered {
+            } else if hit.instance == NONE && light_index != NONE {
                 // Area lights end the path; their light was also sampled directly, so both share it
                 let light = light_at(light_index);
                 var weight = 1.0;
@@ -1264,16 +1515,15 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
                     add_features(vec3<f32>(1.0), -direction, SKY_DISTANCE);
                 }
                 break;
-            }
-            if hit.instance == NONE {
+            } else if hit.instance == NONE {
                 result += clamped(bounce, throughput * environment(direction, last_was_delta && (!diffuse_seen || (glass_reflected && params.caustics.y == 0.0))));
                 if bounce == 0u {
                     add_features(vec3<f32>(1.0), -direction, SKY_DISTANCE);
                 }
                 break;
-            }
+            } else {
             let s = surface_at(hit, direction);
-            if bounce == 0u {
+            if bounce == 0u && (!MEDIA || passes == 0u) {
                 add_features(feature_albedo(s.material), s.shading_normal, hit.t);
             }
             let m = s.material;
@@ -1295,21 +1545,38 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
                 let ior = m.emission.w;
                 let eta = select(1.0 / ior, ior, thin_walled || s.front_face);
                 let cos_i = clamp(dot(n, v), 0.0, 1.0);
-                if next_f32() < fresnel_dielectric(cos_i, eta) {
+                var refracted = vec4<f32>(direction, 1.0);
+                if !thin_walled {
+                    refracted = refract_through(v, n, 1.0 / eta);
+                }
+                var invisible = false;
+                if refracted.w > 0.0 && next_f32() >= fresnel_dielectric(cos_i, eta) {
+                    throughput = throughput * m.base_color.rgb;
+                    if !thin_walled {
+                        direction = refracted.xyz;
+                        glass_bent = glass_bent || ior != 1.0;
+                        if MEDIA {
+                            path_medium = select(NONE, instances[hit.instance].info.z, s.front_face);
+                            // The boundary of a medium is no bounce, it is not seen
+                            invisible = ior == 1.0;
+                        }
+                    }
+                    origin = offset_point(s.position, -ng);
+                } else {
+                    // Reflected, also all of it inside the glass
                     direction = reflect_about(v, n);
                     origin = offset_point(s.position, ng);
                     glass_reflected = true;
                     glass_bent = true;
-                } else {
-                    throughput = throughput * m.base_color.rgb;
-                    if !thin_walled {
-                        let r = refract_through(v, n, 1.0 / eta);
-                        direction = select(reflect_about(v, n), r.xyz, r.w > 0.0);
-                        glass_bent = true;
-                    }
-                    origin = offset_point(s.position, -ng);
                 }
                 last_was_delta = true;
+                if MEDIA && invisible {
+                    passes += 1u;
+                    if passes > 64u {
+                        break;
+                    }
+                    continue;
+                }
             } else {
                 // Diffuse and glossy reflection: light sources directly with shadow rays, then a new direction from the
                 // material
@@ -1328,16 +1595,24 @@ fn radiance(origin_in: vec3<f32>, direction_in: vec3<f32>) -> vec3<f32> {
                 }
                 lit = true;
             }
+            }
         }
         if lit {
             result += clamped(bounce, throughput * direct);
-            let next = sample_material(reflecting(surface_base_color, surface_params), -direction, surface_n);
-            if !next.valid || dot(next.direction, surface_ng) <= 0.0 {
-                break;
+            if MEDIA && medium_event {
+                let l = sample_phase(scatter_g, direction, next_f32(), next_f32());
+                last_pdf = henyey_greenstein(scatter_g, dot(l, direction));
+                direction = l;
+                medium_event = false;
+            } else {
+                let next = sample_material(reflecting(surface_base_color, surface_params), -direction, surface_n);
+                if !next.valid || dot(next.direction, surface_ng) <= 0.0 {
+                    break;
+                }
+                throughput = throughput * next.weight;
+                last_pdf = next.pdf;
+                direction = next.direction;
             }
-            throughput = throughput * next.weight;
-            last_pdf = next.pdf;
-            direction = next.direction;
             last_was_delta = false;
             diffuse_seen = true;
             diffuse_origin = origin;
@@ -1545,10 +1820,23 @@ fn trace_photon(origin_in: vec3<f32>, direction_in: vec3<f32>, power_in: vec3<f3
     var direction = direction_in;
     var power = power_in;
     var bent = false;
+    // The material of the solid the photon is in, NONE in the air
+    var in_solid = NONE;
     for (var bounce = 0u; bounce < max(params.camera.w, 1u) + 8u; bounce++) {
         let hit = walk(origin, direction, BIG, false);
         if hit.instance == NONE {
             return;
+        }
+        if params.fog_shape.z > 0.0 {
+            // Light scattered out of the photon reaches the surfaces by the paths through the medium
+            if in_solid == NONE {
+                if params.fog_shape.y > 0.0 {
+                    let sigma = params.fog_absorption.rgb + params.fog_scattering.rgb;
+                    power *= exp(-sigma * fog_depth(origin, direction, hit.t));
+                }
+            } else {
+                power *= exp(-material_extinction(materials[in_solid]) * hit.t);
+            }
         }
         let s = surface_at(hit, direction);
         let m = s.material;
@@ -1564,18 +1852,22 @@ fn trace_photon(origin_in: vec3<f32>, direction_in: vec3<f32>, power_in: vec3<f3
             let ior = m.emission.w;
             let eta = select(1.0 / ior, ior, thin_walled || s.front_face);
             let cos_i = clamp(dot(n, v), 0.0, 1.0);
-            if next_f32() < fresnel_dielectric(cos_i, eta) {
+            var refracted = vec4<f32>(direction, 1.0);
+            if !thin_walled {
+                refracted = refract_through(v, n, 1.0 / eta);
+            }
+            if refracted.w > 0.0 && next_f32() >= fresnel_dielectric(cos_i, eta) {
+                power = power * m.base_color.rgb;
+                if !thin_walled {
+                    direction = refracted.xyz;
+                    bent = bent || ior != 1.0;
+                    in_solid = select(NONE, instances[hit.instance].info.z, s.front_face);
+                }
+                origin = offset_point(s.position, -ng);
+            } else {
                 direction = reflect_about(v, n);
                 origin = offset_point(s.position, ng);
                 bent = true;
-            } else {
-                power = power * m.base_color.rgb;
-                if !thin_walled {
-                    let r = refract_through(v, n, 1.0 / eta);
-                    direction = select(reflect_about(v, n), r.xyz, r.w > 0.0);
-                    bent = true;
-                }
-                origin = offset_point(s.position, -ng);
             }
         } else {
             if bent {

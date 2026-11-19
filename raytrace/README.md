@@ -173,6 +173,22 @@ binds (128 MB guaranteed by WebGPU), the largest ones are halved in size until t
   sensor (24 mm high), so f/2.8 at 45° is a 29 mm lens with an aperture of 10 mm. Scenes have to be in meters.
   `DepthOfField::focused_on(&camera, point, f_number)` focuses on a point. Rays start on the aperture (concentric
   mapping of two Sobol dimensions) and meet at the focus plane; orthographic cameras stay sharp.
+- Participating media (volumes), on CPU and GPU. `RtMedium { absorption, scattering, anisotropy }` per meter, with a
+  Henyey-Greenstein phase function. `RtMaterial::medium` fills a closed mesh of solid glass (`thin_walled: false`):
+  `RtMedium::absorbing(color, distance)` colors glass and water with depth as glTF's `KHR_materials_volume` does,
+  scattering media make cloudy water. `RtMaterial::medium_boundary(medium)` is an invisible boundary for smoke and fog
+  in a closed mesh; passing it costs no bounce and casts no caustics. `RtScene::set_fog(RtFog { medium, height,
+  scale_height })` puts haze over the whole scene that thins out upwards, so the sky stays visible and sunlight
+  arrives; `RtMedium::fog(half_distance, albedo, anisotropy)` sets it up from the distance at which half the light is
+  left. Paths draw where they scatter from the extinction of a random color channel, sample the lights there with the
+  phase function and go on in a direction drawn from it; shadow rays sum the lengths inside solids from their signed
+  boundary hits, which needs no order of the hits. Purely absorbing media are applied without noise. Photons are
+  attenuated along their way, the light they lose by scattering reaches surfaces by the paths. Not included: media
+  inside other media (an ice cube in a glass of water), a camera inside a closed mesh with a medium (use the fog
+  there), media whose density varies other than the fog with height. The compute tracer builds a second pipeline for
+  scenes with media (the override constant `MEDIA` in trace.wgsl), so the tracer of scenes without stays as small as
+  before for the compilers of small GPUs. `examples/volumes.rs` renders a pergola in ground haze with a water basin
+  and a ball of smoke.
 - Deterministic: the same seed gives the same image with any number of threads.
 
 ## Tests

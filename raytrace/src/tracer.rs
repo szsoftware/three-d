@@ -502,6 +502,13 @@ impl PathContext<'_> {
                         break;
                     }
                     // Light scattered in the medium: the light sources directly, then a new direction
+                    if bounce == 0 && passed == 0 {
+                        *first = FirstHit {
+                            albedo: vec3(1.0, 1.0, 1.0),
+                            normal: -direction,
+                            distance: t,
+                        };
+                    }
                     let p = origin + direction * t;
                     let v = -direction;
                     let scatterer = Scatterer::Medium { anisotropy, v };
@@ -572,7 +579,7 @@ impl PathContext<'_> {
             };
             let surface = self.surface(&hit, direction);
             let m = &surface.material;
-            if bounce == 0 {
+            if bounce == 0 && passed == 0 {
                 *first = FirstHit::at(&surface, hit.t);
             }
             result += self.add(bounce, mul(throughput, m.emission));
@@ -602,7 +609,7 @@ impl PathContext<'_> {
                 match refracted {
                     Some(refracted) if rng.next_f32() >= fresnel_dielectric(cos_i, eta) => {
                         // The boundary of a medium is no bounce, it is not seen
-                        invisible = !m.thin_walled && !bends_light(m);
+                        invisible = media && !m.thin_walled && !bends_light(m);
                         throughput = mul(throughput, m.base_color);
                         if !m.thin_walled {
                             direction = refracted;
