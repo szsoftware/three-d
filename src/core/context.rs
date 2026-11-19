@@ -266,7 +266,7 @@ impl Context {
             backend::Backend::Gl(gl) if gl.has_offscreen_screen() => {
                 use crate::context::HasContext;
                 unsafe { gl.context.flush() };
-                Ok(())
+                gl.lost.error()
             }
             _ => Err(Self::no_offscreen_screen()),
         }
@@ -388,6 +388,30 @@ impl Context {
     ///
     pub fn error_check(&self) -> Result<(), CoreError> {
         self.backend().error_check()
+    }
+
+    ///
+    /// Returns whether the graphics device is lost, for example because the graphics card was reset after a draw or compute call
+    /// took too long. What was drawn or computed since may be wrong, and nothing works anymore: create a new context.
+    /// Once lost, the context stays lost. [Context::error_check] then returns an error, and functions that read pixels panic
+    /// instead of returning pixels that are wrong.
+    ///
+    /// This is cheap, so it can be called after every frame, and after reading results that were computed with the device directly
+    /// (see [Context::as_wgpu]).
+    ///
+    /// A device is noticed as lost
+    /// - with the wgpu backend on Vulkan, Metal and DirectX 12, for devices created by this crate,
+    /// - with the wgpu backend on top of OpenGL (the `wgpu-gl` feature, with EGL on Linux and Android) only if the application uses
+    ///   the patched wgpu-hal of this repository, see "Lost devices" in `docs/wgpu-backend.md`,
+    /// - with the OpenGL backend in a context without a window ([Context::new_headless_gl_with_screen]),
+    /// - with every other OpenGL context only if it was created with the reset notification strategy `LOSE_CONTEXT_ON_RESET`
+    ///   (`GL_KHR_robustness`), and then only after [Context::error_check] returned the error.
+    ///
+    /// On OpenGL this needs a driver that supports `EGL_EXT_create_context_robustness` or EGL 1.5 and `GL_KHR_robustness`
+    /// or `GL_ARB_robustness`, as Mesa does. With the OpenGL backend, call it on the thread where the context is used.
+    ///
+    pub fn is_lost(&self) -> bool {
+        self.backend().is_lost()
     }
 }
 

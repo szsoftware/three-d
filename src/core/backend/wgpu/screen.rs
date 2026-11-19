@@ -112,8 +112,19 @@ impl WgpuBackend {
                 errors.push(error.to_string());
             }
         }));
+        // wgpu tells when the device is lost (on OpenGL only with the patch of wgpu-hal described in docs/wgpu-backend.md), it stays lost
+        let lost = Arc::new(reset::DeviceLost::default());
+        let sink = lost.clone();
+        device.set_device_lost_callback(move |_, message| {
+            sink.lose(if message.is_empty() {
+                "wgpu lost the device".to_string()
+            } else {
+                format!("wgpu lost the device ({message})")
+            })
+        });
         let mut backend = Self::new(device, queue);
         backend.errors = Some(errors);
+        backend.lost = lost;
         backend.float32_renderable = adapter
             .get_texture_format_features(w::TextureFormat::Rgba32Float)
             .allowed_usages
@@ -297,7 +308,7 @@ impl WgpuBackend {
         let screen = state.screen.as_ref().expect(NO_SCREEN);
         let Some((surface, configuration)) = &screen.surface else {
             self.flush(state);
-            return Ok(());
+            return self.lost.error();
         };
         let frame = match surface.get_current_texture() {
             w::CurrentSurfaceTexture::Success(frame)
@@ -657,6 +668,39 @@ mod tests {
         assert!(context.backend_references() > 1);
         context.programs.write().unwrap().clear();
         assert_eq!(context.backend_references(), 1);
+    }
+
+    #[test]
+    fn a_lost_device_is_reported() {
+        let Ok(context) = Context::new_headless_wgpu_with_screen(WIDTH, HEIGHT, true, false) else {
+            return;
+        };
+        let screen = RenderTarget::screen(&context, WIDTH, HEIGHT);
+        render(&context, &screen, WIDTH, HEIGHT);
+        assert!(!screen.read_color::<[u8; 4]>().is_empty());
+        assert!(!context.is_lost());
+        context.error_check().unwrap();
+        // What a reset of the graphics card does to wgpu, on OpenGL with the patched wgpu-hal
+        context.as_wgpu().unwrap().0.destroy();
+        assert!(context.is_lost());
+        let error = context.error_check().unwrap_err().to_string();
+        assert!(error.contains("graphics device is lost"), "{error}");
+        // Still lost, and every frame says so
+        assert!(context.error_check().is_err());
+        assert!(context.submit_offscreen_screen().is_err());
+        // Pixels would not be the ones that were drawn
+        render(&context, &screen, WIDTH, HEIGHT);
+        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            screen.read_color::<[u8; 4]>()
+        }));
+        let message = read.unwrap_err();
+        let message = message
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert!(message.contains("graphics device is lost"), "{message}");
+        drop(screen);
+        context.programs.write().unwrap().clear();
     }
 
     #[test]

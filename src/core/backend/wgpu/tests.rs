@@ -540,3 +540,30 @@ fn float_texture_written_outside_three_d() {
         assert_eq!(p[0], expected[i], "pixel {i}: {pixels:?}");
     }
 }
+
+///
+/// wgpu on top of OpenGL is only told about resets of the graphics card with the patched wgpu-hal in `vendor/wgpu-hal`,
+/// which creates the context with the reset notification strategy `LOSE_CONTEXT_ON_RESET` where the driver can (Mesa can).
+///
+#[cfg(all(feature = "wgpu-gl", target_os = "linux"))]
+#[test]
+fn opengl_context_of_wgpu_is_told_about_resets() {
+    use crate::context::HasContext;
+    let Ok(backend) = super::WgpuBackend::new_headless() else {
+        return;
+    };
+    if !super::gl_device(&backend.device) {
+        return;
+    }
+    // Safety: the context is locked while it is used, and only a value is read
+    let strategy = unsafe {
+        let device = backend.device.as_hal::<wgpu::hal::api::Gles>().unwrap();
+        let gl = device.context().lock();
+        let strategy = gl.get_parameter_i32(0x8256);
+        assert_eq!(gl.get_error(), crate::context::NO_ERROR);
+        strategy
+    };
+    println!("reset notification strategy of the OpenGL context: 0x{strategy:x}");
+    // LOSE_CONTEXT_ON_RESET instead of NO_RESET_NOTIFICATION
+    assert_eq!(strategy, 0x8252);
+}
