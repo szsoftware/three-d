@@ -1941,7 +1941,8 @@ impl crate::Queue for super::Queue {
         // often flush every so often, but headless contexts may not.
         unsafe { gl.flush() };
 
-        Ok(())
+        // Patched (three-d)
+        shared.context.check_reset()
     }
 
     unsafe fn present(

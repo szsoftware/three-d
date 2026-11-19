@@ -14,6 +14,11 @@ pub struct AdapterContext {
 }
 
 impl AdapterContext {
+    /// Patched (three-d): resets of the GPU are only noticed with EGL.
+    pub(super) fn check_reset(&self) -> Result<(), crate::DeviceError> {
+        Ok(())
+    }
+
     pub fn is_owned(&self) -> bool {
         false
     }

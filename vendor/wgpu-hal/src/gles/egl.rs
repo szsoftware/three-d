@@ -12,6 +12,58 @@ const CONTEXT_LOCK_TIMEOUT_SECS: u64 = 6;
 const EGL_CONTEXT_FLAGS_KHR: i32 = 0x30FC;
 const EGL_CONTEXT_OPENGL_DEBUG_BIT_KHR: i32 = 0x0001;
 const EGL_CONTEXT_OPENGL_ROBUST_ACCESS_EXT: i32 = 0x30BF;
+// Patched (three-d): the context is lost when the GPU is reset, so that the reset can be reported as a lost device.
+// Without it, a reset is not reported to the context at all and it goes on with wrong results.
+const EGL_CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY: i32 = 0x31BD;
+const EGL_CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY_EXT: i32 = 0x3138;
+const EGL_LOSE_CONTEXT_ON_RESET: i32 = 0x31BF;
+const GL_RESET_NOTIFICATION_STRATEGY: u32 = 0x8256;
+const GL_LOSE_CONTEXT_ON_RESET: u32 = 0x8252;
+
+/// `glGetGraphicsResetStatus`.
+type ResetStatusFn = unsafe extern "system" fn() -> u32;
+
+/// Patched (three-d): `glGetGraphicsResetStatus` or one of its variants, if the context is lost when the GPU is reset.
+/// Other contexts are never told about resets. The context must be current.
+unsafe fn reset_status_fn(
+    gl: &glow::Context,
+    mut load: impl FnMut(&str) -> *const ffi::c_void,
+) -> Option<ResetStatusFn> {
+    let version = gl.version();
+    let extensions = gl.supported_extensions();
+    let core = if version.is_embedded {
+        (version.major, version.minor) >= (3, 2)
+    } else {
+        (version.major, version.minor) >= (4, 5)
+    };
+    let name = if core {
+        "glGetGraphicsResetStatus"
+    } else if extensions.contains("GL_KHR_robustness") {
+        if version.is_embedded {
+            "glGetGraphicsResetStatusKHR"
+        } else {
+            "glGetGraphicsResetStatus"
+        }
+    } else if extensions.contains("GL_ARB_robustness") {
+        "glGetGraphicsResetStatusARB"
+    } else if extensions.contains("GL_EXT_robustness") {
+        "glGetGraphicsResetStatusEXT"
+    } else {
+        return None;
+    };
+    if unsafe { gl.get_parameter_i32(GL_RESET_NOTIFICATION_STRATEGY) } as u32
+        != GL_LOSE_CONTEXT_ON_RESET
+    {
+        return None;
+    }
+    let address = load(name);
+    if address.is_null() {
+        return None;
+    }
+    log::debug!("\tGL context: reports resets through {name}");
+    // SAFETY: the function has no parameters and returns an enum
+    Some(unsafe { core::mem::transmute::<*const ffi::c_void, ResetStatusFn>(address) })
+}
 const EGL_PLATFORM_WAYLAND_KHR: u32 = 0x31D8;
 const EGL_PLATFORM_X11_KHR: u32 = 0x31D5;
 const EGL_PLATFORM_XCB_EXT: u32 = 0x31DC;
@@ -196,6 +248,10 @@ impl EglContext {
 pub struct AdapterContext {
     glow: Mutex<ManuallyDrop<glow::Context>>,
     egl: Option<EglContext>,
+    /// Patched (three-d): see [`reset_status_fn`].
+    reset_status: Option<ResetStatusFn>,
+    /// Patched (three-d): whether a reset of the GPU was reported, which makes the device lost for good.
+    reset: core::sync::atomic::AtomicBool,
 }
 
 unsafe impl Sync for AdapterContext {}
@@ -204,6 +260,26 @@ unsafe impl Send for AdapterContext {}
 impl AdapterContext {
     pub fn is_owned(&self) -> bool {
         self.egl.is_some()
+    }
+
+    /// Patched (three-d): returns [`crate::DeviceError::Lost`] if the GPU was reset, which an OpenGL context only
+    /// knows if it is lost on a reset (`EGL_CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY`).
+    /// What was computed since may be wrong. The context must be current (locked).
+    pub(super) fn check_reset(&self) -> Result<(), crate::DeviceError> {
+        use core::sync::atomic::Ordering;
+        if self.reset.load(Ordering::Acquire) {
+            return Err(crate::DeviceError::Lost);
+        }
+        if let Some(reset_status) = self.reset_status {
+            // SAFETY: the context is current, as the caller makes sure
+            let status = unsafe { reset_status() };
+            if status != glow::NO_ERROR {
+                log::error!("The GPU was reset (status 0x{status:x}), the device is lost");
+                self.reset.store(true, Ordering::Release);
+                return Err(crate::DeviceError::Lost);
+            }
+        }
+        Ok(())
     }
 
     /// Returns the EGL instance.
@@ -504,14 +580,17 @@ impl Inner {
         let context = {
             #[derive(Copy, Clone)]
             enum Robustness {
+                // Patched (three-d): first with the context lost on a reset of the GPU, then without
+                CoreLoseContextOnReset,
                 Core,
+                ExtLoseContextOnReset,
                 Ext,
             }
 
             let robustness = if version >= (1, 5) {
-                Some(Robustness::Core)
+                Some(Robustness::CoreLoseContextOnReset)
             } else if display_extensions.contains("EGL_EXT_create_context_robustness") {
-                Some(Robustness::Ext)
+                Some(Robustness::ExtLoseContextOnReset)
             } else {
                 None
             };
@@ -522,10 +601,28 @@ impl Inner {
                 let mut robustness = robustness;
                 loop {
                     let robustness_attributes = match robustness {
+                        Some(Robustness::CoreLoseContextOnReset) => {
+                            vec![
+                                khronos_egl::CONTEXT_OPENGL_ROBUST_ACCESS,
+                                khronos_egl::TRUE as _,
+                                EGL_CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY,
+                                EGL_LOSE_CONTEXT_ON_RESET,
+                                khronos_egl::NONE,
+                            ]
+                        }
                         Some(Robustness::Core) => {
                             vec![
                                 khronos_egl::CONTEXT_OPENGL_ROBUST_ACCESS,
                                 khronos_egl::TRUE as _,
+                                khronos_egl::NONE,
+                            ]
+                        }
+                        Some(Robustness::ExtLoseContextOnReset) => {
+                            vec![
+                                EGL_CONTEXT_OPENGL_ROBUST_ACCESS_EXT,
+                                khronos_egl::TRUE as _,
+                                EGL_CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY_EXT,
+                                EGL_LOSE_CONTEXT_ON_RESET,
                                 khronos_egl::NONE,
                             ]
                         }
@@ -545,8 +642,16 @@ impl Inner {
                     match egl.create_context(display, config, None, &context_attributes) {
                         Ok(context) => {
                             match robustness {
+                                Some(Robustness::CoreLoseContextOnReset) => {
+                                    log::debug!("\tEGL context: +robust access +lose context on reset");
+                                }
                                 Some(Robustness::Core) => {
                                     log::debug!("\tEGL context: +robust access");
+                                }
+                                Some(Robustness::ExtLoseContextOnReset) => {
+                                    log::debug!(
+                                        "\tEGL context: +robust access EXT +lose context on reset"
+                                    );
                                 }
                                 Some(Robustness::Ext) => {
                                     log::debug!("\tEGL context: +robust access EXT");
@@ -566,12 +671,14 @@ impl Inner {
                             | khronos_egl::Error::BadConfig,
                         ) if robustness.is_some() => {
                             robustness = match robustness {
+                                Some(Robustness::CoreLoseContextOnReset) => Some(Robustness::Core),
                                 Some(Robustness::Core)
                                     if display_extensions
                                         .contains("EGL_EXT_create_context_robustness") =>
                                 {
-                                    Some(Robustness::Ext)
+                                    Some(Robustness::ExtLoseContextOnReset)
                                 }
+                                Some(Robustness::ExtLoseContextOnReset) => Some(Robustness::Ext),
                                 _ => None,
                             };
                             continue;
@@ -1015,6 +1122,15 @@ impl crate::Instance for Instance {
         // GLOW context, which could also happen if a panic occurs after we uncurrent the context
         // below but before AdapterContext is constructed.
         let gl = ManuallyDrop::new(gl);
+        let reset_status = unsafe {
+            reset_status_fn(&gl, |name| {
+                inner
+                    .egl
+                    .instance
+                    .get_proc_address(name)
+                    .map_or(ptr::null(), |p| p as *const _)
+            })
+        };
         inner.egl.unmake_current();
 
         unsafe {
@@ -1023,6 +1139,8 @@ impl crate::Instance for Instance {
                     glow: Mutex::new(gl),
                     // ERROR: Copying owned reference handles here, be careful to not drop them!
                     egl: Some(inner.egl.clone()),
+                    reset_status,
+                    reset: Default::default(),
                 },
                 self.options.clone(),
             )
@@ -1046,12 +1164,16 @@ impl super::Adapter {
         fun: impl FnMut(&str) -> *const ffi::c_void,
         options: wgt::GlBackendOptions,
     ) -> Option<crate::ExposedAdapter<super::Api>> {
-        let context = unsafe { glow::Context::from_loader_function(fun) };
+        let mut fun = fun;
+        let context = unsafe { glow::Context::from_loader_function(&mut fun) };
+        let reset_status = unsafe { reset_status_fn(&context, fun) };
         unsafe {
             Self::expose(
                 AdapterContext {
                     glow: Mutex::new(ManuallyDrop::new(context)),
                     egl: None,
+                    reset_status,
+                    reset: Default::default(),
                 },
                 options,
             )

@@ -1591,7 +1591,11 @@ impl crate::Device for super::Device {
         fence: &super::Fence,
     ) -> Result<crate::FenceValue, crate::DeviceError> {
         #[cfg_attr(target_arch = "wasm32", allow(clippy::needless_borrow))]
-        Ok(fence.get_latest(&self.shared.context.lock()))
+        let gl = &self.shared.context.lock();
+        let value = fence.get_latest(gl);
+        // Patched (three-d): a lost context reports every fence as signaled
+        self.shared.context.check_reset()?;
+        Ok(value)
     }
     unsafe fn wait(
         &self,
@@ -1615,7 +1619,10 @@ impl crate::Device for super::Device {
                 .map(|t| t.as_nanos().min(u32::MAX as u128) as u32)
                 .unwrap_or(u32::MAX)
         };
-        fence.wait(gl, wait_value, timeout_ns)
+        let result = fence.wait(gl, wait_value, timeout_ns);
+        // Patched (three-d): a lost context reports every fence as signaled
+        self.shared.context.check_reset()?;
+        result
     }
 
     unsafe fn start_graphics_debugger_capture(&self) -> bool {
