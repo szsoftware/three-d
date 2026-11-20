@@ -77,9 +77,12 @@ jobs:
       # macOS tests the wgpu backend on Metal and Windows on DirectX 12 (software adapter), both against what OpenGL returned on Linux
       - if: startsWith(matrix.os, 'macos')
         run: echo "THREE_D_EXPECT_BACKEND=metal" >> $GITHUB_ENV
+      # Debug builds of wgpu compile DirectX shaders without optimizations (DXC -Od); WARP, the software DirectX 12
+      # of the runner, then takes minutes per test binary for the large ray tracing shader. WGPU_DEBUG=0 keeps the
+      # optimizations, validation stays on.
       - if: startsWith(matrix.os, 'windows')
         shell: bash
-        run: echo "THREE_D_EXPECT_BACKEND=dx12" >> $GITHUB_ENV
+        run: echo "THREE_D_EXPECT_BACKEND=dx12" >> $GITHUB_ENV && echo "WGPU_DEBUG=0" >> $GITHUB_ENV
 
       # The shader compiler Windows comes with (FXC) fails on shaders that sample a texture in a loop, so the tests use the new one (DXC) of the Windows SDK, which wgpu finds on the PATH
       - if: startsWith(matrix.os, 'windows')
@@ -105,7 +108,7 @@ jobs:
 
       # The uniffi surface: scenes, uploads, imports, final renders, preview and realtime view on the same adapter
       - name: Test ray tracing for Kotlin
-        run: cargo test -p three-d-raytrace-uniffi --release
+        run: cargo test -p three-d-raytrace-uniffi
 
       # The same tests with wgpu on top of OpenGL (feature wgpu-gl), again on the software driver
       - name: Test wgpu on OpenGL
