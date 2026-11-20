@@ -17,6 +17,8 @@
 
 uniffi::setup_scaffolding!();
 cargo_uniffi_support::native_bytes!();
+// Every record of `log` (three-d, wgpu and this crate) to Kotlin: `UniffiLog.install()` once at the start of the app
+cargo_uniffi_support::log_bridge!();
 
 mod error;
 mod import;

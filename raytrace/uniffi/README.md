@@ -22,6 +22,10 @@ common API gives them `asByteBuffer()`, `asFloatBuffer()` (JVM, Android), `asUin
 Objects that hold a context (`Renderer`, `FinalJob`, `PreviewJob`, `SceneView`) belong to the thread that created the
 renderer; another thread gets `RtFfiError::WrongThread`. Use the plugin's `UniffiOwnerThread` in Kotlin.
 
+The crate has the plugin's log bridge: `UniffiLog.install()` once at the start of the app, and the records of three-d,
+wgpu and this crate go to SLF4J or `System.Logger` (JVM), Logcat (Android) or the console (web). The level comes from
+`rustLog` in the plugin's settings or `-PcargoUniffi.rustLog=debug`. The app installs no Rust logger of its own.
+
 In the browser the application creates the context from its canvas and hands it over with `Renderer::with_context`
 from its own Rust crate; `Renderer::headless` is for desktop and Android.
 
