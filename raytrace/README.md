@@ -125,6 +125,33 @@ the GPU. `ComputeTracer` also implements `Tracer` and then reads every call back
 can not wait for. Its random numbers differ from the CPU tracer's, so the images agree in their averages, not in their
 noise.
 
+## Demo scenes and print size
+
+`three_d_raytrace::scenes` holds the scenes of the examples and tests, each with its start camera, exposure and
+settings: `garden`, `pergola` (sunbeams in haze, a basin of water, a ball of smoke), `aquarium` (nested media, a pane of
+glass on the floor), `caustics` (glass in the sun) and `downlights` (IES luminaires on a wall). `scenes::all()` lists them as `DemoScene`, whose `camera(width,
+height)` and `preview_settings(..)` are ready for a `RaytracePreview`.
+
+`FinalRender` traces an image larger than the screen, for print or export, beside the frames of an application:
+
+```rust
+let (width, height) = A4_LANDSCAPE_300_DPI; // 3508 × 2480
+let mut print = FinalRender::new(&camera, width, height, 256)
+    .with_settings(demo.settings)
+    .with_tone_mapping(demo.tone_mapping);
+// Every frame instead of preview.update, until done; print.progress() and print.remaining() for a progress bar
+if preview.trace_final(&scene, &mut print)? {
+    let png: Vec<u8> = print.png().unwrap(); // or print.rgba8(), rows from the top
+}
+```
+
+The image is traced in bands of at most 2 million pixels (`with_band_pixels`), each with the camera's view of its rows
+(`TraceSettings::view_region`) and some rows more above and below, so the denoiser sees across the seam. On the GPU a
+sample of a band is spread over as many updates as needed to stay within `with_frame_time` (40 ms), then the band is
+denoised, tone mapped and read back on the GPU; without a GPU, `trace_final` traces rows on the CPU. The camera's
+view widens or narrows to the aspect of the print. `cargo run --release -p three-d-raytrace --features wgpu --example
+print -- pergola 256` writes A4 at 300 dpi as PNG.
+
 ## Denoising
 
 ```rust

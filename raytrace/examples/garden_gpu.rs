@@ -5,8 +5,7 @@
 //! cargo run --release -p three-d-raytrace --features wgpu --example garden_gpu -- [samples] [width] [height] [output name]
 //!
 
-#[path = "../scenes/garden.rs"]
-mod garden;
+use three_d_raytrace::scenes::garden;
 
 use three_d_raytrace::*;
 

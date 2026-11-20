@@ -306,7 +306,7 @@ const SHARP_SHARE: f64 = 0.75;
 
 /// Tiles of the full resolution for the next update: as many as fit into the share of the limit, at least one.
 #[cfg(feature = "wgpu")]
-fn sharp_tiles(tile_ms: Option<f64>, limit: std::time::Duration, tiles: u32) -> u32 {
+pub(crate) fn sharp_tiles(tile_ms: Option<f64>, limit: std::time::Duration, tiles: u32) -> u32 {
     match tile_ms {
         None => 1,
         Some(ms) => {
@@ -318,7 +318,7 @@ fn sharp_tiles(tile_ms: Option<f64>, limit: std::time::Duration, tiles: u32) -> 
 
 /// The milliseconds per tile after a measured call: up at once to a slower call, down slowly after faster ones.
 #[cfg(feature = "wgpu")]
-fn next_tile_ms(tile_ms: Option<f64>, call: crate::compute::CallTime) -> Option<f64> {
+pub(crate) fn next_tile_ms(tile_ms: Option<f64>, call: crate::compute::CallTime) -> Option<f64> {
     let ms = call.ms / call.tiles.max(1) as f64;
     Some(match tile_ms {
         Some(old) if old > ms => 0.8 * old + 0.2 * ms,
@@ -1023,6 +1023,44 @@ impl RaytracePreview {
     }
 
     ///
+    /// Traces a [FinalRender](crate::FinalRender) of the scene, for at most its frame time; call it every frame
+    /// instead of [RaytracePreview::update] until it returns `true`. It traces on the preview's GPU (also when the
+    /// preview went to the CPU because the GPU was too slow for [PreviewSettings::gpu_frame_time]), else on the CPU
+    /// with [PreviewSettings::cpu_threads]; while the shaders of the GPU compile it waits for them. The preview's own
+    /// tracing pauses meanwhile and goes on with the next [RaytracePreview::update].
+    ///
+    pub fn trace_final(
+        &mut self,
+        scene: &RtScene,
+        render: &mut crate::FinalRender,
+    ) -> Result<bool, crate::RtError> {
+        #[cfg(feature = "wgpu")]
+        {
+            self.poll_compiling();
+            if self.compiling.is_some() {
+                return Ok(render.is_done());
+            }
+            // The times of the final render's calls are not the preview's
+            self.pace.started = false;
+            if !self.context.is_lost() {
+                let tracer = match &mut self.engine {
+                    Engine::Gpu { tracer, .. } => Some(tracer),
+                    _ => self.slow_tracer.as_mut(),
+                };
+                if let Some(tracer) = tracer {
+                    return render.trace_gpu(&self.context, tracer, scene);
+                }
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Engine::CpuWorker { worker, shown, .. } = &self.engine {
+            // Stops at the samples it has, more with the next update
+            worker.adjust(*shown, self.settings.denoiser, self.settings.cpu_threads);
+        }
+        render.trace_cpu(scene, self.settings.cpu_threads)
+    }
+
+    ///
     /// Adds samples for the scene seen by the camera, after starting again if either changed, and writes the average
     /// into [RaytracePreview::texture]. Returns whether the image changed. With [PreviewSettings::cpu_in_background]
     /// the samples are added on another thread and this shows the newest image; the scene is copied for that thread
@@ -1470,7 +1508,7 @@ impl RaytracePreview {
     }
 }
 
-fn empty_texture(context: &Context, width: u32, height: u32) -> Texture2D {
+pub(crate) fn empty_texture(context: &Context, width: u32, height: u32) -> Texture2D {
     // 32 bit floats can not be interpolated everywhere (WebGPU), so the nearest texel is taken
     Texture2D::new_empty::<[f32; 4]>(
         context,
@@ -1498,9 +1536,9 @@ fn camera_key(camera: &Camera) -> Vec<f32> {
 }
 
 /// Draws the linear image with exposure, a tone curve and sRGB encoding.
-struct DisplayEffect<'a> {
-    texture: &'a Texture2D,
-    tone_mapping: ToneMapping,
+pub(crate) struct DisplayEffect<'a> {
+    pub texture: &'a Texture2D,
+    pub tone_mapping: ToneMapping,
 }
 
 impl Effect for DisplayEffect<'_> {

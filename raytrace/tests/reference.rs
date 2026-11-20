@@ -4,8 +4,7 @@
 //! Write the reference image again with `THREE_D_WRITE_REFERENCE=1 cargo test --release -p three-d-raytrace`.
 //!
 
-#[path = "../scenes/garden.rs"]
-mod garden;
+use three_d_raytrace::scenes::garden;
 
 use three_d_raytrace::*;
 

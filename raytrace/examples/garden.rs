@@ -4,8 +4,7 @@
 //! cargo run --release -p three-d-raytrace --example garden -- [samples] [width] [height] [output name]
 //!
 
-#[path = "../scenes/garden.rs"]
-mod garden;
+use three_d_raytrace::scenes::garden;
 
 use three_d_raytrace::*;
 

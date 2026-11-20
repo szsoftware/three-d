@@ -64,8 +64,7 @@ fn render_image_updates_the_texture_in_place() {
 // ---------------------------------------------------------------------------------------------------------------------
 // The compute tracer against values known from physics and against the CPU reference
 
-#[path = "../scenes/garden.rs"]
-mod garden;
+use three_d_raytrace::scenes::garden;
 
 fn compute_tracer() -> Option<ComputeTracer> {
     let context = context()?;

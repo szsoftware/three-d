@@ -414,7 +414,7 @@ impl ComputeTracer {
 
     ///
     /// Whether shadow rays in scenes with media take the surfaces of solids in their order, with the media of nested
-    /// solids by their [RtMaterial::medium_priority] as the paths do. Everywhere but on WARP, the software adapter of
+    /// solids by their [RtMaterial::medium_priority](crate::RtMaterial::medium_priority) as the paths do. Everywhere but on WARP, the software adapter of
     /// DirectX 12, whose compiler gets that code wrong: there shadow rays add up the media of the solids they cross,
     /// which is right as long as solids do not overlap, and counts the media of nested solids both.
     ///
@@ -2190,11 +2190,20 @@ fn params_bytes(
     p.v3(camera.position(), 1.0);
     let mut view = camera.view();
     view[3] = vec4(0.0, 0.0, 0.0, 1.0);
-    let screen_to_direction = (camera.projection() * view)
+    let mut screen_to_direction = (camera.projection() * view)
         .invert()
         .unwrap_or(Mat4::identity());
+    if let Some(region) = &settings.view_region {
+        screen_to_direction = screen_to_direction * region.ndc_to_view();
+    }
     p.m4(&screen_to_direction);
-    let at = |u: f32, v: f32| camera.position_at_uv_coordinates((u, v));
+    let at = |u: f32, v: f32| {
+        let (u, v) = match &settings.view_region {
+            Some(region) => region.to_view(u, v),
+            None => (u, v),
+        };
+        camera.position_at_uv_coordinates((u, v))
+    };
     let origin = at(0.0, 0.0);
     p.v3(origin, 0.0);
     p.v3(at(1.0, 0.0) - origin, 0.0);

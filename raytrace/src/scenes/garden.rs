@@ -1,9 +1,9 @@
 //!
-//! A small garden scene for the example and the reference image test: a house with glass windows and a gable roof, a
-//! terrace, a hedge and instanced trees on a lawn, in Berlin on a summer afternoon.
+//! A small garden: a house with glass windows and a gable roof, a terrace, a hedge and instanced trees on a lawn, in
+//! Berlin on a summer afternoon. Also the scene of the reference image test.
 //!
 
-use three_d_raytrace::*;
+use crate::*;
 
 /// Size of the image the camera is made for.
 pub fn camera(width: u32, height: u32) -> Camera {
@@ -204,5 +204,26 @@ fn gable_roof() -> CpuMesh {
     CpuMesh {
         positions: three_d_asset::Positions::F32(positions),
         ..Default::default()
+    }
+}
+
+/// The garden with its camera and exposure, see [super::DemoScene].
+pub fn demo() -> super::DemoScene {
+    super::DemoScene {
+        name: "garden",
+        title: "Garden",
+        description: "A house with glass windows, a terrace, a hedge and trees on a lawn, Berlin on a summer \
+                      afternoon: sun, sky and soft shadows.",
+        scene: scene(),
+        eye: vec3(15.0, 5.5, 19.0),
+        target: vec3(0.0, 1.8, 0.0),
+        field_of_view: degrees(45.0),
+        z_near: 0.1,
+        z_far: 1000.0,
+        tone_mapping: ToneMapping {
+            exposure_ev100: 14.0,
+            ..Default::default()
+        },
+        settings: TraceSettings::default(),
     }
 }
