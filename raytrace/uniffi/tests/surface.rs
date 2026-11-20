@@ -348,6 +348,70 @@ fn a_final_render_as_png() {
     assert_eq!((image.width(), image.height()), (40, 30));
 }
 
+/// Textured materials on meshes without texture coordinates or tangents: the realtime view drops what the mesh cannot
+/// carry instead of failing the whole frame (on wgpu a pipeline that misses an attribute left every pixel empty).
+#[test]
+fn realtime_view_with_textures_on_meshes_without_uvs_or_tangents() {
+    if std::env::var_os("THREE_D_SKIP_GPU_TESTS").is_some() {
+        return;
+    }
+    let renderer = Renderer::headless(true);
+    if renderer.cpu_reason().is_some() && std::env::var("THREE_D_REQUIRE_WGPU").is_err() {
+        eprintln!("no GPU: {:?}", renderer.cpu_reason());
+        return;
+    }
+    let demo = demo_scene("pergola".to_owned()).unwrap();
+    let scene = &demo.scene;
+    let pixels = UploadBytes::new(4 * 4 * 4);
+    write(pixels.resize(4 * 4 * 4), &[0x80ff80ffu32; 16]);
+    let texture = scene.add_texture_rgba(4, 4, pixels, true).unwrap();
+    let mut material = scene.material(0).unwrap();
+    material.base_color_texture = Some(texture);
+    material.normal_texture = Some(texture);
+    let material = scene.add_material(material).unwrap();
+    // A floor of two triangles under the pergola: once with nothing but positions, once with texture coordinates
+    let quad = |uvs: bool| {
+        let positions = UploadBytes::new(0);
+        write(
+            positions.resize(12 * 4),
+            &[-2f32, 0.05, -2., 2., 0.05, -2., 2., 0.05, 2., -2., 0.05, 2.],
+        );
+        let indices = UploadBytes::new(0);
+        write(indices.resize(6 * 4), &[0u32, 2, 1, 0, 3, 2]);
+        let uv = uvs.then(|| {
+            let uv = UploadBytes::new(0);
+            write(uv.resize(8 * 4), &[0f32, 0., 1., 0., 1., 1., 0., 1.]);
+            uv
+        });
+        scene
+            .add_uploaded_mesh(positions, indices, None, uv)
+            .unwrap()
+    };
+    let identity = vec![
+        1f32, 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
+    ];
+    scene
+        .add_instance(quad(false), material, identity.clone())
+        .unwrap();
+    scene.add_instance(quad(true), material, identity).unwrap();
+    let realtime = RealtimeSpec {
+        sun_shadow_map: 0,
+        raytrace_when_still_ms: None,
+        look: demo.look,
+    };
+    let view = renderer
+        .scene_view(demo.scene.clone(), demo.camera, 64, 48, realtime)
+        .unwrap();
+    let frame = view.next_frame().unwrap();
+    let pixels = unsafe {
+        std::slice::from_raw_parts(frame.rgba.address as *const u8, frame.rgba.length as usize)
+    };
+    assert!(
+        pixels.chunks(4).all(|p| p[3] == 255),
+        "the frame was not drawn"
+    );
+}
+
 /// The realtime view, the preview and a final render on the GPU; only where a wgpu adapter is (lavapipe in CI).
 #[test]
 fn realtime_view_preview_and_pick_on_the_gpu() {
