@@ -1,0 +1,31 @@
+[package]
+name = "three-d-raytrace-uniffi"
+version = "0.1.0"
+edition = "2021"
+description = "Scenes for three-d-raytrace built from Kotlin (or any uniffi language): scene with ids, buffers Kotlin writes into, final renders, preview and a realtime view"
+license = "MIT"
+publish = false
+
+[lib]
+# lib: linked into the cdylib of an application crate (the KMP library), which then has these types in its bindings;
+# cdylib: bindings and tests of this crate on its own
+crate-type = ["lib", "cdylib"]
+
+[features]
+default = ["gpu"]
+# Final renders, preview and realtime view on a GPU through three-d's wgpu backend; without it only the CPU tracer
+gpu = ["three-d-raytrace/wgpu", "three-d/wgpu"]
+
+[dependencies]
+uniffi = "0.32"
+three-d-raytrace = { path = "..", features = ["three-d", "export"] }
+three-d = { path = "../..", default-features = false }
+three-d-asset = { version = "0.10", features = ["obj", "gltf", "png", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# A context without a window when the GPU cannot be used: OpenGL through EGL for the CPU tracer's display
+[target.'cfg(target_os = "linux")'.dependencies]
+three-d = { path = "../..", default-features = false, features = ["headless-gl"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-time = "1"
