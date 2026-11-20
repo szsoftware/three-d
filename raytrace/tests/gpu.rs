@@ -379,3 +379,37 @@ fn gpu_render_image_shows_in_three_d_without_the_cpu() {
     image.reset();
     assert_eq!(image.read().pixel(3, 3), vec3(0.0, 0.0, 0.0));
 }
+
+#[test]
+fn compute_calls_in_a_row_each_measure_their_time() {
+    let Some(mut tracer) = compute_tracer() else {
+        return;
+    };
+    let mut scene = RtScene::new();
+    scene.set_environment(RtEnvironment::Uniform {
+        color: vec3(1.0, 1.0, 1.0),
+        luminance: 1000.0,
+    });
+    let camera = camera_at(
+        vec3(0.0, 0.0, 4.0),
+        vec3(0.0, 0.0, 0.0),
+        vec3(0.0, 1.0, 0.0),
+        30.0,
+        16,
+    );
+    // Calls without waiting in between take the timestamps of one slot after the other
+    let mut image = GpuRenderImage::new(tracer.gpu(), 16, 16);
+    for _ in 0..6 {
+        tracer
+            .trace_gpu(&scene, &camera, &mut image, &TraceSettings::default())
+            .unwrap();
+    }
+    let _ = tracer
+        .gpu()
+        .device
+        .poll(three_d::wgpu::PollType::wait_indefinitely());
+    assert_eq!(tracer.gpu_error(), None);
+    tracer
+        .trace_gpu(&scene, &camera, &mut image, &TraceSettings::default())
+        .unwrap();
+}

@@ -271,6 +271,49 @@ fn the_cpu_traces_in_the_background() {
 }
 
 #[test]
+fn the_preview_tells_why_it_started_again() {
+    let Some(context) = context() else { return };
+    let mut preview = RaytracePreview::new_on_cpu(&context, 16, 8);
+    let scene = sky_only(1000.0);
+    let at = vec3(0.0, 0.0, 0.0);
+    assert_eq!(preview.last_restart(), None);
+    preview.update(&scene, &camera(16, 8, at)).unwrap();
+    assert_eq!(preview.last_restart(), Some(PreviewRestart::First));
+    // The same camera and scene, also made anew: no restart
+    preview.update(&scene, &camera(16, 8, at)).unwrap();
+    assert_eq!(preview.restarts(), 1);
+    preview
+        .update(&scene, &camera(16, 8, vec3(1.0, 0.0, 0.0)))
+        .unwrap();
+    assert_eq!(preview.last_restart(), Some(PreviewRestart::Camera));
+    preview.update(&scene, &camera(16, 9, at)).unwrap();
+    assert_eq!(preview.last_restart(), Some(PreviewRestart::Viewport));
+    // Another scene with the same content
+    preview
+        .update(&sky_only(1000.0), &camera(16, 9, at))
+        .unwrap();
+    assert_eq!(preview.last_restart(), Some(PreviewRestart::Scene));
+    let scene = sky_only(1000.0);
+    preview.update(&scene, &camera(16, 9, at)).unwrap();
+    preview.resize(32, 18);
+    preview.update(&scene, &camera(16, 9, at)).unwrap();
+    assert_eq!(preview.last_restart(), Some(PreviewRestart::Resize));
+    preview.set_settings(PreviewSettings {
+        max_bounces: preview.settings().max_bounces + 1,
+        ..*preview.settings()
+    });
+    preview.update(&scene, &camera(16, 9, at)).unwrap();
+    assert_eq!(preview.last_restart(), Some(PreviewRestart::Settings));
+    let restarts = preview.restarts();
+    assert_eq!(restarts, 7);
+    // A minimized window: nothing changes, the image waits
+    preview.resize(0, 0);
+    assert!(!preview.update(&scene, &camera(0, 0, at)).unwrap());
+    preview.update(&scene, &camera(16, 9, at)).unwrap();
+    assert_eq!(preview.restarts(), restarts);
+}
+
+#[test]
 fn a_slow_gpu_gets_a_lighter_preview() {
     let Some(context) = context() else { return };
     let mut preview = RaytracePreview::new(&context, 64, 32);
@@ -304,6 +347,90 @@ fn a_slow_gpu_gets_a_lighter_preview() {
     assert_eq!(preview.kind(), TracerKind::CpuReference);
     assert!(
         matches!(preview.availability(), PreviewAvailability::CpuOnly(why) if why.contains("1/4"))
+    );
+}
+
+#[test]
+fn a_slow_application_does_not_make_the_gpu_preview_lighter() {
+    let Some(context) = context() else { return };
+    let mut preview = RaytracePreview::new(&context, 64, 32);
+    preview.wait_for_gpu();
+    if preview.kind() != TracerKind::Compute {
+        return;
+    }
+    let scene = sky_only(1000.0);
+    let camera = camera(64, 32, vec3(0.0, 0.0, 0.0));
+    // The GPU's own time, where the device has timestamp queries
+    preview.set_settings(PreviewSettings {
+        gpu_frame_time: None,
+        ..*preview.settings()
+    });
+    // Several calls at once, each with timestamps of its own
+    for _ in 0..6 {
+        preview.update(&scene, &camera).unwrap();
+    }
+    finish(&context);
+    preview.update(&scene, &camera).unwrap();
+    assert_eq!(preview.availability(), &PreviewAvailability::Gpu);
+    for _ in 0..20 {
+        if preview.gpu_time().is_some() {
+            break;
+        }
+        preview.update(&scene, &camera).unwrap();
+        finish(&context);
+    }
+    let Some(gpu_time) = preview.gpu_time() else {
+        eprintln!("skipped, the device has no timestamp queries");
+        return;
+    };
+    // Frames of the application take longer than the limit, the GPU's work is far below it
+    let limit = (gpu_time * 20).max(std::time::Duration::from_millis(50));
+    preview.set_settings(PreviewSettings {
+        gpu_frame_time: Some(limit),
+        ..*preview.settings()
+    });
+    for _ in 0..5 {
+        preview.update(&scene, &camera).unwrap();
+        std::thread::sleep(limit * 3 / 2);
+    }
+    finish(&context);
+    preview.update(&scene, &camera).unwrap();
+    assert_eq!(preview.kind(), TracerKind::Compute);
+    assert_eq!(preview.gpu_downscale(), 1);
+    assert!(preview.gpu_time().is_some_and(|time| time < limit));
+}
+
+#[test]
+fn the_cpu_goes_on_after_the_gpu_changed_its_resolution() {
+    let Some(context) = context() else { return };
+    let mut preview = RaytracePreview::new(&context, 64, 32);
+    preview.wait_for_gpu();
+    if preview.kind() != TracerKind::Compute {
+        return;
+    }
+    let scene = sky_only(1000.0);
+    let camera = camera(64, 32, vec3(0.0, 0.0, 0.0));
+    preview.update(&scene, &camera).unwrap();
+    // Half the resolution on the GPU (as a slow GPU gets it), then far too slow for the GPU at all
+    preview.set_settings(PreviewSettings {
+        gpu_downscale: 2,
+        ..*preview.settings()
+    });
+    preview.update(&scene, &camera).unwrap();
+    assert_eq!(preview.texture().width(), 32);
+    preview.set_settings(PreviewSettings {
+        gpu_frame_time: Some(std::time::Duration::from_nanos(1)),
+        ..*preview.settings()
+    });
+    for _ in 0..10 {
+        preview.update(&scene, &camera).unwrap();
+    }
+    finish(&context);
+    // On the CPU engine from before the GPU, at the CPU's resolution
+    assert_eq!(preview.kind(), TracerKind::CpuReference);
+    assert_eq!(
+        preview.texture().width(),
+        64 / preview.settings().cpu_downscale
     );
 }
 
