@@ -365,7 +365,7 @@ pub(crate) struct PreviewState {
     pub preview: RaytracePreview,
     context: Context,
     target: Texture2D,
-    ring: FrameBuffers,
+    readback: Readback,
     pub width: u32,
     pub height: u32,
 }
@@ -386,7 +386,7 @@ impl PreviewState {
             preview,
             context: context.clone(),
             target: rgba_texture(context, width, height),
-            ring: FrameBuffers::new(3),
+            readback: Readback::new(),
             width,
             height,
         }
@@ -417,12 +417,10 @@ impl PreviewState {
         self.preview
             .render_to_color(&self.target.as_color_target(None));
         let bytes = self
-            .ring
-            .next(self.width as usize * self.height as usize * 4);
-        let pixels: &mut [[u8; 4]] = as_texels(bytes);
-        self.target.as_color_target(None).read_into(pixels);
+            .readback
+            .read(&self.target.as_color_target(None), self.width, self.height);
         Frame {
-            rgba: NativeBytes::of(&bytes[..]),
+            rgba: NativeBytes::of(bytes),
             width: self.width,
             height: self.height,
             samples: self.preview.sample_count(),
@@ -465,11 +463,13 @@ impl PreviewJob {
 
 /// A ring of byte buffers that keep their place between frames: the bytes of a frame stay valid for the next
 /// `count - 1` frames (a UI thread showing one while the next are written).
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) struct FrameBuffers {
     buffers: Vec<Vec<u8>>,
     next: usize,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl FrameBuffers {
     pub fn new(count: usize) -> Self {
         Self {
@@ -490,6 +490,102 @@ impl FrameBuffers {
     }
 }
 
+/// The pixels of a color target for Kotlin, valid for the next two frames.
+///
+/// Native: read right away into a ring of three buffers. In the browser nothing can wait for the GPU: each call starts a
+/// read without waiting and gives the last finished one, so the frame shows what was drawn one or two calls before (on
+/// WebGPU the pixels arrive between two animation frames). Before the first read finished the frame is transparent.
+pub(crate) struct Readback {
+    #[cfg(not(target_arch = "wasm32"))]
+    ring: FrameBuffers,
+    #[cfg(target_arch = "wasm32")]
+    web: web::WebReadback,
+}
+
+impl Readback {
+    pub fn new() -> Self {
+        Self {
+            #[cfg(not(target_arch = "wasm32"))]
+            ring: FrameBuffers::new(3),
+            #[cfg(target_arch = "wasm32")]
+            web: web::WebReadback::default(),
+        }
+    }
+
+    pub fn read(&mut self, target: &three_d::ColorTarget<'_>, width: u32, height: u32) -> &[u8] {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let bytes = self.ring.next(width as usize * height as usize * 4);
+            target.read_into(as_texels(bytes));
+            &bytes[..]
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.web.read(target, width, height)
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+mod web {
+    use std::collections::VecDeque;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+
+    type Pixels = Vec<[u8; 4]>;
+    type PendingRead = Pin<Box<dyn Future<Output = Pixels>>>;
+
+    #[derive(Default)]
+    pub struct WebReadback {
+        pending: Option<(PendingRead, usize)>,
+        /// Finished reads, the newest last; three are kept so that the bytes of a frame stay valid for two more calls
+        shown: VecDeque<Pixels>,
+        free: Vec<Pixels>,
+        blank: Vec<u8>,
+    }
+
+    impl WebReadback {
+        pub fn read(
+            &mut self,
+            target: &three_d::ColorTarget<'_>,
+            width: u32,
+            height: u32,
+        ) -> &[u8] {
+            let count = width as usize * height as usize;
+            // The read of an earlier call: the browser has mapped its buffer by now, or not yet
+            if let Some((future, len)) = &mut self.pending {
+                let mut context = Context::from_waker(Waker::noop());
+                if let Poll::Ready(pixels) = future.as_mut().poll(&mut context) {
+                    if *len == count {
+                        self.shown.push_back(pixels);
+                        while self.shown.len() > 3 {
+                            self.free.extend(self.shown.pop_front());
+                        }
+                    } else {
+                        self.free.push(pixels);
+                    }
+                    self.pending = None;
+                }
+            }
+            // One read at a time; the next starts as soon as the last one is in
+            if self.pending.is_none() {
+                let buffer = self.free.pop().unwrap_or_default();
+                self.pending = Some((Box::pin(target.read_into_async(buffer)), count));
+            }
+            match self.shown.back() {
+                Some(pixels) if pixels.len() == count => pixels.as_flattened(),
+                _ => {
+                    // Nothing of this size yet (the first frames, or right after a resize): transparent
+                    self.blank.resize(count * 4, 0);
+                    &self.blank
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn as_texels(bytes: &mut [u8]) -> &mut [[u8; 4]] {
     let n = bytes.len() / 4;
     // SAFETY: [u8; 4] has the alignment of u8 and the bytes are exactly n * 4 long
