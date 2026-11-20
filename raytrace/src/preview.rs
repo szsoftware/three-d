@@ -381,6 +381,73 @@ struct Pace {
     slow: u32,
 }
 
+#[cfg(feature = "wgpu")]
+impl Pace {
+    ///
+    /// A frame that starts `now`, outside of browsers; see [Pace::step]. The first frame of an engine has no time
+    /// before it; the time after it, with the first trace, is the warm-up.
+    ///
+    #[cfg(not(target_arch = "wasm32"))]
+    fn frame(
+        &mut self,
+        now: std::time::Instant,
+        limit: std::time::Duration,
+        tracing: bool,
+        gpu_scale: u32,
+    ) -> Option<Result<u32, String>> {
+        let last = self.last.replace(now)?;
+        self.step(now - last, limit, true, tracing, gpu_scale)
+    }
+
+    ///
+    /// One measured time: between two frames, in the browser of one call of the GPU. Returns the GPU's new divisor
+    /// of width and height when the preview gets lighter, or why it goes on with the CPU. Without `at_once` a far
+    /// too slow time also waits for [SLOW_FRAMES] in a row.
+    ///
+    fn step(
+        &mut self,
+        interval: std::time::Duration,
+        limit: std::time::Duration,
+        at_once: bool,
+        tracing: bool,
+        gpu_scale: u32,
+    ) -> Option<Result<u32, String>> {
+        self.frames += 1;
+        // Only while tracing: a finished image costs the GPU nothing. The first time after a new engine has the scene's
+        // structures and the first use of the pipelines in it.
+        if !tracing || self.frames <= WARM_UP_FRAMES || interval <= limit {
+            self.slow = 0;
+            return None;
+        }
+        self.slow += 1;
+        // Far too slow: at once to the resolution that would be fast enough, the time goes with the pixels
+        let far_too_slow = interval > limit * FAR_TOO_SLOW;
+        if self.slow < SLOW_FRAMES && !(far_too_slow && at_once) {
+            return None;
+        }
+        let mut scale = gpu_scale * 2;
+        if far_too_slow {
+            let pixels = interval.as_secs_f32() / limit.as_secs_f32();
+            while scale <= MAX_GPU_DOWNSCALE
+                && pixels * (gpu_scale as f32 / scale as f32).powi(2) > 1.0
+            {
+                scale *= 2;
+            }
+        }
+        Some(if scale <= MAX_GPU_DOWNSCALE {
+            Ok(scale)
+        } else {
+            Err(format!(
+                "The GPU needs {} ms per frame at 1/{} of the resolution, too slow even at 1/{}, so ray tracing \
+                 runs on the CPU beside the frames.",
+                interval.as_millis(),
+                gpu_scale,
+                MAX_GPU_DOWNSCALE
+            ))
+        })
+    }
+}
+
 /// Times measured after a new engine that do not count: the first has the scene's structures and the first use of the
 /// pipelines.
 #[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
@@ -989,18 +1056,13 @@ impl RaytracePreview {
         let Some(limit) = self.settings.gpu_frame_time else {
             return false;
         };
+        let tracing = !self.is_done();
         #[cfg(not(target_arch = "wasm32"))]
-        {
-            let now = std::time::Instant::now();
-            // The first frame of an engine has no time before it; the time after it, with the first trace, is the
-            // warm-up
-            let Some(interval) = self.pace.last.replace(now).map(|last| now - last) else {
-                return false;
-            };
-            self.pace_step(interval, limit, true)
-        }
+        let decision = self
+            .pace
+            .frame(std::time::Instant::now(), limit, tracing, self.gpu_scale);
         #[cfg(target_arch = "wasm32")]
-        {
+        let decision = {
             let Engine::Gpu { tracer, .. } = &self.engine else {
                 return false;
             };
@@ -1010,59 +1072,22 @@ impl RaytracePreview {
                 self.pace.started = true;
                 return false;
             }
+            let mut decision = None;
             for busy in tracer.take_call_times() {
                 let busy = std::time::Duration::from_secs_f64(busy / 1000.0);
                 // Not at once on one slow call: a hidden page stops its frames, and the browser may tell late about
                 // the at most two calls it still had
-                if self.pace_step(busy, limit, false) {
-                    return true;
+                decision = self.pace.step(busy, limit, false, tracing, self.gpu_scale);
+                if decision.is_some() {
+                    break;
                 }
             }
-            false
-        }
-    }
-
-    /// One frame (in the browser one call of the GPU) that took `interval` after the one before; see
-    /// [RaytracePreview::pace_gpu]. Without `at_once` a far too slow frame also waits for [SLOW_FRAMES] in a row.
-    #[cfg(feature = "wgpu")]
-    fn pace_step(
-        &mut self,
-        interval: std::time::Duration,
-        limit: std::time::Duration,
-        at_once: bool,
-    ) -> bool {
-        self.pace.frames += 1;
-        // Only while tracing: a finished image costs the GPU nothing. The first time after a new engine has the scene's
-        // structures and the first use of the pipelines in it.
-        if self.is_done() || self.pace.frames <= WARM_UP_FRAMES || interval <= limit {
-            self.pace.slow = 0;
-            return false;
-        }
-        self.pace.slow += 1;
-        // Far too slow: at once to the resolution that would be fast enough, the time goes with the pixels
-        let far_too_slow = interval > limit * FAR_TOO_SLOW;
-        if self.pace.slow < SLOW_FRAMES && !(far_too_slow && at_once) {
-            return false;
-        }
-        let mut scale = self.gpu_scale * 2;
-        if far_too_slow {
-            let pixels = interval.as_secs_f32() / limit.as_secs_f32();
-            while scale <= MAX_GPU_DOWNSCALE
-                && pixels * (self.gpu_scale as f32 / scale as f32).powi(2) > 1.0
-            {
-                scale *= 2;
-            }
-        }
-        if scale <= MAX_GPU_DOWNSCALE {
-            self.gpu_scale = scale;
-        } else {
-            self.availability = PreviewAvailability::CpuOnly(format!(
-                "The GPU needs {} ms per frame at 1/{} of the resolution, too slow even at 1/{}, so ray tracing \
-                 runs on the CPU beside the frames.",
-                interval.as_millis(),
-                self.gpu_scale,
-                MAX_GPU_DOWNSCALE
-            ));
+            decision
+        };
+        match decision {
+            None => return false,
+            Some(Ok(scale)) => self.gpu_scale = scale,
+            Some(Err(why)) => self.availability = PreviewAvailability::CpuOnly(why),
         }
         self.rebuild();
         true
@@ -1218,5 +1243,69 @@ fn placeholder_engine() -> Engine {
         image: RenderImage::new(1, 1),
         pending: RenderImage::new(1, 1),
         next_row: 0,
+    }
+}
+
+#[cfg(all(test, feature = "wgpu", not(target_arch = "wasm32")))]
+mod tests {
+    use super::Pace;
+    use std::time::{Duration, Instant};
+
+    const LIMIT: Duration = Duration::from_millis(40);
+
+    #[test]
+    fn the_first_frame_of_an_engine_does_not_count() {
+        let start = Instant::now();
+        let mut pace = Pace::default();
+        // No time before the first frame; the time after it has the scene's structures and the pipelines' first use
+        assert_eq!(pace.frame(start, LIMIT, true, 1), None);
+        let mut now = start + Duration::from_millis(1182);
+        assert_eq!(pace.frame(now, LIMIT, true, 1), None);
+        for _ in 0..10 {
+            now += Duration::from_millis(20);
+            assert_eq!(pace.frame(now, LIMIT, true, 1), None);
+        }
+        // A far too slow frame after that counts at once: 300 ms are 7.5 times the limit, a quarter of the pixels
+        now += Duration::from_millis(300);
+        assert_eq!(pace.frame(now, LIMIT, true, 1), Some(Ok(4)));
+    }
+
+    #[test]
+    fn three_slow_frames_halve_the_resolution() {
+        let mut pace = Pace::default();
+        assert_eq!(pace.step(LIMIT * 3, LIMIT, true, true, 1), None);
+        let slow = LIMIT * 2;
+        assert_eq!(pace.step(slow, LIMIT, true, true, 1), None);
+        assert_eq!(pace.step(slow, LIMIT, true, true, 1), None);
+        // A fast frame in between starts the count again
+        assert_eq!(pace.step(LIMIT / 2, LIMIT, true, true, 1), None);
+        assert_eq!(pace.step(slow, LIMIT, true, true, 1), None);
+        assert_eq!(pace.step(slow, LIMIT, true, true, 1), None);
+        assert_eq!(pace.step(slow, LIMIT, true, true, 1), Some(Ok(2)));
+    }
+
+    #[test]
+    fn in_the_browser_a_far_too_slow_call_waits_for_three_in_a_row() {
+        let mut pace = Pace::default();
+        let far = LIMIT * 8;
+        assert_eq!(pace.step(far, LIMIT, false, true, 1), None);
+        assert_eq!(pace.step(far, LIMIT, false, true, 1), None);
+        assert_eq!(pace.step(far, LIMIT, false, true, 1), None);
+        assert_eq!(pace.step(far, LIMIT, false, true, 1), Some(Ok(4)));
+    }
+
+    #[test]
+    fn too_slow_at_a_quarter_goes_to_the_cpu_and_a_finished_image_never() {
+        let mut pace = Pace::default();
+        let far = LIMIT * 30;
+        assert_eq!(pace.step(far, LIMIT, true, true, 1), None);
+        assert!(matches!(
+            pace.step(far, LIMIT, true, true, 1),
+            Some(Err(why)) if why.contains("1/4")
+        ));
+        let mut pace = Pace::default();
+        for _ in 0..5 {
+            assert_eq!(pace.step(far, LIMIT, true, false, 1), None);
+        }
     }
 }
