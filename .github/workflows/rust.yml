@@ -112,12 +112,26 @@ jobs:
           args: --all-features --lib
 
       # The ray tracing crate of the fork, also together with the wgpu backend on the adapter chosen above
+      # On Windows the runner has only WARP, the software DirectX 12, which needs about three minutes per test to build
+      # the tracer's shaders: in pull requests there the GPU tests are turned off but one, the full set runs on master
       - name: Test ray tracing
-        run: cargo test -p three-d-raytrace --all-features
+        shell: bash
+        run: |
+          if [[ "${{ matrix.os }}" == windows* && "${{ github.event_name }}" == "pull_request" ]]; then
+            THREE_D_SKIP_GPU_TESTS=1 cargo test -p three-d-raytrace --all-features
+            cargo test -p three-d-raytrace --all-features --test gpu compute_garden_agrees_with_the_cpu_reference
+          else
+            cargo test -p three-d-raytrace --all-features
+          fi
 
       # The uniffi surface: scenes, uploads, imports, final renders, preview and realtime view on the same adapter
       - name: Test ray tracing for Kotlin
-        run: cargo test -p three-d-raytrace-uniffi
+        shell: bash
+        run: |
+          if [[ "${{ matrix.os }}" == windows* && "${{ github.event_name }}" == "pull_request" ]]; then
+            export THREE_D_SKIP_GPU_TESTS=1
+          fi
+          cargo test -p three-d-raytrace-uniffi
 
       # The same tests with wgpu on top of OpenGL (feature wgpu-gl), again on the software driver
       - name: Test wgpu on OpenGL

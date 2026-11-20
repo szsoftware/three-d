@@ -349,6 +349,9 @@ fn a_final_render_as_png() {
 /// The realtime view, the preview and a final render on the GPU; only where a wgpu adapter is (lavapipe in CI).
 #[test]
 fn realtime_view_preview_and_pick_on_the_gpu() {
+    if std::env::var_os("THREE_D_SKIP_GPU_TESTS").is_some() {
+        return;
+    }
     let renderer = Renderer::headless(true);
     if renderer.cpu_reason().is_some() && std::env::var("THREE_D_REQUIRE_WGPU").is_err() {
         eprintln!("no GPU: {:?}", renderer.cpu_reason());

@@ -4,6 +4,8 @@
 //!
 #![cfg(feature = "three-d")]
 
+mod common;
+
 use three_d_raytrace::*;
 
 /// Bright sky above, a dark ground below and a light grey box in the middle, which the bands cut through.
@@ -192,7 +194,7 @@ mod gpu {
     use three_d::Context;
 
     fn context() -> Option<Context> {
-        match Context::new_headless_wgpu() {
+        match common::headless_wgpu() {
             Ok(context) => Some(context),
             Err(error) if std::env::var("THREE_D_REQUIRE_WGPU").is_ok() => {
                 panic!("no wgpu adapter: {error}")

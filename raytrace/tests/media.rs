@@ -3,6 +3,8 @@
 //! and scattered in closed meshes and in the fog over the scene, against closed forms.
 //!
 
+mod common;
+
 use std::f32::consts::PI;
 use three_d_raytrace::*;
 
@@ -11,7 +13,7 @@ fn tracers() -> Vec<(&'static str, Box<dyn Tracer>)> {
     let mut tracers: Vec<(&'static str, Box<dyn Tracer>)> =
         vec![("cpu", Box::new(CpuReferenceTracer::new()))];
     #[cfg(feature = "wgpu")]
-    match three_d::Context::new_headless_wgpu() {
+    match common::headless_wgpu() {
         Ok(context) => match ComputeTracer::from_context(&context) {
             // WARP adds up the media along shadow rays, see ComputeTracer::orders_shadow_crossings
             Some(tracer) if !tracer.orders_shadow_crossings() => {

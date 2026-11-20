@@ -3,6 +3,8 @@
 //! distance stays sharp, an edge behind it is blurred by the circle of confusion of a thin lens.
 //!
 
+mod common;
+
 use three_d_raytrace::*;
 
 fn tracers() -> Vec<(&'static str, Box<dyn Tracer>)> {
@@ -10,7 +12,7 @@ fn tracers() -> Vec<(&'static str, Box<dyn Tracer>)> {
     let mut tracers: Vec<(&'static str, Box<dyn Tracer>)> =
         vec![("cpu", Box::new(CpuReferenceTracer::new()))];
     #[cfg(feature = "wgpu")]
-    match three_d::Context::new_headless_wgpu() {
+    match common::headless_wgpu() {
         Ok(context) => match ComputeTracer::from_context(&context) {
             Some(tracer) => tracers.push(("compute", Box::new(tracer))),
             None if std::env::var("WGPU_BACKEND").as_deref() == Ok("gl") => {}

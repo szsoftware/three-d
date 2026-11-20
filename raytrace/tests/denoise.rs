@@ -2,6 +2,8 @@
 //! The à-trous denoiser on the CPU and, with the `wgpu` feature, on the GPU.
 //!
 
+mod common;
+
 use three_d_raytrace::*;
 
 /// A floor with four large checkers and a box, under a sky and a low light, so there are textures, edges and soft light.
@@ -165,7 +167,7 @@ fn many_samples_are_left_almost_alone() {
 #[cfg(feature = "wgpu")]
 #[test]
 fn the_gpu_denoises_like_the_cpu() {
-    let context = match three_d::Context::new_headless_wgpu() {
+    let context = match common::headless_wgpu() {
         Ok(context) => context,
         Err(error) if std::env::var("THREE_D_REQUIRE_WGPU").is_ok() => {
             panic!("no wgpu adapter: {error}")

@@ -2317,6 +2317,9 @@ mod tests {
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
     fn every_pass_is_timed_also_in_calls_with_many_passes() {
+        if std::env::var_os("THREE_D_SKIP_GPU_TESTS").is_some() {
+            return;
+        }
         let Ok(context) = three_d::Context::new_headless_wgpu() else {
             return;
         };
@@ -2365,6 +2368,9 @@ mod tests {
 
     #[test]
     fn errors_of_the_gpu_are_caught() {
+        if std::env::var_os("THREE_D_SKIP_GPU_TESTS").is_some() {
+            return;
+        }
         let Ok(context) = three_d::Context::new_headless_wgpu() else {
             return;
         };

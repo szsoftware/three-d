@@ -4,11 +4,13 @@
 //!
 #![cfg(feature = "wgpu")]
 
+mod common;
+
 use three_d::{Context, Interpolation, Texture2D, Wrapping};
 use three_d_raytrace::*;
 
 fn context() -> Option<Context> {
-    match Context::new_headless_wgpu() {
+    match common::headless_wgpu() {
         Ok(context) => Some(context),
         Err(error) if std::env::var("THREE_D_REQUIRE_WGPU").is_ok() => {
             panic!("no wgpu adapter: {error}")
@@ -212,7 +214,7 @@ fn check_upright(context: &Context, name: &str) {
 
 #[test]
 fn preview_is_upright_on_wgpu() {
-    let context = match Context::new_headless_wgpu_with_screen(32, 32, true, false) {
+    let context = match common::headless_wgpu_with_screen(32, 32, true, false) {
         Ok(context) => context,
         Err(error) if std::env::var("THREE_D_REQUIRE_WGPU").is_ok() => {
             panic!("no wgpu adapter: {error}")

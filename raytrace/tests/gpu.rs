@@ -4,11 +4,13 @@
 //!
 #![cfg(feature = "wgpu")]
 
+mod common;
+
 use three_d::Context;
 use three_d_raytrace::*;
 
 fn context() -> Option<Context> {
-    match Context::new_headless_wgpu() {
+    match common::headless_wgpu() {
         Ok(context) => Some(context),
         Err(error) if std::env::var("THREE_D_REQUIRE_WGPU").is_ok() => {
             panic!("no wgpu adapter: {error}")
