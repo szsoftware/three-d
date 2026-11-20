@@ -219,7 +219,7 @@ path = "examples/logo/src/main.rs"
 
 # Fork addition: further crates of the fork live next to three-d, the examples stay separate crates
 [workspace]
-members = ["raytrace"]
+members = ["raytrace", "raytrace/uniffi"]
 exclude = ["examples", "vendor"]
 
 # Fork addition: wgpu-hal with a patch, so that wgpu notices a reset of the graphics card on OpenGL and reports a lost device,
