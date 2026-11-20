@@ -89,12 +89,9 @@ jobs:
       # macOS tests the wgpu backend on Metal and Windows on DirectX 12 (software adapter), both against what OpenGL returned on Linux
       - if: startsWith(matrix.os, 'macos')
         run: echo "THREE_D_EXPECT_BACKEND=metal" >> $GITHUB_ENV
-      # Debug builds of wgpu compile DirectX shaders without optimizations (DXC -Od); WARP, the software DirectX 12
-      # of the runner, then takes minutes per test binary for the large ray tracing shader. WGPU_DEBUG=0 keeps the
-      # optimizations, validation stays on.
       - if: startsWith(matrix.os, 'windows')
         shell: bash
-        run: echo "THREE_D_EXPECT_BACKEND=dx12" >> $GITHUB_ENV && echo "WGPU_DEBUG=0" >> $GITHUB_ENV
+        run: echo "THREE_D_EXPECT_BACKEND=dx12" >> $GITHUB_ENV
 
       # The shader compiler Windows comes with (FXC) fails on shaders that sample a texture in a loop, so the tests use the new one (DXC) of the Windows SDK, which wgpu finds on the PATH
       - if: startsWith(matrix.os, 'windows')
