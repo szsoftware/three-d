@@ -170,6 +170,45 @@ impl Renderer {
     }
 }
 
+/// The renderer of a web page.
+#[cfg(target_arch = "wasm32")]
+#[uniffi::export]
+impl Renderer {
+    ///
+    /// A renderer on the canvas with the id `canvas_id` in the page: WebGPU where the browser has it on the graphics card
+    /// and `prefer_gpu` is set, WebGL2 otherwise. The canvas only gives the device; the views hand their pixels to Kotlin
+    /// (Compose draws them), so it may stay hidden. Asynchronous, because the browser cannot wait for WebGPU otherwise.
+    ///
+    #[uniffi::constructor]
+    pub async fn from_canvas(canvas_id: String, prefer_gpu: bool) -> Result<Arc<Self>, RtFfiError> {
+        cargo_uniffi_support::LocalExecutor::new()
+            .run(move || async move {
+                use wasm_bindgen::JsCast;
+                let canvas = web_sys::window()
+                    .and_then(|w| w.document())
+                    .and_then(|d| d.get_element_by_id(&canvas_id))
+                    .ok_or_else(|| invalid(format!("no element with the id {canvas_id:?}")))?
+                    .dyn_into::<web_sys::HtmlCanvasElement>()
+                    .map_err(|_| invalid(format!("the element {canvas_id:?} is no canvas")))?;
+                let preference = if prefer_gpu {
+                    three_d::BackendPreference::Auto
+                } else {
+                    three_d::BackendPreference::Gl
+                };
+                let context = three_d::WindowedContext::from_canvas_async(
+                    canvas,
+                    three_d::SurfaceSettings::default(),
+                    preference,
+                )
+                .await
+                .map_err(|e| RtFfiError::Gpu { why: e.to_string() })?;
+                Ok(Self::with_context((*context).clone()))
+            })
+            .await
+            .map_err(|e| RtFfiError::Gpu { why: e.to_string() })?
+    }
+}
+
 impl Renderer {
     /// A renderer on the context of the application, for example the one of the browser's canvas or of the POC.
     pub fn with_context(context: Context) -> Arc<Self> {
