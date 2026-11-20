@@ -19,7 +19,7 @@ gpu = ["three-d-raytrace/wgpu", "three-d/wgpu"]
 [dependencies]
 uniffi = "0.32"
 # ThreadBound, NativeBytes, OwnedBytes and UploadBytes of the cargo-uniffi Gradle plugin, whose common API knows them
-cargo-uniffi-support = { git = "https://github.com/szsoftware/cargo-uniffi-gradle-plugin", tag = "v0.4.0-alpha.16", default-features = false, features = ["thread-bound", "bytes"] }
+cargo-uniffi-support = { git = "https://github.com/szsoftware/cargo-uniffi-gradle-plugin", tag = "support-v0.4.0-alpha.17", default-features = false, features = ["thread-bound", "bytes"] }
 three-d-raytrace = { path = "..", features = ["three-d", "export"] }
 three-d = { path = "../..", default-features = false }
 three-d-asset = { version = "0.10", features = ["obj", "gltf", "png", "jpeg"] }
