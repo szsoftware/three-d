@@ -64,8 +64,7 @@ fn render_image_updates_the_texture_in_place() {
 // ---------------------------------------------------------------------------------------------------------------------
 // The compute tracer against values known from physics and against the CPU reference
 
-#[path = "../scenes/garden.rs"]
-mod garden;
+use three_d_raytrace::scenes::garden;
 
 fn compute_tracer() -> Option<ComputeTracer> {
     let context = context()?;
@@ -412,4 +411,75 @@ fn compute_calls_in_a_row_each_measure_their_time() {
     tracer
         .trace_gpu(&scene, &camera, &mut image, &TraceSettings::default())
         .unwrap();
+}
+
+#[test]
+fn a_sample_spread_over_calls_adds_up_to_the_same_image() {
+    let Some(tracer) = compute_tracer() else {
+        return;
+    };
+    let mut tracer = tracer.with_tile_size(16);
+    let mut scene = RtScene::new();
+    scene.set_environment(RtEnvironment::Uniform {
+        color: vec3(1.0, 0.8, 0.6),
+        luminance: 1000.0,
+    });
+    let square = scene.add_mesh(&CpuMesh::square()).unwrap();
+    let material = scene.add_material(RtMaterial::default());
+    scene
+        .add_instance(square, material, Mat4::identity())
+        .unwrap();
+    let camera = Camera::new_perspective(
+        Viewport::new_at_origo(40, 24),
+        vec3(0.5, 0.3, 3.0),
+        vec3(0.0, 0.0, 0.0),
+        vec3(0.0, 1.0, 0.0),
+        degrees(45.0),
+        0.01,
+        100.0,
+    );
+    // 3 by 2 tiles of 16 pixels
+    assert_eq!(tracer.tiles_per_sample(40, 24), 6);
+    let settings = TraceSettings::default();
+    let mut whole = GpuRenderImage::new(tracer.gpu(), 40, 24);
+    for _ in 0..2 {
+        tracer
+            .trace_gpu(&scene, &camera, &mut whole, &settings)
+            .unwrap();
+    }
+    let mut parts = GpuRenderImage::new(tracer.gpu(), 40, 24);
+    // Four tiles, then the two to the end of the sample
+    assert!(!tracer
+        .trace_gpu_tiles(&scene, &camera, &mut parts, &settings, 4)
+        .unwrap());
+    assert!(parts.sample_in_progress());
+    assert_eq!(parts.sample_count(), 0);
+    assert!(tracer
+        .trace_gpu_tiles(&scene, &camera, &mut parts, &settings, 4)
+        .unwrap());
+    assert!(!parts.sample_in_progress());
+    assert_eq!(parts.sample_count(), 1);
+    // A tile of the second sample, which trace_gpu completes
+    assert!(!tracer
+        .trace_gpu_tiles(&scene, &camera, &mut parts, &settings, 1)
+        .unwrap());
+    tracer
+        .trace_gpu(&scene, &camera, &mut parts, &settings)
+        .unwrap();
+    assert_eq!(parts.sample_count(), 2);
+    assert!(!parts.sample_in_progress());
+    assert_eq!(tracer.gpu_error(), None);
+    // The same samples of the same pixels: the random numbers go with pixel and sample, not with the tile
+    let (whole, parts) = (whole.read(), parts.read());
+    assert_eq!(whole.sample_count(), 2);
+    let differs = whole
+        .pixels()
+        .iter()
+        .zip(parts.pixels())
+        .filter(|(a, b)| (**a - *b).magnitude() > 1e-3 * a.magnitude().max(1.0))
+        .count();
+    assert_eq!(differs, 0);
+    // Not all of one color: the square is in the picture
+    let pixels = whole.pixels();
+    assert!(pixels.iter().any(|p| (*p - pixels[0]).magnitude() > 1.0));
 }

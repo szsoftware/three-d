@@ -65,14 +65,22 @@ core for its frames, and the threads of the preview run at nice 10 on Linux and 
 names devices whose drivers crash with the tracer (none known at the moment); `RaytraceSupport::of` reports `Cpu` for
 them and the preview says why.
 
-On the GPU the preview watches the time between updates while it traces (`PreviewSettings::gpu_frame_time`, 40 ms by
-default, not in the browser). After three slower frames in a row it halves the resolution, down to a quarter, and then
-goes on with the CPU, with the reason in `availability`. A frame five times slower (under 5 fps) goes at once to the
-resolution that would be fast enough, or to the CPU. Weak GPUs such as the Intel HD 4000 trace no faster than four
-CPU cores (about 0.5 million samples per second on the T430) but hold up every frame of the application while they do;
-the CPU traces beside the frames. `gpu_downscale` sets the starting resolution, `RaytracePreview::gpu_downscale` tells
-the current one. The texture is then smaller than the viewport; call `resize` only when the viewport changes, it
-starts again (and does nothing for the same size).
+On the GPU the preview watches the GPU's own time of every update while it traces (`PreviewSettings::gpu_frame_time`,
+40 ms by default), from timestamp queries where the device has them (also in Chrome), in browsers without them from
+when the browser tells that the work is done, and otherwise from the time between updates. After three slower updates
+in a row it halves the resolution, down to a quarter, and then goes on with the CPU, with the reason in
+`availability`. One five times slower (under 5 fps) goes at once to the resolution that would be fast enough, or to the
+CPU. Weak GPUs such as the Intel HD 4000 trace no faster than four CPU cores (about 0.5 million samples per second on
+the T430) but hold up every frame of the application while they do; the CPU traces beside the frames.
+`gpu_downscale` sets the starting resolution, `RaytracePreview::gpu_downscale` tells the current one. The texture is
+then smaller than the viewport; call `resize` only when the viewport changes, it starts again (and does nothing for
+the same size). A new `gpu_frame_time` starts from `gpu_downscale` again, also back from the CPU when the GPU was too
+slow; `None` keeps the full resolution, for a switch such as "full resolution, fewer frames".
+
+While camera and scene stand still, a GPU at a lower resolution goes on at the full one after 16 samples
+(`gpu_sharp_when_still`, on by default): `ComputeTracer::trace_gpu_tiles` spreads a sample over several updates, as many
+tiles in each as fit into `gpu_frame_time`, and the preview shows the image once it has 4 samples, so the finished
+image is sharp. A move of the camera goes back to the lower resolution.
 
 The shaders of the GPU compile on another thread at nice 19, which takes about 8 s on the HD 4000; the CPU traces
 meanwhile and the preview goes on with the GPU in the first `update` after (`is_compiling`, `wait_for_gpu`). With wgpu
@@ -116,6 +124,33 @@ default, `with_tile_size`), one dispatch per tile and sample, so no dispatch run
 the GPU. `ComputeTracer` also implements `Tracer` and then reads every call back into a `RenderImage`, which a browser
 can not wait for. Its random numbers differ from the CPU tracer's, so the images agree in their averages, not in their
 noise.
+
+## Demo scenes and print size
+
+`three_d_raytrace::scenes` holds the scenes of the examples and tests, each with its start camera, exposure and
+settings: `garden`, `pergola` (sunbeams in haze, a basin of water, a ball of smoke), `aquarium` (nested media, a pane of
+glass on the floor), `caustics` (glass in the sun) and `downlights` (IES luminaires on a wall). `scenes::all()` lists them as `DemoScene`, whose `camera(width,
+height)` and `preview_settings(..)` are ready for a `RaytracePreview`.
+
+`FinalRender` traces an image larger than the screen, for print or export, beside the frames of an application:
+
+```rust
+let (width, height) = A4_LANDSCAPE_300_DPI; // 3508 × 2480
+let mut print = FinalRender::new(&camera, width, height, 256)
+    .with_settings(demo.settings)
+    .with_tone_mapping(demo.tone_mapping);
+// Every frame instead of preview.update, until done; print.progress() and print.remaining() for a progress bar
+if preview.trace_final(&scene, &mut print)? {
+    let png: Vec<u8> = print.png().unwrap(); // or print.rgba8(), rows from the top
+}
+```
+
+The image is traced in bands of at most 2 million pixels (`with_band_pixels`), each with the camera's view of its rows
+(`TraceSettings::view_region`) and some rows more above and below, so the denoiser sees across the seam. On the GPU a
+sample of a band is spread over as many updates as needed to stay within `with_frame_time` (40 ms), then the band is
+denoised, tone mapped and read back on the GPU; without a GPU, `trace_final` traces rows on the CPU. The camera's
+view widens or narrows to the aspect of the print. `cargo run --release -p three-d-raytrace --features wgpu --example
+print -- pergola 256` writes A4 at 300 dpi as PNG.
 
 ## Denoising
 

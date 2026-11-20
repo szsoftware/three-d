@@ -30,6 +30,8 @@ mod denoise;
 #[cfg(feature = "three-d")]
 mod display;
 mod error;
+#[cfg(feature = "three-d")]
+mod final_render;
 #[cfg(feature = "wgpu")]
 mod gpu;
 mod ies;
@@ -46,6 +48,7 @@ mod priority;
 mod render_image;
 mod sampling;
 mod scene;
+pub mod scenes;
 mod sky;
 mod sun;
 mod texture;
@@ -57,6 +60,8 @@ pub use bvh::{Bvh, BvhNode};
 pub use compute::*;
 pub use denoise::*;
 pub use error::*;
+#[cfg(feature = "three-d")]
+pub use final_render::*;
 #[cfg(feature = "wgpu")]
 pub use gpu::*;
 pub use ies::IesProfile;

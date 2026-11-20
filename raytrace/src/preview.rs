@@ -110,10 +110,19 @@ pub struct PreviewSettings {
     /// goes at once to the resolution that would be fast enough, or to the CPU (in browsers it also waits for three in a
     /// row); [RaytracePreview::availability] then says why. The first update after the GPU starts does not count, it
     /// builds the scene's structures and uses the pipelines for the first time. Weak GPUs such as Intel HD 4000 trace
-    /// no faster than four CPU cores and would hold up every frame. `None` keeps the GPU at `gpu_downscale`. What the
-    /// application draws and reads back in a frame does not count where the GPU's time is measured.
+    /// no faster than four CPU cores and would hold up every frame. `None` keeps the GPU at `gpu_downscale`, also when
+    /// set later ([RaytracePreview::set_settings]). What the application draws and reads back in a frame does not
+    /// count where the GPU's time is measured.
     ///
     pub gpu_frame_time: Option<std::time::Duration>,
+    ///
+    /// When the GPU traces at a lower resolution (`gpu_downscale`, or lowered by `gpu_frame_time`) and camera and
+    /// scene stand still for 16 of its samples, it goes on at the full resolution: a sample spread over several
+    /// updates, as many tiles in each as fit into `gpu_frame_time`, and shown once it has 4 samples; until then the
+    /// image of the lower resolution stays. Only where the GPU's time is measured (timestamp queries, browsers) and
+    /// with a `gpu_frame_time`. On by default.
+    ///
+    pub gpu_sharp_when_still: bool,
     /// The CPU traces at width and height divided by this, 4 by default and 8 in browsers.
     pub cpu_downscale: u32,
     ///
@@ -172,6 +181,7 @@ impl Default for PreviewSettings {
             gpu_samples_per_frame: 1,
             gpu_downscale: 1,
             gpu_frame_time: Some(std::time::Duration::from_millis(40)),
+            gpu_sharp_when_still: true,
             cpu_downscale: if cfg!(target_arch = "wasm32") { 8 } else { 4 },
             cpu_frame_time: if cfg!(target_arch = "wasm32") {
                 Some(std::time::Duration::from_millis(12))
@@ -258,6 +268,62 @@ pub struct RaytracePreview {
     /// the CPU again, so its samples are not lost
     #[cfg(feature = "wgpu")]
     parked: Option<(Engine, Texture2D, Option<TracedFor>)>,
+    /// The GPU's image at the full resolution while camera and scene stand still, see
+    /// [PreviewSettings::gpu_sharp_when_still]
+    #[cfg(feature = "wgpu")]
+    sharp: Option<Sharp>,
+    /// A tile at the full resolution took too long for [PreviewSettings::gpu_frame_time], until the image starts again
+    #[cfg(feature = "wgpu")]
+    sharp_too_slow: bool,
+    /// The compute tracer while the CPU traces because the GPU was too slow for [PreviewSettings::gpu_frame_time]:
+    /// back to the GPU with it when the limit changes
+    #[cfg(feature = "wgpu")]
+    slow_tracer: GpuTracer,
+}
+
+/// The GPU's image at the full resolution, see [PreviewSettings::gpu_sharp_when_still].
+#[cfg(feature = "wgpu")]
+struct Sharp {
+    image: crate::GpuRenderImage,
+    /// The texture of the full resolution, or, while that is shown as [RaytracePreview::texture], the texture of the
+    /// lower resolution, back when the camera moves
+    texture: Texture2D,
+    shown: bool,
+    /// The GPU's milliseconds per tile, see [next_tile_ms]
+    tile_ms: Option<f64>,
+}
+
+/// Samples of the GPU's image at the lower resolution before the GPU goes on at the full one.
+#[cfg(feature = "wgpu")]
+const SHARP_AFTER: u32 = 16;
+/// Samples of the image at the full resolution before it is shown instead.
+#[cfg(feature = "wgpu")]
+const SHARP_SHOWN_AFTER: u32 = 4;
+/// Share of [PreviewSettings::gpu_frame_time] the tiles of an update are planned for: tiles of the sky take a tenth of
+/// tiles with much of the scene, so the next ones may take longer than the ones before.
+#[cfg(feature = "wgpu")]
+const SHARP_SHARE: f64 = 0.75;
+
+/// Tiles of the full resolution for the next update: as many as fit into the share of the limit, at least one.
+#[cfg(feature = "wgpu")]
+pub(crate) fn sharp_tiles(tile_ms: Option<f64>, limit: std::time::Duration, tiles: u32) -> u32 {
+    match tile_ms {
+        None => 1,
+        Some(ms) => {
+            let fit = limit.as_secs_f64() * 1000.0 * SHARP_SHARE / ms.max(1e-3);
+            (fit.min(u32::MAX as f64) as u32).clamp(1, tiles.max(1))
+        }
+    }
+}
+
+/// The milliseconds per tile after a measured call: up at once to a slower call, down slowly after faster ones.
+#[cfg(feature = "wgpu")]
+pub(crate) fn next_tile_ms(tile_ms: Option<f64>, call: crate::compute::CallTime) -> Option<f64> {
+    let ms = call.ms / call.tiles.max(1) as f64;
+    Some(match tile_ms {
+        Some(old) if old > ms => 0.8 * old + 0.2 * ms,
+        _ => ms,
+    })
 }
 
 /// Camera matrices and viewport, scene and revision.
@@ -519,6 +585,12 @@ impl RaytracePreview {
             compiling,
             #[cfg(feature = "wgpu")]
             parked: None,
+            #[cfg(feature = "wgpu")]
+            sharp: None,
+            #[cfg(feature = "wgpu")]
+            sharp_too_slow: false,
+            #[cfg(feature = "wgpu")]
+            slow_tracer: None,
         }
     }
 
@@ -590,9 +662,15 @@ impl RaytracePreview {
         &self.settings
     }
 
-    /// Changes the settings. A new CPU resolution starts the preview again.
+    ///
+    /// Changes the settings. A new CPU resolution starts the preview again. A new
+    /// [PreviewSettings::gpu_frame_time] goes back to [PreviewSettings::gpu_downscale] and watches the GPU's time
+    /// anew, also from the CPU when the preview went there because the GPU was too slow: `None` keeps the GPU at the
+    /// full resolution (with a `gpu_downscale` of 1) from then on.
+    ///
     pub fn set_settings(&mut self, settings: PreviewSettings) {
-        let rebuild = ((settings.cpu_downscale != self.settings.cpu_downscale
+        #[allow(unused_mut)]
+        let mut rebuild = ((settings.cpu_downscale != self.settings.cpu_downscale
             || settings.cpu_in_background != self.settings.cpu_in_background)
             && self.on_cpu())
             || (settings.gpu_downscale != self.settings.gpu_downscale && !self.on_cpu());
@@ -605,11 +683,34 @@ impl RaytracePreview {
         {
             self.parked = None;
         }
+        #[cfg(feature = "wgpu")]
+        if !settings.gpu_sharp_when_still || settings.gpu_frame_time.is_none() {
+            self.leave_sharp();
+        }
         let restart = settings.max_bounces != self.settings.max_bounces
             || settings.cpu_caustic_photons != self.settings.cpu_caustic_photons
             || settings.gpu_caustic_photons != self.settings.gpu_caustic_photons
             || settings.depth_of_field != self.settings.depth_of_field;
+        #[cfg(feature = "wgpu")]
+        let new_limit = settings.gpu_frame_time != self.settings.gpu_frame_time;
         self.settings = settings;
+        #[cfg(feature = "wgpu")]
+        if new_limit {
+            self.sharp_too_slow = false;
+            if let Some(tracer) = self.slow_tracer.take() {
+                // Back from the CPU, which waits with its samples
+                self.availability = PreviewAvailability::Gpu;
+                self.gpu_scale = settings.gpu_downscale.max(1);
+                self.restart_cause = Some(PreviewRestart::Settings);
+                self.rebuild_with(Some(tracer), true);
+                return;
+            }
+            if !self.on_cpu() && self.gpu_scale != settings.gpu_downscale.max(1) {
+                self.gpu_scale = settings.gpu_downscale.max(1);
+                rebuild = true;
+            }
+            self.pace = Pace::default();
+        }
         if rebuild || restart {
             self.restart_cause = Some(PreviewRestart::Settings);
         }
@@ -655,6 +756,12 @@ impl RaytracePreview {
     /// Makes the engine with the tracer, on the CPU without one, and starts again. From the CPU to the GPU, with
     /// `park`, the CPU engine waits with its samples.
     fn rebuild_with(&mut self, tracer: GpuTracer, #[allow(unused_variables)] park: bool) {
+        // The new engine's texture replaces the texture shown, whichever resolution it had
+        #[cfg(feature = "wgpu")]
+        {
+            self.sharp = None;
+            self.sharp_too_slow = false;
+        }
         // Back to the CPU: with the samples it had
         #[cfg(feature = "wgpu")]
         if tracer.is_none() {
@@ -817,8 +924,15 @@ impl RaytracePreview {
         }
     }
 
-    /// Samples every pixel has.
+    /// Samples every pixel of the image shown has.
     pub fn sample_count(&self) -> u32 {
+        #[cfg(feature = "wgpu")]
+        if let Some(Sharp {
+            image, shown: true, ..
+        }) = &self.sharp
+        {
+            return image.sample_count();
+        }
         match &self.engine {
             #[cfg(feature = "wgpu")]
             Engine::Gpu { image, .. } => image.sample_count(),
@@ -830,7 +944,120 @@ impl RaytracePreview {
 
     /// Whether [PreviewSettings::max_samples] is reached, so the image does not change any more.
     pub fn is_done(&self) -> bool {
-        self.traced_for.is_some() && self.sample_count() >= self.settings.max_samples
+        #[cfg(feature = "wgpu")]
+        let (traced, sharp_next) = match &self.sharp {
+            Some(sharp) => (sharp.image.sample_count(), false),
+            None => (self.sample_count(), self.wants_sharp()),
+        };
+        #[cfg(not(feature = "wgpu"))]
+        let (traced, sharp_next) = (self.sample_count(), false);
+        self.traced_for.is_some() && traced >= self.settings.max_samples && !sharp_next
+    }
+
+    ///
+    /// Whether the GPU goes on at the full resolution in the next update, see [PreviewSettings::gpu_sharp_when_still]:
+    /// it traces at a lower one, and the image has enough samples since camera and scene stand still.
+    ///
+    #[cfg(feature = "wgpu")]
+    fn wants_sharp(&self) -> bool {
+        let Engine::Gpu { tracer, image } = &self.engine else {
+            return false;
+        };
+        self.sharp.is_none()
+            && !self.sharp_too_slow
+            && self.settings.gpu_sharp_when_still
+            && self.settings.gpu_frame_time.is_some()
+            && tracer.measures_call_times()
+            && self.traced_for.is_some()
+            && (image.width() < self.width || image.height() < self.height)
+            && image.sample_count() >= SHARP_AFTER.min(self.settings.max_samples).max(1)
+    }
+
+    /// The image at the full resolution, traced from the next update on.
+    #[cfg(feature = "wgpu")]
+    fn start_sharp(&mut self) {
+        let Engine::Gpu { tracer, image } = &self.engine else {
+            return;
+        };
+        if crate::compute::timing::enabled() {
+            crate::compute::timing::log(&format!(
+                "preview goes on at {}x{} after {} samples at {}x{}",
+                self.width,
+                self.height,
+                image.sample_count(),
+                image.width(),
+                image.height()
+            ));
+        }
+        // The calls at the lower resolution do not tell the time of the tiles
+        tracer.restart_call_times();
+        self.sharp = Some(Sharp {
+            image: crate::GpuRenderImage::with_features(tracer.gpu(), self.width, self.height),
+            texture: empty_texture(&self.context, self.width, self.height),
+            shown: false,
+            tile_ms: None,
+        });
+    }
+
+    /// Back to the image at the lower resolution, which is shown again.
+    #[cfg(feature = "wgpu")]
+    fn leave_sharp(&mut self) {
+        if let Some(mut sharp) = self.sharp.take() {
+            if crate::compute::timing::enabled() {
+                crate::compute::timing::log(&format!(
+                    "preview leaves the full resolution after {} samples there, {:?} ms per tile",
+                    sharp.image.sample_count(),
+                    sharp.tile_ms
+                ));
+            }
+            if sharp.shown {
+                std::mem::swap(&mut self.texture, &mut sharp.texture);
+            }
+            // The lower resolution starts counting slow calls anew
+            self.pace.slow = 0;
+            if let Engine::Gpu { tracer, .. } = &self.engine {
+                // Calls of the full resolution do not count for the lower one
+                tracer.restart_call_times();
+            }
+        }
+    }
+
+    ///
+    /// Traces a [FinalRender](crate::FinalRender) of the scene, for at most its frame time; call it every frame
+    /// instead of [RaytracePreview::update] until it returns `true`. It traces on the preview's GPU (also when the
+    /// preview went to the CPU because the GPU was too slow for [PreviewSettings::gpu_frame_time]), else on the CPU
+    /// with [PreviewSettings::cpu_threads]; while the shaders of the GPU compile it waits for them. The preview's own
+    /// tracing pauses meanwhile and goes on with the next [RaytracePreview::update].
+    ///
+    pub fn trace_final(
+        &mut self,
+        scene: &RtScene,
+        render: &mut crate::FinalRender,
+    ) -> Result<bool, crate::RtError> {
+        #[cfg(feature = "wgpu")]
+        {
+            self.poll_compiling();
+            if self.compiling.is_some() {
+                return Ok(render.is_done());
+            }
+            // The times of the final render's calls are not the preview's
+            self.pace.started = false;
+            if !self.context.is_lost() {
+                let tracer = match &mut self.engine {
+                    Engine::Gpu { tracer, .. } => Some(tracer),
+                    _ => self.slow_tracer.as_mut(),
+                };
+                if let Some(tracer) = tracer {
+                    return render.trace_gpu(&self.context, tracer, scene);
+                }
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Engine::CpuWorker { worker, shown, .. } = &self.engine {
+            // Stops at the samples it has, more with the next update
+            worker.adjust(*shown, self.settings.denoiser, self.settings.cpu_threads);
+        }
+        render.trace_cpu(scene, self.settings.cpu_threads)
     }
 
     ///
@@ -849,6 +1076,11 @@ impl RaytracePreview {
         let key = (camera_key(camera), scene.id(), scene.revision());
         let changed = self.traced_for.as_ref() != Some(&key);
         let reason = changed.then(|| self.restart_reason(&key));
+        #[cfg(feature = "wgpu")]
+        if changed {
+            self.leave_sharp();
+            self.sharp_too_slow = false;
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if let Engine::CpuWorker {
             worker,
@@ -944,7 +1176,12 @@ impl RaytracePreview {
             self.last_restart = reason;
             self.restarts += 1;
             self.traced_for = Some(key);
-        } else if self.sample_count() >= self.settings.max_samples {
+        }
+        #[cfg(feature = "wgpu")]
+        if self.wants_sharp() {
+            self.start_sharp();
+        }
+        if !changed && self.is_done() {
             return Ok(false);
         }
         let settings = TraceSettings {
@@ -953,6 +1190,81 @@ impl RaytracePreview {
             depth_of_field: self.settings.depth_of_field,
             ..Default::default()
         };
+        #[cfg(feature = "wgpu")]
+        if let (Some(sharp), Engine::Gpu { tracer, .. }, Some(limit)) = (
+            &mut self.sharp,
+            &mut self.engine,
+            self.settings.gpu_frame_time,
+        ) {
+            if sharp
+                .tile_ms
+                .is_some_and(|ms| ms > 2000.0 * limit.as_secs_f64())
+            {
+                // One tile alone takes far too long: the lower resolution until the image starts again
+                if crate::compute::timing::enabled() {
+                    crate::compute::timing::log(
+                        "preview: a tile at the full resolution takes too long",
+                    );
+                }
+                self.leave_sharp();
+                self.sharp_too_slow = true;
+                return self.update(scene, camera);
+            }
+            if tracer.unfinished_calls() > crate::gpu::frames_ahead(tracer.adapter_info()) {
+                return Ok(false);
+            }
+            let settings = TraceSettings {
+                caustic_photons: self.settings.gpu_caustic_photons,
+                ..settings
+            };
+            let tiles = sharp_tiles(
+                sharp.tile_ms,
+                limit,
+                tracer.tiles_per_sample(sharp.image.width(), sharp.image.height()),
+            );
+            let mut full = camera.clone();
+            full.set_viewport(three_d_asset::Viewport::new_at_origo(
+                sharp.image.width(),
+                sharp.image.height(),
+            ));
+            match tracer.trace_gpu_tiles(scene, &full, &mut sharp.image, &settings, tiles) {
+                Ok(true) => {}
+                Ok(false) => return Ok(false),
+                Err(crate::RtError::Gpu(why)) => {
+                    self.availability = PreviewAvailability::CpuOnly(format!(
+                        "The GPU failed to trace ({why}); ray tracing runs on the CPU."
+                    ));
+                    self.rebuild();
+                    return self.update(scene, camera);
+                }
+                Err(error) => return Err(error),
+            }
+            if sharp.image.sample_count() < SHARP_SHOWN_AFTER.min(self.settings.max_samples) {
+                return Ok(false);
+            }
+            let target = if sharp.shown {
+                &self.texture
+            } else {
+                &sharp.texture
+            };
+            match &self.settings.denoiser {
+                Some(denoiser) => sharp
+                    .image
+                    .write_denoised_to_three_d_texture(target, denoiser),
+                None => sharp.image.write_to_three_d_texture(target),
+            }
+            if !sharp.shown {
+                std::mem::swap(&mut self.texture, &mut sharp.texture);
+                sharp.shown = true;
+                if crate::compute::timing::enabled() {
+                    crate::compute::timing::log(&format!(
+                        "preview shows the full resolution, {:?} ms per tile, {tiles} tile(s) per update",
+                        sharp.tile_ms
+                    ));
+                }
+            }
+            return Ok(true);
+        }
         match &mut self.engine {
             #[cfg(feature = "wgpu")]
             Engine::Gpu { tracer, image } => {
@@ -1062,6 +1374,23 @@ impl RaytracePreview {
         let Engine::Gpu { tracer, .. } = &self.engine else {
             return false;
         };
+        if let Some(sharp) = &mut self.sharp {
+            // At the full resolution the tiles of an update follow the time, the resolution stays
+            for call in tracer.take_call_times() {
+                self.gpu_time = Some(std::time::Duration::from_secs_f64(call.ms / 1000.0));
+                sharp.tile_ms = next_tile_ms(sharp.tile_ms, call);
+            }
+            return false;
+        }
+        // How the time was measured, for the reason when the preview goes to the CPU
+        let measured = if tracer.times_from_timestamps() {
+            "the GPU's own time, from timestamps"
+        } else if tracer.measures_call_times() {
+            "until the browser told that the work was done"
+        } else {
+            "the time between frames"
+        };
+        let timed = crate::compute::timing::enabled();
         let decision = if tracer.measures_call_times() {
             // The GPU's own time of every call
             if !self.pace.started {
@@ -1074,9 +1403,15 @@ impl RaytracePreview {
             // late about the at most two calls it still had
             let at_once = !cfg!(target_arch = "wasm32");
             let mut decision = None;
-            for busy in tracer.take_call_times() {
-                let busy = std::time::Duration::from_secs_f64(busy / 1000.0);
+            for call in tracer.take_call_times() {
+                let busy = std::time::Duration::from_secs_f64(call.ms / 1000.0);
                 self.gpu_time = Some(busy);
+                if timed && limit.is_some_and(|limit| busy > limit) {
+                    crate::compute::timing::log(&format!(
+                        "preview: a call of {} tile(s) took {:.1} ms at 1/{} ({measured}), more than the limit",
+                        call.tiles, call.ms, self.gpu_scale
+                    ));
+                }
                 if let (None, Some(limit)) = (&decision, limit) {
                     decision = self
                         .pace
@@ -1096,17 +1431,38 @@ impl RaytracePreview {
             #[cfg(target_arch = "wasm32")]
             None
         };
+        if let (true, Some(decision)) = (timed, &decision) {
+            crate::compute::timing::log(&format!("preview: {decision:?} ({measured})"));
+        }
         match decision {
             None => return false,
             Some(Ok(scale)) => self.gpu_scale = scale,
-            Some(Err(why)) => self.availability = PreviewAvailability::CpuOnly(why),
+            Some(Err(why)) => {
+                self.availability =
+                    PreviewAvailability::CpuOnly(format!("{why} Measured: {measured}."));
+                // Kept for another limit, see set_settings
+                if let Engine::Gpu { tracer, .. } =
+                    std::mem::replace(&mut self.engine, placeholder_engine())
+                {
+                    self.slow_tracer = Some(tracer);
+                }
+                self.rebuild_with(None, false);
+                return true;
+            }
         }
         self.rebuild();
         true
     }
 
-    /// What the GPU's width and height are divided by now, raised by the preview on slow GPUs.
+    ///
+    /// What the width and height of the GPU's image on screen are divided by now: raised by the preview on slow GPUs,
+    /// 1 again while the image at the full resolution is shown (see [PreviewSettings::gpu_sharp_when_still]).
+    ///
     pub fn gpu_downscale(&self) -> u32 {
+        #[cfg(feature = "wgpu")]
+        if self.sharp.as_ref().is_some_and(|sharp| sharp.shown) {
+            return 1;
+        }
         self.gpu_scale
     }
 
@@ -1152,7 +1508,7 @@ impl RaytracePreview {
     }
 }
 
-fn empty_texture(context: &Context, width: u32, height: u32) -> Texture2D {
+pub(crate) fn empty_texture(context: &Context, width: u32, height: u32) -> Texture2D {
     // 32 bit floats can not be interpolated everywhere (WebGPU), so the nearest texel is taken
     Texture2D::new_empty::<[f32; 4]>(
         context,
@@ -1180,9 +1536,9 @@ fn camera_key(camera: &Camera) -> Vec<f32> {
 }
 
 /// Draws the linear image with exposure, a tone curve and sRGB encoding.
-struct DisplayEffect<'a> {
-    texture: &'a Texture2D,
-    tone_mapping: ToneMapping,
+pub(crate) struct DisplayEffect<'a> {
+    pub texture: &'a Texture2D,
+    pub tone_mapping: ToneMapping,
 }
 
 impl Effect for DisplayEffect<'_> {
@@ -1273,7 +1629,8 @@ fn placeholder_engine() -> Engine {
 
 #[cfg(all(test, feature = "wgpu", not(target_arch = "wasm32")))]
 mod tests {
-    use super::Pace;
+    use super::{next_tile_ms, sharp_tiles, Pace};
+    use crate::compute::CallTime;
     use std::time::{Duration, Instant};
 
     const LIMIT: Duration = Duration::from_millis(40);
@@ -1332,5 +1689,32 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(pace.step(far, LIMIT, true, false, 1), None);
         }
+    }
+
+    #[test]
+    fn the_tiles_of_an_update_at_the_full_resolution_fit_into_the_limit() {
+        // Unknown at first: one tile
+        assert_eq!(sharp_tiles(None, LIMIT, 24), 1);
+        // A share of 30 of the 40 ms
+        assert_eq!(sharp_tiles(Some(10.0), LIMIT, 24), 3);
+        assert_eq!(sharp_tiles(Some(2.0), LIMIT, 24), 15);
+        // Never more than the sample has, never none
+        assert_eq!(sharp_tiles(Some(0.1), LIMIT, 24), 24);
+        assert_eq!(sharp_tiles(Some(100.0), LIMIT, 24), 1);
+        assert_eq!(sharp_tiles(Some(0.0), LIMIT, 24), 24);
+    }
+
+    #[test]
+    fn a_slower_call_counts_at_once_a_faster_one_slowly() {
+        let call = |ms, tiles| CallTime { ms, tiles };
+        // Milliseconds per tile of the call
+        let ms = next_tile_ms(None, call(30.0, 3)).unwrap();
+        assert_eq!(ms, 10.0);
+        // Tiles with much of the scene after tiles of the sky
+        let ms = next_tile_ms(Some(ms), call(40.0, 2)).unwrap();
+        assert_eq!(ms, 20.0);
+        // Back to the sky: a fifth of the way at a time
+        let ms = next_tile_ms(Some(ms), call(10.0, 5)).unwrap();
+        assert!((ms - 16.4).abs() < 1e-9);
     }
 }

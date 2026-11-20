@@ -60,6 +60,58 @@ pub struct TraceSettings {
     /// Blur in front of and behind the focus distance of a perspective camera, `None` for a pinhole camera that
     /// shows everything sharp.
     pub depth_of_field: Option<DepthOfField>,
+    ///
+    /// The part of the camera's view the render image holds, `None` for the whole view. For images too large for
+    /// one render image, traced in parts (see `FinalRender`): the camera stays the one of the whole image.
+    ///
+    pub view_region: Option<ViewRegion>,
+}
+
+///
+/// A rectangle of a camera's view in uv coordinates of the whole view: 0 to 1, u to the right and v up, as
+/// `Camera::position_at_uv_coordinates` takes them.
+///
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewRegion {
+    /// Lower left corner
+    pub min: Vec2,
+    /// Upper right corner
+    pub max: Vec2,
+}
+
+impl ViewRegion {
+    ///
+    /// The rows `rows` (from the top) of an image `height` pixels high, all its columns.
+    ///
+    pub fn rows(rows: std::ops::Range<u32>, height: u32) -> Self {
+        let h = height.max(1) as f32;
+        Self {
+            min: vec2(0.0, 1.0 - rows.end as f32 / h),
+            max: vec2(1.0, 1.0 - rows.start as f32 / h),
+        }
+    }
+
+    /// The uv coordinates of the whole view for uv coordinates within the region.
+    pub fn to_view(&self, u: f32, v: f32) -> (f32, f32) {
+        (
+            self.min.x + u * (self.max.x - self.min.x),
+            self.min.y + v * (self.max.y - self.min.y),
+        )
+    }
+
+    ///
+    /// From normalized device coordinates within the region to those of the whole view, for a matrix from the
+    /// screen into the scene.
+    ///
+    #[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
+    pub(crate) fn ndc_to_view(&self) -> Mat4 {
+        let (w, h) = (self.max.x - self.min.x, self.max.y - self.min.y);
+        Mat4::from_translation(vec3(
+            2.0 * self.min.x + w - 1.0,
+            2.0 * self.min.y + h - 1.0,
+            0.0,
+        )) * Mat4::from_nonuniform_scale(w, h, 1.0)
+    }
 }
 
 impl Default for TraceSettings {
@@ -72,6 +124,7 @@ impl Default for TraceSettings {
             caustic_photons: 0,
             caustic_radius: 0.02,
             depth_of_field: None,
+            view_region: None,
         }
     }
 }
@@ -161,7 +214,7 @@ impl CpuReferenceTracer {
         self.accel.as_ref()
     }
 
-    fn thread_count(&self) -> usize {
+    pub(crate) fn thread_count(&self) -> usize {
         if cfg!(target_arch = "wasm32") {
             return 1;
         }
@@ -253,7 +306,7 @@ impl CpuReferenceTracer {
         let mut context = PathContext {
             scene,
             accel,
-            rays: CameraRays::new(camera, settings.depth_of_field),
+            rays: CameraRays::new(camera, settings.depth_of_field, settings.view_region),
             settings: *settings,
             width: render_image.width(),
             height: render_image.height(),
@@ -339,10 +392,15 @@ struct CameraRays {
     /// For perspective cameras: from normalized device coordinates to a direction in world space.
     screen_to_direction: Option<Mat4>,
     lens: Option<Lens>,
+    region: Option<ViewRegion>,
 }
 
 impl CameraRays {
-    fn new(camera: &Camera, depth_of_field: Option<DepthOfField>) -> Self {
+    fn new(
+        camera: &Camera,
+        depth_of_field: Option<DepthOfField>,
+        region: Option<ViewRegion>,
+    ) -> Self {
         let screen_to_direction = match camera.projection_type() {
             ProjectionType::Perspective { .. } => {
                 let mut view = camera.view();
@@ -355,11 +413,16 @@ impl CameraRays {
             camera: camera.clone(),
             screen_to_direction,
             lens: Lens::of(camera, depth_of_field),
+            region,
         }
     }
 
-    /// Origin and unit direction for uv coordinates with v up.
+    /// Origin and unit direction for uv coordinates of the image with v up.
     fn ray(&self, u: f32, v: f32) -> (Vec3, Vec3) {
+        let (u, v) = match &self.region {
+            Some(region) => region.to_view(u, v),
+            None => (u, v),
+        };
         match self.screen_to_direction {
             Some(m) => (
                 self.camera.position(),

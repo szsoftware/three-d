@@ -15,7 +15,6 @@ use three_d::wgpu as w;
 
 #[cfg(target_arch = "wasm32")]
 mod browser;
-#[cfg(not(target_arch = "wasm32"))]
 mod clock;
 mod denoise_gpu;
 pub(crate) mod timing;
@@ -151,8 +150,7 @@ pub struct ComputeTracer {
     /// How long the GPU took for the calls of [ComputeTracer::trace_gpu] it finished, see
     /// [ComputeTracer::take_call_times]
     call_times: std::sync::Arc<std::sync::Mutex<CallTimes>>,
-    /// Outside of browsers: the GPU's time of the calls from timestamp queries, where the device has them
-    #[cfg(not(target_arch = "wasm32"))]
+    /// The GPU's time of the calls from timestamp queries, where the device has them
     clock: Option<clock::GpuClock>,
     /// Calls of [ComputeTracer::trace_gpu] logged so far, see [set_gpu_timing_log]
     timed_calls: u32,
@@ -166,8 +164,17 @@ struct CallTimes {
     /// In the browser: when the GPU finished the last call, in milliseconds of `timing::now`
     #[cfg(target_arch = "wasm32")]
     last_done: f64,
-    /// Milliseconds the GPU took for each call finished since the last take
-    finished: Vec<f64>,
+    /// Each call finished since the last take
+    finished: Vec<CallTime>,
+}
+
+/// The GPU's time for one call of the tracer, see [ComputeTracer::take_call_times].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CallTime {
+    /// Milliseconds
+    pub ms: f64,
+    /// Tiles the call traced, a tile for each sample
+    pub tiles: u32,
 }
 
 /// The first calls of [ComputeTracer::trace_gpu] that [set_gpu_timing_log] logs.
@@ -290,7 +297,6 @@ impl ComputeTracer {
             #[cfg(target_arch = "wasm32")]
             unfinished: Default::default(),
             call_times: Default::default(),
-            #[cfg(not(target_arch = "wasm32"))]
             clock: clock::GpuClock::new(&gpu.device, &gpu.queue),
             timed_calls: 0,
         }
@@ -408,7 +414,7 @@ impl ComputeTracer {
 
     ///
     /// Whether shadow rays in scenes with media take the surfaces of solids in their order, with the media of nested
-    /// solids by their [RtMaterial::medium_priority] as the paths do. Everywhere but on WARP, the software adapter of
+    /// solids by their [RtMaterial::medium_priority](crate::RtMaterial::medium_priority) as the paths do. Everywhere but on WARP, the software adapter of
     /// DirectX 12, whose compiler gets that code wrong: there shadow rays add up the media of the solids they cross,
     /// which is right as long as solids do not overlap, and counts the media of nested solids both.
     ///
@@ -437,6 +443,45 @@ impl ComputeTracer {
         image: &mut GpuRenderImage,
         settings: &TraceSettings,
     ) -> Result<(), RtError> {
+        self.trace_gpu_checked(scene, camera, image, settings, None)
+            .map(|_| ())
+    }
+
+    ///
+    /// Like [ComputeTracer::trace_gpu], but traces only the next `max_tiles` tiles of the sample the image is at (at
+    /// least one, at most up to the sample's end), so that a sample of a large image can be spread over several calls
+    /// and each call stays short, for example within the time of a frame. Returns whether the call completed the
+    /// sample; the image counts it from then on.
+    ///
+    /// Until then the tiles traced so far hold one sample more than [GpuRenderImage::sample_count]: show or read the
+    /// image only when no sample is in progress ([GpuRenderImage::sample_in_progress]). [ComputeTracer::trace_gpu]
+    /// first completes a sample in progress. The tiles of a sample are [ComputeTracer::tiles_per_sample] for this
+    /// tracer, use the same tracer until the sample is complete.
+    ///
+    pub fn trace_gpu_tiles(
+        &mut self,
+        scene: &RtScene,
+        camera: &Camera,
+        image: &mut GpuRenderImage,
+        settings: &TraceSettings,
+        max_tiles: u32,
+    ) -> Result<bool, RtError> {
+        self.trace_gpu_checked(scene, camera, image, settings, Some(max_tiles.max(1)))
+    }
+
+    /// The tiles of one sample of an image of this size, see [ComputeTracer::trace_gpu_tiles].
+    pub fn tiles_per_sample(&self, width: u32, height: u32) -> u32 {
+        width.div_ceil(self.tile_size) * height.div_ceil(self.tile_size)
+    }
+
+    fn trace_gpu_checked(
+        &mut self,
+        scene: &RtScene,
+        camera: &Camera,
+        image: &mut GpuRenderImage,
+        settings: &TraceSettings,
+        max_tiles: Option<u32>,
+    ) -> Result<bool, RtError> {
         if image.width == 0 || image.height == 0 {
             return Err(RtError::EmptyImage);
         }
@@ -445,16 +490,19 @@ impl ComputeTracer {
         }
         let scopes = ErrorScopes::push(&self.gpu.device);
         let start = timing::now();
-        let result = self.trace_gpu_watched(scene, camera, image, settings);
+        let result = self.trace_gpu_watched(scene, camera, image, settings, max_tiles);
         scopes.pop_into(&self.errors);
         if timing::enabled() && self.timed_calls < TIMED_CALLS {
             self.timed_calls += 1;
             let what = format!(
-                "trace call {} at {}x{}, {} sample(s)",
+                "trace call {} at {}x{}, {}",
                 self.timed_calls,
                 image.width,
                 image.height,
-                settings.samples_per_call.max(1)
+                match max_tiles {
+                    Some(tiles) => format!("at most {tiles} tile(s)"),
+                    None => format!("{} sample(s)", settings.samples_per_call),
+                }
             );
             timing::log(&format!(
                 "{what}: {:.0} ms on the CPU",
@@ -471,7 +519,8 @@ impl ComputeTracer {
         camera: &Camera,
         image: &mut GpuRenderImage,
         settings: &TraceSettings,
-    ) -> Result<(), RtError> {
+        max_tiles: Option<u32>,
+    ) -> Result<bool, RtError> {
         let start = timing::now();
         // The number of the call if it is logged
         let timed =
@@ -599,28 +648,44 @@ impl ComputeTracer {
                 ]);
             }
         }
-        let samples = settings.samples_per_call;
-        let mut tile_data =
-            vec![0u8; (stride * tiles.len() as u64 * samples.max(1) as u64) as usize];
-        for s in 0..samples {
-            for (t, rect) in tiles.iter().enumerate() {
-                let at = ((s as usize * tiles.len() + t) as u64 * stride) as usize;
-                let words = [
-                    rect[0],
-                    rect[1],
-                    rect[2],
-                    rect[3],
-                    image.samples + s,
-                    1,
-                    u32::from(image.features),
-                    caustics.as_ref().map_or(0, |_| {
-                        crate::photons::gather_radius(settings.caustic_radius, image.samples + s)
-                            .to_bits()
-                    }),
-                ];
-                for (i, word) in words.iter().enumerate() {
-                    tile_data[at + 4 * i..at + 4 * i + 4].copy_from_slice(&word.to_le_bytes());
-                }
+        // The dispatches of the call, a sample (counted from the image's samples) and a tile each: from the tile of
+        // the sample in progress either to the end of that sample, at most `max_tiles`, or for `samples_per_call`
+        // samples, the one in progress completed first
+        let n = tiles.len() as u32;
+        let begin = if image.next_tile < n {
+            image.next_tile
+        } else {
+            0
+        };
+        let count = match max_tiles {
+            Some(max) => max.clamp(1, n - begin),
+            None => (settings.samples_per_call * n).saturating_sub(begin),
+        };
+        if count == 0 {
+            return Ok(false);
+        }
+        let dispatches: Vec<(u32, usize)> = (begin..begin + count)
+            .map(|g| (g / n, (g % n) as usize))
+            .collect();
+        let mut tile_data = vec![0u8; (stride * count as u64) as usize];
+        for (k, &(s, t)) in dispatches.iter().enumerate() {
+            let rect = tiles[t];
+            let at = (k as u64 * stride) as usize;
+            let words = [
+                rect[0],
+                rect[1],
+                rect[2],
+                rect[3],
+                image.samples + s,
+                1,
+                u32::from(image.features),
+                caustics.as_ref().map_or(0, |_| {
+                    crate::photons::gather_radius(settings.caustic_radius, image.samples + s)
+                        .to_bits()
+                }),
+            ];
+            for (i, word) in words.iter().enumerate() {
+                tile_data[at + 4 * i..at + 4 * i + 4].copy_from_slice(&word.to_le_bytes());
             }
         }
         let tile_buffer = filled_buffer(
@@ -727,33 +792,33 @@ impl ComputeTracer {
             );
         }
         // The GPU's time of the call, from the beginning of its first pass to the end of its last one
-        #[cfg(not(target_arch = "wasm32"))]
+        let passes = count
+            + caustics.as_ref().map_or(0, |_| {
+                dispatches.iter().filter(|(_, t)| *t == 0).count() as u32
+            });
         let stamp = self
             .clock
             .as_ref()
-            .and_then(|clock| Some((clock, clock.begin()?)));
-        #[cfg(not(target_arch = "wasm32"))]
+            .and_then(|clock| Some((clock, clock.begin(passes)?)));
         let round = self
             .call_times
             .lock()
             .map(|times| times.round)
             .unwrap_or_default();
-        #[cfg(not(target_arch = "wasm32"))]
-        let mut first_pass = true;
-        #[cfg(not(target_arch = "wasm32"))]
-        let mut writes = |last: bool| {
-            let first = std::mem::replace(&mut first_pass, false);
-            stamp.and_then(|(clock, stamp)| clock.writes(stamp, first, last))
+        let mut pass = 0;
+        let mut writes = || {
+            pass += 1;
+            stamp.and_then(|(clock, stamp)| clock.writes(stamp, pass - 1))
         };
-        #[cfg(target_arch = "wasm32")]
-        let writes = |_last: bool| None;
         // One submission per sample and tile, so the GPU can go on with other work between them, and only a few at a time
-        for s in 0..samples {
+        for (k, &(s, t)) in dispatches.iter().enumerate() {
             let mut encoder = device.create_command_encoder(&w::CommandEncoderDescriptor {
                 label: Some("ray tracing"),
             });
-            if let (Some(plan), Some(bind_group)) = (&caustics, &photon_bind_group) {
-                // The photons of this sample: shot, counted per cell, sorted by cell
+            let offset = (k as u64 * stride) as u32;
+            if let (0, Some(plan), Some(bind_group)) = (t, &caustics, &photon_bind_group) {
+                // The photons of this sample, with its first tile: shot, counted per cell, sorted by cell. Calls that
+                // trace the sample's other tiles find them in the buffer.
                 encoder.clear_buffer(
                     extras,
                     4 * plan.counter as u64,
@@ -761,9 +826,8 @@ impl ComputeTracer {
                 );
                 let mut pass = encoder.begin_compute_pass(&w::ComputePassDescriptor {
                     label: Some("caustic photons"),
-                    timestamp_writes: writes(false),
+                    timestamp_writes: writes(),
                 });
-                let offset = (s as u64 * tiles.len() as u64 * stride) as u32;
                 pass.set_bind_group(0, bind_group, &[offset]);
                 let groups = plan.capacity().div_ceil(64);
                 for (pipeline, groups) in self
@@ -775,57 +839,48 @@ impl ComputeTracer {
                     pass.dispatch_workgroups(groups, 1, 1);
                 }
             }
-            let mut first = Some(encoder);
-            for (t, rect) in tiles.iter().enumerate() {
-                // The photons go with the first tile
-                let mut encoder = first.take().unwrap_or_else(|| {
-                    device.create_command_encoder(&w::CommandEncoderDescriptor {
-                        label: Some("ray tracing"),
-                    })
+            let rect = tiles[t];
+            let last = k + 1 == dispatches.len();
+            {
+                let mut pass = encoder.begin_compute_pass(&w::ComputePassDescriptor {
+                    label: Some("ray tracing"),
+                    timestamp_writes: writes(),
                 });
-                let last = s + 1 == samples && t + 1 == tiles.len();
-                {
-                    let mut pass = encoder.begin_compute_pass(&w::ComputePassDescriptor {
-                        label: Some("ray tracing"),
-                        timestamp_writes: writes(last),
-                    });
-                    pass.set_pipeline(pipeline);
-                    let offset = (s as u64 * tiles.len() as u64 + t as u64) * stride;
-                    pass.set_bind_group(0, &bind_group, &[offset as u32]);
-                    pass.dispatch_workgroups(
-                        rect[2].div_ceil(WORKGROUP),
-                        rect[3].div_ceil(WORKGROUP),
-                        1,
-                    );
-                }
-                #[cfg(not(target_arch = "wasm32"))]
-                if let (true, Some((clock, stamp))) = (last, stamp) {
-                    clock.resolve(&mut encoder, stamp);
-                }
-                submit(&self.gpu, &mut self.in_flight, encoder.finish());
-                #[cfg(not(target_arch = "wasm32"))]
-                if let (true, Some((clock, stamp))) = (last, stamp) {
-                    clock.read(stamp, &self.call_times, round);
-                }
-                if let Some(call) = timed {
-                    timing::when_gpu_done(
-                        &self.gpu.queue,
-                        start,
-                        format!(
-                            "trace call {call}, sample {s}, tile {t} of {}x{} px{}",
-                            rect[2],
-                            rect[3],
-                            if t == 0 && caustics.is_some() {
-                                " with the photons"
-                            } else {
-                                ""
-                            }
-                        ),
-                    );
-                }
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &bind_group, &[offset]);
+                pass.dispatch_workgroups(
+                    rect[2].div_ceil(WORKGROUP),
+                    rect[3].div_ceil(WORKGROUP),
+                    1,
+                );
+            }
+            if let (true, Some((clock, stamp))) = (last, stamp) {
+                clock.resolve(&mut encoder, stamp);
+            }
+            submit(&self.gpu, &mut self.in_flight, encoder.finish());
+            if let (true, Some((clock, stamp))) = (last, stamp) {
+                clock.read(stamp, &self.call_times, round, count);
+            }
+            if let Some(call) = timed {
+                timing::when_gpu_done(
+                    &self.gpu.queue,
+                    start,
+                    format!(
+                        "trace call {call}, sample {s}, tile {t} of {}x{} px{}",
+                        rect[2],
+                        rect[3],
+                        if t == 0 && caustics.is_some() {
+                            " with the photons"
+                        } else {
+                            ""
+                        }
+                    ),
+                );
             }
         }
-        image.samples += samples;
+        let end = begin + count;
+        image.samples += end / n;
+        image.next_tile = end % n;
         // The browser tells when the work is done; until then the next call would only queue more
         #[cfg(target_arch = "wasm32")]
         {
@@ -833,22 +888,27 @@ impl ComputeTracer {
             self.unfinished.fetch_add(1, Ordering::Relaxed);
             let unfinished = self.unfinished.clone();
             let times = self.call_times.clone();
-            let round = times.lock().map(|times| times.round).unwrap_or_default();
+            // Without timestamps: the time until the browser tells
+            let timed_here = self.clock.is_none();
             self.gpu.queue.on_submitted_work_done(move || {
                 unfinished.fetch_sub(1, Ordering::Relaxed);
                 let done = timing::now();
                 if let Ok(mut times) = times.lock() {
                     // The GPU worked on the call from its start or, if it was busy then, from the end of the call
-                    // before; that includes what the application queued in between, such as the denoiser
+                    // before; that includes what the application queued in between, such as the denoiser, and the
+                    // time until the page's thread is free for the browser's message, such as a frame of the page
                     let busy = done - start.max(times.last_done);
                     times.last_done = done;
-                    if times.round == round {
-                        times.finished.push(busy.max(0.0));
+                    if timed_here && times.round == round {
+                        times.finished.push(CallTime {
+                            ms: busy.max(0.0),
+                            tiles: count,
+                        });
                     }
                 }
             });
         }
-        Ok(())
+        Ok(end >= n)
     }
 
     ///
@@ -920,9 +980,14 @@ impl ComputeTracer {
         0
     }
 
+    /// Whether the calls are timed with timestamp queries, pass by pass.
+    pub(crate) fn times_from_timestamps(&self) -> bool {
+        self.clock.is_some()
+    }
+
     ///
-    /// Whether [ComputeTracer::take_call_times] tells the GPU's time: always in the browser, elsewhere where the device
-    /// has timestamp queries.
+    /// Whether [ComputeTracer::take_call_times] tells the GPU's time: where the device has timestamp queries, and in
+    /// browsers always (without them from when the browser tells that the work is done).
     ///
     pub(crate) fn measures_call_times(&self) -> bool {
         #[cfg(target_arch = "wasm32")]
@@ -932,12 +997,12 @@ impl ComputeTracer {
     }
 
     ///
-    /// Milliseconds the GPU took for each call of [ComputeTracer::trace_gpu] finished since the last take, oldest
-    /// first: in the browser from when it said the work was done (the frames of a browser do not wait for the GPU, so
-    /// the time between them does not tell), elsewhere from timestamps at the beginning and end of the call (the time
-    /// between frames also holds what the application draws and reads back).
+    /// The GPU's time for each call of [ComputeTracer::trace_gpu] finished since the last take, oldest first: from
+    /// timestamps at the beginning and end of the call (the time between frames also holds what the application draws
+    /// and reads back, and the frames of a browser do not wait for the GPU at all); in browsers without timestamp
+    /// queries from when the browser tells that the work is done, which comes late while the page's thread is busy.
     ///
-    pub(crate) fn take_call_times(&self) -> Vec<f64> {
+    pub(crate) fn take_call_times(&self) -> Vec<CallTime> {
         // The times arrive when the device is polled
         #[cfg(not(target_arch = "wasm32"))]
         let _ = self.gpu.device.poll(w::PollType::Poll);
@@ -1150,6 +1215,8 @@ pub struct GpuRenderImage {
     width: u32,
     height: u32,
     samples: u32,
+    /// The next tile of the sample in progress, see [ComputeTracer::trace_gpu_tiles]; 0 between samples
+    next_tile: u32,
     sums: w::Buffer,
     /// Three words per pixel with the features for a denoiser instead of one.
     features: bool,
@@ -1189,6 +1256,7 @@ impl GpuRenderImage {
             width,
             height,
             samples: 0,
+            next_tile: 0,
             sums,
             features,
             resolve: None,
@@ -1211,6 +1279,14 @@ impl GpuRenderImage {
         self.samples
     }
 
+    ///
+    /// Whether [ComputeTracer::trace_gpu_tiles] traced only some tiles of the next sample so far. Its tiles then hold
+    /// a sample more than the others and the average is wrong there until the sample is complete.
+    ///
+    pub fn sample_in_progress(&self) -> bool {
+        self.next_tile > 0
+    }
+
     /// Forgets all samples, for example after the camera or the scene changed.
     pub fn reset(&mut self) {
         let mut encoder = self
@@ -1222,6 +1298,7 @@ impl GpuRenderImage {
         encoder.clear_buffer(&self.sums, 0, None);
         self.gpu.queue.submit([encoder.finish()]);
         self.samples = 0;
+        self.next_tile = 0;
     }
 
     /// Changes the size and forgets all samples.
@@ -2113,11 +2190,20 @@ fn params_bytes(
     p.v3(camera.position(), 1.0);
     let mut view = camera.view();
     view[3] = vec4(0.0, 0.0, 0.0, 1.0);
-    let screen_to_direction = (camera.projection() * view)
+    let mut screen_to_direction = (camera.projection() * view)
         .invert()
         .unwrap_or(Mat4::identity());
+    if let Some(region) = &settings.view_region {
+        screen_to_direction = screen_to_direction * region.ndc_to_view();
+    }
     p.m4(&screen_to_direction);
-    let at = |u: f32, v: f32| camera.position_at_uv_coordinates((u, v));
+    let at = |u: f32, v: f32| {
+        let (u, v) = match &settings.view_region {
+            Some(region) => region.to_view(u, v),
+            None => (u, v),
+        };
+        camera.position_at_uv_coordinates((u, v))
+    };
     let origin = at(0.0, 0.0);
     p.v3(origin, 0.0);
     p.v3(at(1.0, 0.0) - origin, 0.0);
@@ -2226,6 +2312,55 @@ mod tests {
         assert_eq!(shrunk.0.len(), 4 + 8 + 32 * 16 + 4);
         assert_eq!(&shrunk.0[4..7], &[12, 32, 16]);
         assert_eq!(shrunk.0[12], u32::from_le_bytes([200, 100, 50, 255]));
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn every_pass_is_timed_also_in_calls_with_many_passes() {
+        let Ok(context) = three_d::Context::new_headless_wgpu() else {
+            return;
+        };
+        let Some(tracer) = ComputeTracer::from_context(&context) else {
+            return;
+        };
+        if !tracer.times_from_timestamps() {
+            return;
+        }
+        let mut tracer = tracer.with_tile_size(8);
+        let mut scene = RtScene::new();
+        scene.set_environment(RtEnvironment::Uniform {
+            color: vec3(1.0, 1.0, 1.0),
+            luminance: 1000.0,
+        });
+        let camera = Camera::new_perspective(
+            three_d_asset::Viewport::new_at_origo(40, 24),
+            vec3(0.0, 0.0, 4.0),
+            vec3(0.0, 0.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+            degrees(45.0),
+            0.1,
+            100.0,
+        );
+        let mut image = GpuRenderImage::new(tracer.gpu(), 40, 24);
+        // 15 tiles: a call of one sample, each pass timed, and one of four samples, timed in groups of two passes
+        tracer
+            .trace_gpu(&scene, &camera, &mut image, &TraceSettings::default())
+            .unwrap();
+        let four = TraceSettings {
+            samples_per_call: 4,
+            ..Default::default()
+        };
+        tracer
+            .trace_gpu(&scene, &camera, &mut image, &four)
+            .unwrap();
+        let _ = tracer.gpu.device.poll(w::PollType::wait_indefinitely());
+        let times = tracer.take_call_times();
+        assert_eq!(
+            times.iter().map(|time| time.tiles).collect::<Vec<_>>(),
+            [15, 60]
+        );
+        assert!(times.iter().all(|time| time.ms > 0.0), "{times:?}");
+        assert_eq!(tracer.gpu_error(), None);
     }
 
     #[test]
