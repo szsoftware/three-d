@@ -12,10 +12,14 @@ static LINES: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 struct Capture;
 
 impl log::Log for Capture {
-    fn enabled(&self, _: &log::Metadata) -> bool {
-        true
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        // Only the tracer's lines, not those of wgpu and its drivers
+        metadata.target().starts_with("three_d_raytrace")
     }
     fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
         LINES
             .lock()
             .unwrap()
@@ -57,6 +61,12 @@ fn the_gpu_timing_log_goes_through_an_installed_logger() {
     tracer
         .trace_gpu(&scene, &camera, &mut image, &TraceSettings::default())
         .unwrap();
+    // Waits for the GPU, so its callbacks have run and dropping the context does not time out on slow adapters such
+    // as WARP
+    let _ = tracer
+        .gpu()
+        .device
+        .poll(three_d::wgpu::PollType::wait_indefinitely());
     set_gpu_timing_log(false);
     let lines = LINES.lock().unwrap();
     assert!(
