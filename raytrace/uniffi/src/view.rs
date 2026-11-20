@@ -308,14 +308,24 @@ impl SceneView {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[uniffi::export]
 impl SceneView {
-    /// What is under the pixel (from the top left), on platforms that can wait for the GPU (not the browser).
+    /// What is under the pixel (from the top left), right away: on the GPU where the platform can wait for it, in the
+    /// browser with a ray through the scene on the CPU. Exported on every target, so that the common API of the bindings
+    /// has it.
     pub fn pick(&self, x: f32, y: f32) -> Result<Option<Hit>, RtFfiError> {
         self.state.with(|s| {
             s.sync(&self.scene);
-            s.pick_now(x, y)
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                s.pick_now(x, y)
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                Ok(self
+                    .scene
+                    .with_rt(|rt| cpu_pick(rt, &s.camera, x, s.height as f32 - y)))
+            }
         })?
     }
 }

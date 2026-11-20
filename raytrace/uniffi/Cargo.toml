@@ -19,7 +19,7 @@ gpu = ["three-d-raytrace/wgpu", "three-d/wgpu"]
 [dependencies]
 uniffi = "0.32"
 # ThreadBound, NativeBytes, OwnedBytes and UploadBytes of the cargo-uniffi Gradle plugin, whose common API knows them
-cargo-uniffi-support = { git = "https://github.com/szsoftware/cargo-uniffi-gradle-plugin", tag = "support-v0.4.0-alpha.19", default-features = false, features = ["thread-bound", "bytes", "log"] }
+cargo-uniffi-support = { git = "https://github.com/szsoftware/cargo-uniffi-gradle-plugin", tag = "support-v0.4.0-alpha.19", default-features = false, features = ["thread-bound", "local-futures", "bytes", "log"] }
 three-d-raytrace = { path = "..", features = ["three-d", "export"] }
 three-d = { path = "../..", default-features = false }
 three-d-asset = { version = "0.10", features = ["obj", "gltf", "png", "jpeg"] }
@@ -31,3 +31,7 @@ three-d = { path = "../..", default-features = false, features = ["headless-gl"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-time = "1"
+# Renderer::from_canvas: the context of a canvas in the page (WebGPU or WebGL2)
+three-d = { path = "../..", default-features = false, features = ["window"] }
+web-sys = { version = "0.3", features = ["Window", "Document", "HtmlCanvasElement"] }
+wasm-bindgen = "0.2"

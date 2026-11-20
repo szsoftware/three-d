@@ -26,8 +26,21 @@ The crate has the plugin's log bridge: `UniffiLog.install()` once at the start o
 wgpu and this crate go to SLF4J or `System.Logger` (JVM), Logcat (Android) or the console (web). The level comes from
 `rustLog` in the plugin's settings or `-PcargoUniffi.rustLog=debug`. The app installs no Rust logger of its own.
 
-In the browser the application creates the context from its canvas and hands it over with `Renderer::with_context`
-from its own Rust crate; `Renderer::headless` is for desktop and Android.
+In the browser `Renderer.fromCanvas(canvasId, preferGpu)` (async) takes the device of a canvas in the page: WebGPU on
+the graphics card, WebGL2 otherwise. The canvas may stay hidden, the views hand their pixels to Kotlin. An application
+crate with its own context hands it over with `Renderer::with_context` from Rust. `Renderer::headless` is for desktop and
+Android.
+
+### In the application crate
+
+A dependency on this crate is not enough: the linker drops everything the application's cdylib does not use, and with
+it the uniffi exports, so the bindings of this crate (`three_d_raytrace_uniffi.api`) never appear. Re-export the crate
+in the application's `lib.rs`:
+
+```rust
+uniffi::setup_scaffolding!();
+pub use three_d_raytrace_uniffi;
+```
 
 ```sh
 cargo test -p three-d-raytrace-uniffi --release      # with VK_ICD_FILENAMES set to lavapipe in a container
