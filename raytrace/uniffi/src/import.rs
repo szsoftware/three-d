@@ -10,7 +10,7 @@ pub struct ModelFile {
     /// by its extension: `.obj`, `.gltf` or `.glb`.
     pub name: String,
     /// The bytes.
-    pub bytes: Arc<Upload>,
+    pub bytes: Arc<UploadBytes>,
 }
 
 /// A part of an imported model: a mesh with its material and where it sits in the model.

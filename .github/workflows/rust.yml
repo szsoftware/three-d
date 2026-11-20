@@ -13,6 +13,8 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   RUSTFLAGS: "-Dwarnings"
+  # git dependencies through the git command line, so that the token of the step "Access to the plugin repository" applies
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
   desktop:
@@ -27,6 +29,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      # cargo-uniffi-support comes from the private repository of the cargo-uniffi Gradle plugin, read with a token
+      - name: Access to the plugin repository
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.CARGO_UNIFFI_SUPPORT_TOKEN }}
+        run: git config --global url."https://x-access-token:${TOKEN}@github.com/szsoftware/cargo-uniffi-gradle-plugin".insteadOf "https://github.com/szsoftware/cargo-uniffi-gradle-plugin"
 
       - name: Install Rust Toolchain
         uses: actions-rs/toolchain@v1
@@ -123,6 +132,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      # cargo-uniffi-support comes from the private repository of the cargo-uniffi Gradle plugin, read with a token
+      - name: Access to the plugin repository
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.CARGO_UNIFFI_SUPPORT_TOKEN }}
+        run: git config --global url."https://x-access-token:${TOKEN}@github.com/szsoftware/cargo-uniffi-gradle-plugin".insteadOf "https://github.com/szsoftware/cargo-uniffi-gradle-plugin"
+
       - name: Install Rust Toolchain
         uses: actions-rs/toolchain@v1
         with:
@@ -149,6 +165,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # cargo-uniffi-support comes from the private repository of the cargo-uniffi Gradle plugin, read with a token
+      - name: Access to the plugin repository
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.CARGO_UNIFFI_SUPPORT_TOKEN }}
+        run: git config --global url."https://x-access-token:${TOKEN}@github.com/szsoftware/cargo-uniffi-gradle-plugin".insteadOf "https://github.com/szsoftware/cargo-uniffi-gradle-plugin"
 
       - name: Install Rust Toolchain
         uses: actions-rs/toolchain@v1

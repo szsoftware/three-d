@@ -153,7 +153,9 @@ fn render_cpu(
         .unwrap();
     while !job.step().unwrap() {}
     let rgba = job.rgba().unwrap().expect("complete");
-    unsafe { std::slice::from_raw_parts(rgba.address as *const u8, rgba.length as usize) }.to_vec()
+    let bytes = rgba.bytes();
+    unsafe { std::slice::from_raw_parts(bytes.address as *const u8, bytes.length as usize) }
+        .to_vec()
 }
 
 #[test]
@@ -195,24 +197,49 @@ fn write<T: Copy>(bytes: NativeBytes, values: &[T]) {
 
 #[test]
 fn a_mesh_written_into_an_upload() {
-    let upload = MeshUpload::new(4, 2, true, false);
+    // One set of uploads for several meshes in a row, as a CAD import does it: resize, write, hand over
+    let positions = UploadBytes::new(0);
+    let normals = UploadBytes::new(0);
+    let indices = UploadBytes::new(0);
     write(
-        upload.positions(),
+        positions.resize(12 * 4),
         &[-1f32, 0., -1., 1., 0., -1., 1., 0., 1., -1., 0., 1.],
     );
     write(
-        upload.normals().unwrap(),
+        normals.resize(12 * 4),
         &[0f32, 1., 0., 0., 1., 0., 0., 1., 0., 0., 1., 0.],
     );
-    write(upload.indices(), &[0u32, 2, 1, 0, 3, 2]);
-    assert!(upload.uvs().is_none());
+    write(indices.resize(6 * 4), &[0u32, 2, 1, 0, 3, 2]);
     let scene = Scene::new();
-    let mesh = scene.add_uploaded_mesh(upload.clone()).unwrap();
+    let mesh = scene
+        .add_uploaded_mesh(
+            positions.clone(),
+            indices.clone(),
+            Some(normals.clone()),
+            None,
+        )
+        .unwrap();
     assert_eq!(scene.counts().meshes, 1);
-    assert_eq!(scene.add_uploaded_mesh(upload), Err(RtFfiError::Consumed));
+    assert_eq!(
+        scene.add_uploaded_mesh(positions.clone(), indices.clone(), None, None),
+        Err(RtFfiError::Consumed)
+    );
+    // The memory stays for the next mesh
+    let capacity = positions.capacity();
+    assert!(capacity >= 48);
+    write(
+        positions.resize(9 * 4),
+        &[0f32, 0., 0., 1., 0., 0., 0., 0., 1.],
+    );
+    assert_eq!(positions.capacity(), capacity);
+    write(indices.resize(3 * 4), &[0u32, 2, 1]);
+    scene
+        .add_uploaded_mesh(positions.clone(), indices.clone(), None, None)
+        .unwrap();
+    assert_eq!(scene.counts().meshes, 2);
     let material = scene.add_material(diffuse(v(0.5, 0.5, 0.5), 1.0)).unwrap();
     // Many instances from one upload of 16 floats each
-    let transforms = Upload::new(3 * 16 * 4);
+    let transforms = UploadBytes::new(3 * 16 * 4);
     let mut values = Vec::new();
     for i in 0..3 {
         values.extend(boxed(v(i as f32 * 3.0, 0.0, 0.0), v(2.0, 2.0, 2.0)));
@@ -221,16 +248,16 @@ fn a_mesh_written_into_an_upload() {
     assert_eq!(scene.add_instances(mesh, material, transforms).unwrap(), 0);
     assert_eq!(scene.counts().instances, 3);
     // Indices out of range are refused
-    let bad = MeshUpload::new(3, 1, false, false);
-    write(bad.indices(), &[0u32, 1, 7]);
+    write(positions.resize(9 * 4), &[0f32; 9]);
+    write(indices.resize(3 * 4), &[0u32, 1, 7]);
     assert!(matches!(
-        scene.add_uploaded_mesh(bad),
+        scene.add_uploaded_mesh(positions, indices, None, None),
         Err(RtFfiError::InvalidData { .. })
     ));
 }
 
-fn upload(bytes: &[u8]) -> Arc<Upload> {
-    let u = Upload::new(bytes.len() as u64);
+fn upload(bytes: &[u8]) -> Arc<UploadBytes> {
+    let u = UploadBytes::new(bytes.len() as u64);
     write(u.bytes(), bytes);
     u
 }
@@ -312,7 +339,7 @@ fn a_final_render_as_png() {
     assert!(job.png().unwrap().is_none());
     while !job.step().unwrap() {}
     assert!(job.is_done() && job.progress() >= 1.0);
-    let png = job.png().unwrap().unwrap();
+    let png = job.png().unwrap().unwrap().bytes();
     let bytes =
         unsafe { std::slice::from_raw_parts(png.address as *const u8, png.length as usize) };
     let image = image::load_from_memory(bytes).unwrap();

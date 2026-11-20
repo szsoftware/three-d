@@ -1,6 +1,6 @@
 use crate::thread::ThreadBound;
 use crate::*;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use three_d::{Context, Texture2D};
 use three_d_raytrace::{FinalRender, PreviewSettings, RaytracePreview};
@@ -134,7 +134,6 @@ impl Renderer {
             renderer: self,
             scene,
             render: ThreadBound::new(render),
-            png: Mutex::new(None),
         }))
     }
 
@@ -223,7 +222,6 @@ pub struct FinalJob {
     renderer: Arc<Renderer>,
     scene: Arc<Scene>,
     render: ThreadBound<FinalRender>,
-    png: Mutex<Option<Vec<u8>>>,
 }
 
 #[uniffi::export]
@@ -273,18 +271,15 @@ impl FinalJob {
             .unwrap_or_default()
     }
 
-    /// The complete image as RGBA8, rows top first, valid as long as the job lives.
-    pub fn rgba(&self) -> Result<Option<NativeBytes>, RtFfiError> {
-        self.render.with(|r| r.rgba8().map(NativeBytes::of))
+    /// The complete image as RGBA8, rows top first, when it is done; close it in Kotlin when it is used.
+    pub fn rgba(&self) -> Result<Option<Arc<OwnedBytes>>, RtFfiError> {
+        self.render
+            .with(|r| r.rgba8().map(|pixels| OwnedBytes::new(pixels.to_vec())))
     }
 
-    /// The complete image as PNG file, valid as long as the job lives.
-    pub fn png(&self) -> Result<Option<NativeBytes>, RtFfiError> {
-        let mut png = self.png.lock().unwrap();
-        if png.is_none() {
-            *png = self.render.with(|r| r.png())?;
-        }
-        Ok(png.as_deref().map(NativeBytes::of))
+    /// The complete image as PNG file when it is done; close it in Kotlin when it is used.
+    pub fn png(&self) -> Result<Option<Arc<OwnedBytes>>, RtFfiError> {
+        self.render.with(|r| r.png().map(OwnedBytes::new))
     }
 }
 

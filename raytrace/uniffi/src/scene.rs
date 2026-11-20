@@ -88,10 +88,24 @@ impl Scene {
         Ok(self.lock().scene.add_mesh(&mesh)?.0)
     }
 
-    /// A mesh Kotlin wrote into a [MeshUpload]; the upload is empty afterwards.
-    pub fn add_uploaded_mesh(&self, upload: Arc<MeshUpload>) -> Result<u32, RtFfiError> {
-        let d = upload.take()?;
-        self.add_mesh(d.positions, d.indices, d.normals, d.uvs)
+    ///
+    /// A mesh Kotlin wrote into uploads: `positions` (3 `f32` per vertex), `indices` (3 `u32` per triangle, counter
+    /// clockwise seen from the front), optional `normals` (3 `f32`) and `uvs` (2 `f32`), in the byte order of the platform.
+    /// The bytes are copied out and the uploads keep their memory: `resize` them for the next mesh.
+    ///
+    #[uniffi::method(default(normals = None, uvs = None))]
+    pub fn add_uploaded_mesh(
+        &self,
+        positions: Arc<UploadBytes>,
+        indices: Arc<UploadBytes>,
+        normals: Option<Arc<UploadBytes>>,
+        uvs: Option<Arc<UploadBytes>>,
+    ) -> Result<u32, RtFfiError> {
+        let positions = positions.take_f32()?;
+        let indices = indices.take_u32()?;
+        let normals = normals.map(|n| n.take_f32()).transpose()?;
+        let uvs = uvs.map(|u| u.take_f32()).transpose()?;
+        self.add_mesh(positions, indices, normals, uvs)
     }
 
     ///
@@ -100,7 +114,7 @@ impl Scene {
     ///
     pub fn add_texture(
         &self,
-        file: Arc<Upload>,
+        file: Arc<UploadBytes>,
         srgb: bool,
         repeat: bool,
     ) -> Result<u32, RtFfiError> {
@@ -118,17 +132,20 @@ impl Scene {
         &self,
         width: u32,
         height: u32,
-        pixels: Arc<Upload>,
+        pixels: Arc<UploadBytes>,
         srgb: bool,
     ) -> Result<u32, RtFfiError> {
-        let bytes = pixels.take()?;
-        if bytes.len() != width as usize * height as usize * 4 {
-            return Err(invalid(format!(
-                "{} bytes for {width} x {height} RGBA8 pixels",
-                bytes.len()
-            )));
-        }
-        let mut texture = RtTexture::new(width, height, bytes.as_chunks::<4>().0.to_vec());
+        let texels = pixels.consume(|bytes| {
+            (bytes.len() == width as usize * height as usize * 4)
+                .then(|| bytes.as_chunks::<4>().0.to_vec())
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "{} bytes for {width} x {height} RGBA8 pixels",
+                        bytes.len()
+                    ))
+                })
+        })??;
+        let mut texture = RtTexture::new(width, height, texels);
         texture.linear = !srgb;
         Ok(self.lock().scene.add_texture(texture).0)
     }
@@ -180,7 +197,7 @@ impl Scene {
         &self,
         mesh: u32,
         material: u32,
-        transforms: Arc<Upload>,
+        transforms: Arc<UploadBytes>,
     ) -> Result<u32, RtFfiError> {
         let values = transforms.take_f32()?;
         if values.len() % 16 != 0 || values.is_empty() {

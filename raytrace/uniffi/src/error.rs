@@ -25,7 +25,9 @@ pub enum RtFfiError {
     },
     /// An object that holds a three-d context was called from another thread than the one that created the renderer.
     WrongThread,
-    /// An upload that was already handed to the scene and is empty now.
+    /// An object that is in use already, called again from inside one of its own calls.
+    Busy,
+    /// An upload whose bytes the scene took already: `resize` it for the next one.
     Consumed,
 }
 
@@ -40,7 +42,11 @@ impl std::fmt::Display for RtFfiError {
                 f,
                 "called from another thread than the one that created the renderer"
             ),
-            Self::Consumed => write!(f, "the upload was already added to a scene"),
+            Self::Busy => write!(f, "the object is in use already"),
+            Self::Consumed => write!(
+                f,
+                "the bytes of the upload were taken already, resize it for the next"
+            ),
         }
     }
 }
@@ -62,6 +68,26 @@ impl From<RtError> for RtFfiError {
             RtError::InvalidMesh(why) => Self::InvalidData { why },
             RtError::Ies(why) | RtError::Export(why) => Self::Import { why },
             RtError::Gpu(why) => Self::Gpu { why },
+            other => Self::InvalidData {
+                why: other.to_string(),
+            },
+        }
+    }
+}
+
+impl From<cargo_uniffi_support::ThreadBoundError> for RtFfiError {
+    fn from(e: cargo_uniffi_support::ThreadBoundError) -> Self {
+        match e {
+            cargo_uniffi_support::ThreadBoundError::WrongThread { .. } => Self::WrongThread,
+            cargo_uniffi_support::ThreadBoundError::Busy => Self::Busy,
+        }
+    }
+}
+
+impl From<cargo_uniffi_support::BytesError> for RtFfiError {
+    fn from(e: cargo_uniffi_support::BytesError) -> Self {
+        match e {
+            cargo_uniffi_support::BytesError::Consumed => Self::Consumed,
             other => Self::InvalidData {
                 why: other.to_string(),
             },
