@@ -35,7 +35,10 @@ jobs:
         shell: bash
         env:
           TOKEN: ${{ secrets.CARGO_UNIFFI_SUPPORT_TOKEN }}
-        run: git config --global url."https://x-access-token:${TOKEN}@github.com/szsoftware/cargo-uniffi-gradle-plugin".insteadOf "https://github.com/szsoftware/cargo-uniffi-gradle-plugin"
+        # core.longpaths: cargo checks out the whole repository, whose test fixtures are deeper than 260 characters on Windows
+        run: |
+          git config --global url."https://x-access-token:${TOKEN}@github.com/szsoftware/cargo-uniffi-gradle-plugin".insteadOf "https://github.com/szsoftware/cargo-uniffi-gradle-plugin"
+          git config --global core.longpaths true
 
       - name: Install Rust Toolchain
         uses: actions-rs/toolchain@v1
@@ -137,7 +140,10 @@ jobs:
         shell: bash
         env:
           TOKEN: ${{ secrets.CARGO_UNIFFI_SUPPORT_TOKEN }}
-        run: git config --global url."https://x-access-token:${TOKEN}@github.com/szsoftware/cargo-uniffi-gradle-plugin".insteadOf "https://github.com/szsoftware/cargo-uniffi-gradle-plugin"
+        # core.longpaths: cargo checks out the whole repository, whose test fixtures are deeper than 260 characters on Windows
+        run: |
+          git config --global url."https://x-access-token:${TOKEN}@github.com/szsoftware/cargo-uniffi-gradle-plugin".insteadOf "https://github.com/szsoftware/cargo-uniffi-gradle-plugin"
+          git config --global core.longpaths true
 
       - name: Install Rust Toolchain
         uses: actions-rs/toolchain@v1
@@ -171,7 +177,10 @@ jobs:
         shell: bash
         env:
           TOKEN: ${{ secrets.CARGO_UNIFFI_SUPPORT_TOKEN }}
-        run: git config --global url."https://x-access-token:${TOKEN}@github.com/szsoftware/cargo-uniffi-gradle-plugin".insteadOf "https://github.com/szsoftware/cargo-uniffi-gradle-plugin"
+        # core.longpaths: cargo checks out the whole repository, whose test fixtures are deeper than 260 characters on Windows
+        run: |
+          git config --global url."https://x-access-token:${TOKEN}@github.com/szsoftware/cargo-uniffi-gradle-plugin".insteadOf "https://github.com/szsoftware/cargo-uniffi-gradle-plugin"
+          git config --global core.longpaths true
 
       - name: Install Rust Toolchain
         uses: actions-rs/toolchain@v1
