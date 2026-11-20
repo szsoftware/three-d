@@ -565,3 +565,111 @@ fn on_wgpu_over_opengl_the_shaders_compile_once_the_cpu_shows_an_image() {
     assert_eq!(preview.kind(), TracerKind::Compute);
     finish(&context);
 }
+
+#[test]
+fn a_still_camera_gets_the_full_resolution_on_the_gpu() {
+    let Some(context) = context() else { return };
+    let mut preview = RaytracePreview::new(&context, 64, 32);
+    preview.wait_for_gpu();
+    if preview.kind() != TracerKind::Compute {
+        return;
+    }
+    // Half the resolution, as a slow GPU gets it, and a limit no update reaches
+    preview.set_settings(PreviewSettings {
+        gpu_downscale: 2,
+        gpu_frame_time: Some(std::time::Duration::from_secs(10)),
+        max_samples: 40,
+        ..*preview.settings()
+    });
+    let scene = sky_only(1000.0);
+    let still = camera(64, 32, vec3(0.0, 0.0, 0.0));
+    preview.update(&scene, &still).unwrap();
+    assert_eq!(preview.texture().width(), 32);
+    let restarts = preview.restarts();
+    for _ in 0..200 {
+        if preview.texture().width() == 64 {
+            break;
+        }
+        preview.update(&scene, &still).unwrap();
+        finish(&context);
+    }
+    if preview.gpu_time().is_none() {
+        eprintln!("skipped, the device has no timestamp queries");
+        return;
+    }
+    // Shown once it has a few samples; going on at the full resolution is no restart
+    assert_eq!(preview.texture().width(), 64);
+    assert_eq!(preview.gpu_downscale(), 1);
+    assert!(preview.sample_count() >= 4);
+    assert_eq!(preview.restarts(), restarts);
+    // Until done at the full resolution
+    for _ in 0..200 {
+        if preview.is_done() {
+            break;
+        }
+        preview.update(&scene, &still).unwrap();
+    }
+    assert!(preview.is_done());
+    assert_eq!(preview.sample_count(), 40);
+    assert_eq!(preview.texture().width(), 64);
+    assert!(!preview.update(&scene, &still).unwrap());
+    // A move starts again at half the resolution
+    preview
+        .update(&scene, &camera(64, 32, vec3(1.0, 0.0, 0.0)))
+        .unwrap();
+    assert_eq!(preview.texture().width(), 32);
+    assert_eq!(preview.gpu_downscale(), 2);
+    assert_eq!(preview.last_restart(), Some(PreviewRestart::Camera));
+    assert_eq!(preview.sample_count(), 1);
+    finish(&context);
+}
+
+#[test]
+fn without_a_limit_the_gpu_comes_back_at_the_full_resolution() {
+    let Some(context) = context() else { return };
+    let mut preview = RaytracePreview::new(&context, 64, 32);
+    preview.wait_for_gpu();
+    if preview.kind() != TracerKind::Compute {
+        return;
+    }
+    let scene = sky_only(1000.0);
+    let camera = camera(64, 32, vec3(0.0, 0.0, 0.0));
+    // Far too slow for any limit: lower, then on the CPU
+    preview.set_settings(PreviewSettings {
+        gpu_frame_time: Some(std::time::Duration::from_nanos(1)),
+        ..*preview.settings()
+    });
+    for _ in 0..40 {
+        preview.update(&scene, &camera).unwrap();
+        finish(&context);
+        if preview.kind() == TracerKind::CpuReference {
+            break;
+        }
+    }
+    assert_eq!(preview.kind(), TracerKind::CpuReference);
+    // A switch for the full resolution: no limit
+    preview.set_settings(PreviewSettings {
+        gpu_frame_time: None,
+        ..*preview.settings()
+    });
+    assert_eq!(preview.availability(), &PreviewAvailability::Gpu);
+    assert_eq!(preview.kind(), TracerKind::Compute);
+    assert_eq!(preview.gpu_downscale(), 1);
+    assert_eq!(preview.texture().width(), 64);
+    for _ in 0..5 {
+        preview.update(&scene, &camera).unwrap();
+    }
+    finish(&context);
+    preview.update(&scene, &camera).unwrap();
+    assert_eq!(preview.kind(), TracerKind::Compute);
+    assert_eq!(preview.texture().width(), 64);
+    assert_eq!(preview.last_restart(), Some(PreviewRestart::Settings));
+    // And with a limit again the preview watches the GPU anew
+    preview.set_settings(PreviewSettings {
+        gpu_frame_time: Some(std::time::Duration::from_secs(10)),
+        ..*preview.settings()
+    });
+    preview.update(&scene, &camera).unwrap();
+    assert_eq!(preview.kind(), TracerKind::Compute);
+    finish(&context);
+}

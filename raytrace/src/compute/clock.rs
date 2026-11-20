@@ -1,10 +1,11 @@
 //!
-//! The GPU's own time for the calls of the tracer, from timestamp queries, outside of browsers. The time between the
-//! frames of an application also holds what the application draws and reads back; on a large window that alone can
-//! be longer than the limit of the preview.
+//! The GPU's own time for the calls of the tracer, from timestamp queries. The time between the frames of an
+//! application also holds what the application draws and reads back; on a large window that alone can be longer than
+//! the limit of the preview. Browsers tell when work is done only once the page's thread is free, after a frame of the
+//! page, which can take longer than the work.
 //!
 
-use super::CallTimes;
+use super::{CallTime, CallTimes};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use three_d::wgpu as w;
@@ -116,10 +117,11 @@ impl GpuClock {
     }
 
     ///
-    /// After the submission of [GpuClock::resolve]: reads the time once the GPU is done (when the device is polled)
-    /// and adds the milliseconds to `times` if they are still in `round`.
+    /// After the submission of [GpuClock::resolve]: reads the time once the GPU is done (when the device is polled, in
+    /// browsers when the browser tells)
+    /// and adds the milliseconds of the call with its `tiles` to `times` if they are still in `round`.
     ///
-    pub(super) fn read(&self, stamp: Stamp, times: &Arc<Mutex<CallTimes>>, round: u64) {
+    pub(super) fn read(&self, stamp: Stamp, times: &Arc<Mutex<CallTimes>>, round: u64, tiles: u32) {
         let slot = &self.slots[stamp.slot as usize];
         let buffer = slot.buffer.clone();
         let busy = slot.busy.clone();
@@ -141,7 +143,10 @@ impl GpuClock {
                     buffer.unmap();
                     if let (Some(ticks @ 1..), Ok(mut times)) = (ticks, times.lock()) {
                         if times.round == round {
-                            times.finished.push(ticks as f64 * period / 1e6);
+                            times.finished.push(CallTime {
+                                ms: ticks as f64 * period / 1e6,
+                                tiles,
+                            });
                         }
                     }
                 }
