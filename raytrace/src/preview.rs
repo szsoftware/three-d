@@ -1003,9 +1003,18 @@ impl RaytracePreview {
     #[cfg(feature = "wgpu")]
     fn leave_sharp(&mut self) {
         if let Some(mut sharp) = self.sharp.take() {
+            if crate::compute::timing::enabled() {
+                crate::compute::timing::log(&format!(
+                    "preview leaves the full resolution after {} samples there, {:?} ms per tile",
+                    sharp.image.sample_count(),
+                    sharp.tile_ms
+                ));
+            }
             if sharp.shown {
                 std::mem::swap(&mut self.texture, &mut sharp.texture);
             }
+            // The lower resolution starts counting slow calls anew
+            self.pace.slow = 0;
             if let Engine::Gpu { tracer, .. } = &self.engine {
                 // Calls of the full resolution do not count for the lower one
                 tracer.restart_call_times();
@@ -1154,6 +1163,11 @@ impl RaytracePreview {
                 .is_some_and(|ms| ms > 2000.0 * limit.as_secs_f64())
             {
                 // One tile alone takes far too long: the lower resolution until the image starts again
+                if crate::compute::timing::enabled() {
+                    crate::compute::timing::log(
+                        "preview: a tile at the full resolution takes too long",
+                    );
+                }
                 self.leave_sharp();
                 self.sharp_too_slow = true;
                 return self.update(scene, camera);
@@ -1204,6 +1218,12 @@ impl RaytracePreview {
             if !sharp.shown {
                 std::mem::swap(&mut self.texture, &mut sharp.texture);
                 sharp.shown = true;
+                if crate::compute::timing::enabled() {
+                    crate::compute::timing::log(&format!(
+                        "preview shows the full resolution, {:?} ms per tile, {tiles} tile(s) per update",
+                        sharp.tile_ms
+                    ));
+                }
             }
             return Ok(true);
         }
@@ -1324,6 +1344,15 @@ impl RaytracePreview {
             }
             return false;
         }
+        // How the time was measured, for the reason when the preview goes to the CPU
+        let measured = if tracer.times_from_timestamps() {
+            "the GPU's own time, from timestamps"
+        } else if tracer.measures_call_times() {
+            "until the browser told that the work was done"
+        } else {
+            "the time between frames"
+        };
+        let timed = crate::compute::timing::enabled();
         let decision = if tracer.measures_call_times() {
             // The GPU's own time of every call
             if !self.pace.started {
@@ -1339,6 +1368,12 @@ impl RaytracePreview {
             for call in tracer.take_call_times() {
                 let busy = std::time::Duration::from_secs_f64(call.ms / 1000.0);
                 self.gpu_time = Some(busy);
+                if timed && limit.is_some_and(|limit| busy > limit) {
+                    crate::compute::timing::log(&format!(
+                        "preview: a call of {} tile(s) took {:.1} ms at 1/{} ({measured}), more than the limit",
+                        call.tiles, call.ms, self.gpu_scale
+                    ));
+                }
                 if let (None, Some(limit)) = (&decision, limit) {
                     decision = self
                         .pace
@@ -1358,11 +1393,15 @@ impl RaytracePreview {
             #[cfg(target_arch = "wasm32")]
             None
         };
+        if let (true, Some(decision)) = (timed, &decision) {
+            crate::compute::timing::log(&format!("preview: {decision:?} ({measured})"));
+        }
         match decision {
             None => return false,
             Some(Ok(scale)) => self.gpu_scale = scale,
             Some(Err(why)) => {
-                self.availability = PreviewAvailability::CpuOnly(why);
+                self.availability =
+                    PreviewAvailability::CpuOnly(format!("{why} Measured: {measured}."));
                 // Kept for another limit, see set_settings
                 if let Engine::Gpu { tracer, .. } =
                     std::mem::replace(&mut self.engine, placeholder_engine())

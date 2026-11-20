@@ -792,19 +792,23 @@ impl ComputeTracer {
             );
         }
         // The GPU's time of the call, from the beginning of its first pass to the end of its last one
+        let passes = count
+            + caustics.as_ref().map_or(0, |_| {
+                dispatches.iter().filter(|(_, t)| *t == 0).count() as u32
+            });
         let stamp = self
             .clock
             .as_ref()
-            .and_then(|clock| Some((clock, clock.begin()?)));
+            .and_then(|clock| Some((clock, clock.begin(passes)?)));
         let round = self
             .call_times
             .lock()
             .map(|times| times.round)
             .unwrap_or_default();
-        let mut first_pass = true;
-        let mut writes = |last: bool| {
-            let first = std::mem::replace(&mut first_pass, false);
-            stamp.and_then(|(clock, stamp)| clock.writes(stamp, first, last))
+        let mut pass = 0;
+        let mut writes = || {
+            pass += 1;
+            stamp.and_then(|(clock, stamp)| clock.writes(stamp, pass - 1))
         };
         // One submission per sample and tile, so the GPU can go on with other work between them, and only a few at a time
         for (k, &(s, t)) in dispatches.iter().enumerate() {
@@ -822,7 +826,7 @@ impl ComputeTracer {
                 );
                 let mut pass = encoder.begin_compute_pass(&w::ComputePassDescriptor {
                     label: Some("caustic photons"),
-                    timestamp_writes: writes(false),
+                    timestamp_writes: writes(),
                 });
                 pass.set_bind_group(0, bind_group, &[offset]);
                 let groups = plan.capacity().div_ceil(64);
@@ -840,7 +844,7 @@ impl ComputeTracer {
             {
                 let mut pass = encoder.begin_compute_pass(&w::ComputePassDescriptor {
                     label: Some("ray tracing"),
-                    timestamp_writes: writes(last),
+                    timestamp_writes: writes(),
                 });
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, &bind_group, &[offset]);
@@ -974,6 +978,11 @@ impl ComputeTracer {
         return self.unfinished.load(std::sync::atomic::Ordering::Relaxed);
         #[cfg(not(target_arch = "wasm32"))]
         0
+    }
+
+    /// Whether the calls are timed with timestamp queries, pass by pass.
+    pub(crate) fn times_from_timestamps(&self) -> bool {
+        self.clock.is_some()
     }
 
     ///
@@ -2294,6 +2303,55 @@ mod tests {
         assert_eq!(shrunk.0.len(), 4 + 8 + 32 * 16 + 4);
         assert_eq!(&shrunk.0[4..7], &[12, 32, 16]);
         assert_eq!(shrunk.0[12], u32::from_le_bytes([200, 100, 50, 255]));
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn every_pass_is_timed_also_in_calls_with_many_passes() {
+        let Ok(context) = three_d::Context::new_headless_wgpu() else {
+            return;
+        };
+        let Some(tracer) = ComputeTracer::from_context(&context) else {
+            return;
+        };
+        if !tracer.times_from_timestamps() {
+            return;
+        }
+        let mut tracer = tracer.with_tile_size(8);
+        let mut scene = RtScene::new();
+        scene.set_environment(RtEnvironment::Uniform {
+            color: vec3(1.0, 1.0, 1.0),
+            luminance: 1000.0,
+        });
+        let camera = Camera::new_perspective(
+            three_d_asset::Viewport::new_at_origo(40, 24),
+            vec3(0.0, 0.0, 4.0),
+            vec3(0.0, 0.0, 0.0),
+            vec3(0.0, 1.0, 0.0),
+            degrees(45.0),
+            0.1,
+            100.0,
+        );
+        let mut image = GpuRenderImage::new(tracer.gpu(), 40, 24);
+        // 15 tiles: a call of one sample, each pass timed, and one of four samples, timed in groups of two passes
+        tracer
+            .trace_gpu(&scene, &camera, &mut image, &TraceSettings::default())
+            .unwrap();
+        let four = TraceSettings {
+            samples_per_call: 4,
+            ..Default::default()
+        };
+        tracer
+            .trace_gpu(&scene, &camera, &mut image, &four)
+            .unwrap();
+        let _ = tracer.gpu.device.poll(w::PollType::wait_indefinitely());
+        let times = tracer.take_call_times();
+        assert_eq!(
+            times.iter().map(|time| time.tiles).collect::<Vec<_>>(),
+            [15, 60]
+        );
+        assert!(times.iter().all(|time| time.ms > 0.0), "{times:?}");
+        assert_eq!(tracer.gpu_error(), None);
     }
 
     #[test]
