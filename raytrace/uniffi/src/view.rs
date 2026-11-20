@@ -1,4 +1,4 @@
-use crate::render::{as_texels, rgba_texture, FrameBuffers, PreviewState};
+use crate::render::{rgba_texture, PreviewState, Readback};
 use crate::thread::ThreadBound;
 use crate::*;
 use std::collections::{HashMap, HashSet};
@@ -133,7 +133,7 @@ struct ViewState {
     height: u32,
     color: Texture2D,
     depth: DepthTexture2D,
-    ring: FrameBuffers,
+    readback: Readback,
     groups: Vec<Group>,
     lights: Lights,
     revision: u64,
@@ -188,7 +188,7 @@ impl Renderer {
             camera: cam,
             width,
             height,
-            ring: FrameBuffers::new(3),
+            readback: Readback::new(),
             groups: Vec::new(),
             lights: Lights::default(),
             revision: u64::MAX,
@@ -589,10 +589,9 @@ impl ViewState {
         };
         target.render(&self.camera, self.groups.iter().map(|g| &g.gm), &lights);
         let (w, h) = (self.width, self.height);
-        let bytes = self.ring.next(w as usize * h as usize * 4);
-        self.color.as_color_target(None).read_into(as_texels(bytes));
+        let bytes = self.readback.read(&self.color.as_color_target(None), w, h);
         Ok(Frame {
-            rgba: NativeBytes::of(&bytes[..]),
+            rgba: NativeBytes::of(bytes),
             width: w,
             height: h,
             samples: 0,
