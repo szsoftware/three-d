@@ -650,14 +650,25 @@ fn build_groups(
         .into_iter()
         .map(|key| {
             let ids = by_key.remove(&key).unwrap();
-            let cpu = cpu_material_of(rt, &rt.materials()[key.1 as usize], key.2, scale);
+            let mesh = &meshes[key.0 as usize];
+            let mut cpu = cpu_material_of(rt, &rt.materials()[key.1 as usize], key.2, scale);
+            if mesh.uvs.is_none() {
+                // Without texture coordinates the shader has nothing to read textures with: on wgpu the pipeline
+                // would fail to build and the whole frame stays empty
+                cpu.albedo_texture = None;
+                cpu.metallic_roughness_texture = None;
+                cpu.normal_texture = None;
+                cpu.occlusion_texture = None;
+                cpu.emissive_texture = None;
+            } else if mesh.tangents.is_none() {
+                cpu.normal_texture = None;
+            }
             let material = if cpu.albedo.a < 255 {
                 PhysicalMaterial::new_transparent(context, &cpu)
             } else {
                 PhysicalMaterial::new_opaque(context, &cpu)
             };
-            let mesh =
-                InstancedMesh::new(context, &instances_of(rt, &ids), &meshes[key.0 as usize]);
+            let mesh = InstancedMesh::new(context, &instances_of(rt, &ids), mesh);
             Group {
                 instances: ids,
                 gm: Gm::new(mesh, material),
@@ -677,6 +688,10 @@ fn cpu_mesh_of(m: &three_d_raytrace::RtMesh) -> CpuMesh {
     };
     if mesh.normals.is_none() {
         mesh.compute_normals();
+    }
+    // Normal textures need tangents; the raytracer follows the texture coordinates of each triangle without them
+    if mesh.tangents.is_none() && mesh.uvs.is_some() {
+        mesh.compute_tangents();
     }
     mesh
 }
