@@ -339,7 +339,9 @@ fn a_final_render_as_png() {
     assert!(job.png().unwrap().is_none());
     while !job.step().unwrap() {}
     assert!(job.is_done() && job.progress() >= 1.0);
-    let png = job.png().unwrap().unwrap().bytes();
+    // The OwnedBytes must live while the bytes are read
+    let owned = job.png().unwrap().unwrap();
+    let png = owned.bytes();
     let bytes =
         unsafe { std::slice::from_raw_parts(png.address as *const u8, png.length as usize) };
     let image = image::load_from_memory(bytes).unwrap();
