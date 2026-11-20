@@ -118,7 +118,7 @@ jobs:
         shell: bash
         run: |
           if [[ "${{ matrix.os }}" == windows* && "${{ github.event_name }}" == "pull_request" ]]; then
-            THREE_D_SKIP_GPU_TESTS=1 cargo test -p three-d-raytrace --all-features
+            env -u THREE_D_REQUIRE_WGPU THREE_D_SKIP_GPU_TESTS=1 cargo test -p three-d-raytrace --all-features
             cargo test -p three-d-raytrace --all-features --test gpu compute_garden_agrees_with_the_cpu_reference
           else
             cargo test -p three-d-raytrace --all-features
