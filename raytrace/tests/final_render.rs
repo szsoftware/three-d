@@ -247,4 +247,67 @@ mod gpu {
             .update(&scene(), &camera())
             .expect("the preview goes on");
     }
+
+    /// The preview's image as shown, top row first.
+    fn shown(context: &Context, preview: &RaytracePreview) -> Vec<[u8; 4]> {
+        let target = three_d::RenderTarget::screen(context, 32, 24);
+        target.clear(three_d::ClearState::color(0.0, 0.0, 0.0, 1.0));
+        preview.render(&target);
+        target.read_color()
+    }
+
+    #[test]
+    fn the_preview_stays_on_screen_while_the_final_render_traces() {
+        let context = match Context::new_headless_wgpu_with_screen(32, 24, true, false) {
+            Ok(context) => context,
+            Err(error) if std::env::var("THREE_D_REQUIRE_WGPU").is_ok() => {
+                panic!("no wgpu adapter: {error}")
+            }
+            Err(_) => return,
+        };
+        let scene = scene();
+        let mut camera = camera();
+        camera.set_viewport(Viewport::new_at_origo(32, 24));
+        // On the GPU, and on the CPU with its worker thread as on the desktop
+        for mut preview in [
+            RaytracePreview::new(&context, 32, 24),
+            RaytracePreview::new_on_cpu(&context, 32, 24),
+        ] {
+            preview.wait_for_gpu();
+            let kind = preview.kind();
+            for _ in 0..10_000 {
+                preview.update(&scene, &camera).unwrap();
+                if preview.sample_count() >= 2 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let before = shown(&context, &preview);
+            check_upright_at(&before, 32, 24, &format!("{kind:?} before"));
+            let mut print = render(2, WIDTH * 16, None);
+            let mut steps = 0;
+            while !preview.trace_final(&scene, &mut print).unwrap() {
+                steps += 1;
+                if steps % 5 == 1 {
+                    let during = shown(&context, &preview);
+                    check_upright_at(&during, 32, 24, &format!("{kind:?} during"));
+                }
+            }
+            check_upright_at(
+                &shown(&context, &preview),
+                32,
+                24,
+                &format!("{kind:?} after"),
+            );
+        }
+    }
+
+    fn check_upright_at(pixels: &[[u8; 4]], width: u32, height: u32, name: &str) {
+        let green = |rows: std::ops::Range<u32>| {
+            let rows = &pixels[(rows.start * width) as usize..(rows.end * width) as usize];
+            rows.iter().map(|p| p[1] as f64).sum::<f64>() / rows.len() as f64
+        };
+        let (top, bottom) = (green(0..3), green(height - 3..height));
+        assert!(top > bottom + 50.0, "{name}: top {top} bottom {bottom}");
+    }
 }

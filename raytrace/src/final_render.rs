@@ -31,7 +31,12 @@ const BAND_PIXELS: u32 = 2_000_000;
 ///
 /// Call [RaytracePreview::trace_final](crate::RaytracePreview::trace_final) every frame instead of
 /// [RaytracePreview::update](crate::RaytracePreview::update) until it returns `true`; it uses the preview's GPU, or
-/// the CPU where there is none.
+/// the CPU where there is none. [RaytracePreview::render](crate::RaytracePreview::render) shows the last image of the
+/// preview meanwhile. [FinalRender::png] needs the feature `export` (a default feature).
+///
+/// Outside of browsers a final render is [Send] and [Sync], so it can live in an object shared between threads. With
+/// [FinalRender::trace_cpu] it can also be traced on a thread of its own, with a clone of the scene; the GPU path
+/// stays on the thread of the context.
 ///
 /// ```ignore
 /// let (width, height) = A4_LANDSCAPE_300_DPI;
@@ -75,13 +80,107 @@ enum Work {
     },
     /// The band's colors on their way back from the GPU
     #[cfg(feature = "wgpu")]
-    Reading(std::pin::Pin<Box<dyn std::future::Future<Output = Vec<[u8; 4]>>>>),
+    Reading(Reading),
     Cpu {
         image: RenderImage,
         /// The row the next call starts at in the sample in progress
         next_row: u32,
         rows_per_call: u32,
     },
+}
+
+///
+/// The colors of a band on their way back from the GPU, read with wgpu itself rather than three-d's futures, so that
+/// [FinalRender] is [Send] and [Sync] outside of browsers.
+///
+#[cfg(feature = "wgpu")]
+struct Reading {
+    /// To poll outside of browsers
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    device: three_d::wgpu::Device,
+    buffer: three_d::wgpu::Buffer,
+    /// Whether the buffer is mapped, once wgpu calls back
+    mapped: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
+    width: u32,
+    rows: u32,
+    bytes_per_row: u32,
+}
+
+#[cfg(feature = "wgpu")]
+impl Reading {
+    /// Copies the texture into a buffer and asks for it to be mapped.
+    fn start(gpu: &crate::GpuDevice, texture: &three_d::wgpu::Texture) -> Self {
+        use three_d::wgpu as w;
+        let (width, rows) = (texture.width(), texture.height());
+        let bytes_per_row = (width * 4).next_multiple_of(w::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let buffer = gpu.device.create_buffer(&w::BufferDescriptor {
+            label: Some("read final render band"),
+            size: bytes_per_row as u64 * rows as u64,
+            usage: w::BufferUsages::COPY_DST | w::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&w::CommandEncoderDescriptor {
+                label: Some("read final render band"),
+            });
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            w::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: w::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(rows),
+                },
+            },
+            w::Extent3d {
+                width,
+                height: rows,
+                depth_or_array_layers: 1,
+            },
+        );
+        gpu.queue.submit([encoder.finish()]);
+        let mapped = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let shared = mapped.clone();
+        buffer.slice(..).map_async(w::MapMode::Read, move |result| {
+            *shared.lock().unwrap_or_else(|e| e.into_inner()) = Some(result.is_ok());
+        });
+        Self {
+            device: gpu.device.clone(),
+            buffer,
+            mapped,
+            width,
+            rows,
+            bytes_per_row,
+        }
+    }
+
+    /// The colors, top row first, once the GPU is done; browsers map without being asked.
+    fn poll(&self) -> Result<Option<Vec<[u8; 4]>>, RtError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = self.device.poll(three_d::wgpu::PollType::Poll);
+        let mapped = *self.mapped.lock().unwrap_or_else(|e| e.into_inner());
+        match mapped {
+            None => Ok(None),
+            Some(false) => Err(RtError::Gpu(
+                "the final render could not be read from the GPU".to_owned(),
+            )),
+            Some(true) => {
+                let mut colors = Vec::with_capacity((self.width * self.rows) as usize);
+                {
+                    let bytes = self.buffer.slice(..).get_mapped_range();
+                    // three-d draws into textures with v = 0 at wgpu's first row: the top is the last row
+                    for row in bytes.chunks(self.bytes_per_row as usize).rev() {
+                        let row = &row[..(self.width * 4) as usize];
+                        colors.extend(row.as_chunks::<4>().0.iter().copied());
+                    }
+                }
+                self.buffer.unmap();
+                Ok(Some(colors))
+            }
+        }
+    }
 }
 
 /// Rows of a band: those traced, and those of them kept (the others give the denoiser what lies beyond the band).
@@ -225,7 +324,7 @@ impl FinalRender {
         self.is_done().then_some(self.pixels.as_slice())
     }
 
-    /// The image as PNG, once complete.
+    /// The image as PNG, once complete. Only with the feature `export`, which is on by default.
     #[cfg(feature = "export")]
     pub fn png(&self) -> Option<Vec<u8>> {
         use image::ImageEncoder;
@@ -452,21 +551,27 @@ impl FinalRender {
                     None,
                     None,
                 );
-                let reading = target.read_async::<[u8; 4]>();
-                self.work = Some(Work::Reading(Box::pin(reading)));
+                // as_wgpu orders three-d's work before the copy
+                let texture = colors.as_wgpu().expect("a texture of wgpu");
+                self.work = Some(Work::Reading(Reading::start(tracer.gpu(), &texture)));
                 Ok(false)
             }
-            Work::Reading(future) => {
-                let mut waker = std::task::Context::from_waker(std::task::Waker::noop());
-                match future.as_mut().poll(&mut waker) {
-                    std::task::Poll::Ready(colors) => {
-                        self.finish_band(&colors);
-                        Ok(self.is_done())
-                    }
-                    std::task::Poll::Pending => Ok(false),
+            Work::Reading(reading) => match reading.poll()? {
+                Some(colors) => {
+                    self.finish_band(&colors);
+                    Ok(self.is_done())
                 }
-            }
+                None => Ok(false),
+            },
             Work::Cpu { .. } => unreachable!("dropped above"),
         }
     }
+}
+
+/// A final render can be traced on another thread than the one that made it, outside of browsers.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(dead_code)]
+fn final_render_is_send_and_sync() {
+    fn check<T: Send + Sync>() {}
+    check::<FinalRender>();
 }

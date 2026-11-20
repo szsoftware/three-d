@@ -1027,7 +1027,9 @@ impl RaytracePreview {
     /// instead of [RaytracePreview::update] until it returns `true`. It traces on the preview's GPU (also when the
     /// preview went to the CPU because the GPU was too slow for [PreviewSettings::gpu_frame_time]), else on the CPU
     /// with [PreviewSettings::cpu_threads]; while the shaders of the GPU compile it waits for them. The preview's own
-    /// tracing pauses meanwhile and goes on with the next [RaytracePreview::update].
+    /// tracing pauses meanwhile and goes on with the next [RaytracePreview::update]; [RaytracePreview::render] keeps
+    /// showing its last image. For the PNG ([FinalRender::png](crate::FinalRender::png)) the feature `export` must be
+    /// on, which it is by default.
     ///
     pub fn trace_final(
         &mut self,
