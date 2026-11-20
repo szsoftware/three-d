@@ -12,6 +12,9 @@ use three_d::wgpu as w;
 /// Calls measured at once; a call while all of them are still read back is not measured.
 const SLOTS: u32 = 4;
 
+/// Bytes between the resolved timestamps of two calls: queries resolve only to offsets of this alignment.
+const SLOT_BYTES: u64 = w::QUERY_RESOLVE_BUFFER_ALIGNMENT;
+
 /// Timestamps at the beginning and the end of the calls, where the device has timestamp queries.
 #[derive(Debug)]
 pub(super) struct GpuClock {
@@ -48,7 +51,7 @@ impl GpuClock {
         });
         let resolved = device.create_buffer(&w::BufferDescriptor {
             label: Some("ray tracing time"),
-            size: 16 * SLOTS as u64,
+            size: SLOT_BYTES * SLOTS as u64,
             usage: w::BufferUsages::QUERY_RESOLVE | w::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
@@ -96,7 +99,7 @@ impl GpuClock {
 
     /// After the last pass of the call, in the same encoder: copies the timestamps to where they are read.
     pub(super) fn resolve(&self, encoder: &mut w::CommandEncoder, stamp: Stamp) {
-        let at = 16 * stamp.slot as u64;
+        let at = SLOT_BYTES * stamp.slot as u64;
         encoder.resolve_query_set(
             &self.queries,
             2 * stamp.slot..2 * stamp.slot + 2,

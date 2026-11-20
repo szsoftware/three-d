@@ -365,6 +365,13 @@ fn a_slow_application_does_not_make_the_gpu_preview_lighter() {
         gpu_frame_time: None,
         ..*preview.settings()
     });
+    // Several calls at once, each with timestamps of its own
+    for _ in 0..6 {
+        preview.update(&scene, &camera).unwrap();
+    }
+    finish(&context);
+    preview.update(&scene, &camera).unwrap();
+    assert_eq!(preview.availability(), &PreviewAvailability::Gpu);
     for _ in 0..20 {
         if preview.gpu_time().is_some() {
             break;
