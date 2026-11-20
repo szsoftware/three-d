@@ -149,6 +149,8 @@ fn the_final_render_is_a_png() {
         decoded.get_pixel(3, 5).0,
         render.rgba8().unwrap()[(5 * WIDTH + 3) as usize]
     );
+    let pixels = render.rgba8().unwrap().to_vec();
+    assert_eq!(render.into_rgba8(), Some(pixels));
 }
 
 #[test]
