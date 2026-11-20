@@ -15,6 +15,8 @@ use three_d::wgpu as w;
 
 #[cfg(target_arch = "wasm32")]
 mod browser;
+#[cfg(not(target_arch = "wasm32"))]
+mod clock;
 mod denoise_gpu;
 pub(crate) mod timing;
 use three_d_asset::prelude::*;
@@ -146,21 +148,23 @@ pub struct ComputeTracer {
     /// [ComputeTracer::unfinished_calls]
     #[cfg(target_arch = "wasm32")]
     unfinished: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    /// How long the browser's GPU took for the calls of [ComputeTracer::trace_gpu] it finished
-    #[cfg(target_arch = "wasm32")]
+    /// How long the GPU took for the calls of [ComputeTracer::trace_gpu] it finished, see
+    /// [ComputeTracer::take_call_times]
     call_times: std::sync::Arc<std::sync::Mutex<CallTimes>>,
+    /// Outside of browsers: the GPU's time of the calls from timestamp queries, where the device has them
+    #[cfg(not(target_arch = "wasm32"))]
+    clock: Option<clock::GpuClock>,
     /// Calls of [ComputeTracer::trace_gpu] logged so far, see [set_gpu_timing_log]
     timed_calls: u32,
 }
 
-/// How long the browser's GPU took for the calls of [ComputeTracer::trace_gpu], see
-/// [ComputeTracer::take_call_times].
-#[cfg(target_arch = "wasm32")]
+/// How long the GPU took for the calls of [ComputeTracer::trace_gpu], see [ComputeTracer::take_call_times].
 #[derive(Debug, Default)]
 struct CallTimes {
     /// Counted up by [ComputeTracer::restart_call_times]; calls queued before then are not kept
     round: u64,
-    /// When the GPU finished the last call, in milliseconds of `timing::now`
+    /// In the browser: when the GPU finished the last call, in milliseconds of `timing::now`
+    #[cfg(target_arch = "wasm32")]
     last_done: f64,
     /// Milliseconds the GPU took for each call finished since the last take
     finished: Vec<f64>,
@@ -285,8 +289,9 @@ impl ComputeTracer {
             warm: None,
             #[cfg(target_arch = "wasm32")]
             unfinished: Default::default(),
-            #[cfg(target_arch = "wasm32")]
             call_times: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            clock: clock::GpuClock::new(&gpu.device, &gpu.queue),
             timed_calls: 0,
         }
     }
@@ -721,6 +726,27 @@ impl ComputeTracer {
                 ),
             );
         }
+        // The GPU's time of the call, from the beginning of its first pass to the end of its last one
+        #[cfg(not(target_arch = "wasm32"))]
+        let stamp = self
+            .clock
+            .as_ref()
+            .and_then(|clock| Some((clock, clock.begin()?)));
+        #[cfg(not(target_arch = "wasm32"))]
+        let round = self
+            .call_times
+            .lock()
+            .map(|times| times.round)
+            .unwrap_or_default();
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut first_pass = true;
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut writes = |last: bool| {
+            let first = std::mem::replace(&mut first_pass, false);
+            stamp.and_then(|(clock, stamp)| clock.writes(stamp, first, last))
+        };
+        #[cfg(target_arch = "wasm32")]
+        let writes = |_last: bool| None;
         // One submission per sample and tile, so the GPU can go on with other work between them, and only a few at a time
         for s in 0..samples {
             let mut encoder = device.create_command_encoder(&w::CommandEncoderDescriptor {
@@ -735,7 +761,7 @@ impl ComputeTracer {
                 );
                 let mut pass = encoder.begin_compute_pass(&w::ComputePassDescriptor {
                     label: Some("caustic photons"),
-                    timestamp_writes: None,
+                    timestamp_writes: writes(false),
                 });
                 let offset = (s as u64 * tiles.len() as u64 * stride) as u32;
                 pass.set_bind_group(0, bind_group, &[offset]);
@@ -757,10 +783,11 @@ impl ComputeTracer {
                         label: Some("ray tracing"),
                     })
                 });
+                let last = s + 1 == samples && t + 1 == tiles.len();
                 {
                     let mut pass = encoder.begin_compute_pass(&w::ComputePassDescriptor {
                         label: Some("ray tracing"),
-                        timestamp_writes: None,
+                        timestamp_writes: writes(last),
                     });
                     pass.set_pipeline(pipeline);
                     let offset = (s as u64 * tiles.len() as u64 + t as u64) * stride;
@@ -771,7 +798,15 @@ impl ComputeTracer {
                         1,
                     );
                 }
+                #[cfg(not(target_arch = "wasm32"))]
+                if let (true, Some((clock, stamp))) = (last, stamp) {
+                    clock.resolve(&mut encoder, stamp);
+                }
                 submit(&self.gpu, &mut self.in_flight, encoder.finish());
+                #[cfg(not(target_arch = "wasm32"))]
+                if let (true, Some((clock, stamp))) = (last, stamp) {
+                    clock.read(stamp, &self.call_times, round);
+                }
                 if let Some(call) = timed {
                     timing::when_gpu_done(
                         &self.gpu.queue,
@@ -886,20 +921,33 @@ impl ComputeTracer {
     }
 
     ///
-    /// In the browser: milliseconds the GPU took for each call of [ComputeTracer::trace_gpu] finished since the last
-    /// take, oldest first, from when the browser said the work was done. The frames of a browser do not wait for the
-    /// GPU, so the time between them does not tell.
+    /// Whether [ComputeTracer::take_call_times] tells the GPU's time: always in the browser, elsewhere where the device
+    /// has timestamp queries.
     ///
-    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn measures_call_times(&self) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        return true;
+        #[cfg(not(target_arch = "wasm32"))]
+        self.clock.is_some()
+    }
+
+    ///
+    /// Milliseconds the GPU took for each call of [ComputeTracer::trace_gpu] finished since the last take, oldest
+    /// first: in the browser from when it said the work was done (the frames of a browser do not wait for the GPU, so
+    /// the time between them does not tell), elsewhere from timestamps at the beginning and end of the call (the time
+    /// between frames also holds what the application draws and reads back).
+    ///
     pub(crate) fn take_call_times(&self) -> Vec<f64> {
+        // The times arrive when the device is polled
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = self.gpu.device.poll(w::PollType::Poll);
         self.call_times
             .lock()
             .map(|mut times| std::mem::take(&mut times.finished))
             .unwrap_or_default()
     }
 
-    /// In the browser: forgets the times of the calls so far, also of those the GPU has not finished yet.
-    #[cfg(target_arch = "wasm32")]
+    /// Forgets the times of the calls so far, also of those the GPU has not finished yet.
     pub(crate) fn restart_call_times(&self) {
         if let Ok(mut times) = self.call_times.lock() {
             times.round += 1;

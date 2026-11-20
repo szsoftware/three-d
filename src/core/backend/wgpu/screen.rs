@@ -109,8 +109,15 @@ impl WgpuBackend {
         let (device, queue) = adapter
             .request_device(&w::DeviceDescriptor {
                 label: Some("three-d"),
-                // Optional features are used when the adapter has them
-                required_features: adapter.features() & w::Features::FLOAT32_FILTERABLE,
+                // Optional features are used when the adapter has them. Timestamps measure the GPU's own time of
+                // work (the ray tracer's preview paces itself by it); browsers tell when work is done instead
+                required_features: adapter.features()
+                    & (w::Features::FLOAT32_FILTERABLE
+                        | if cfg!(target_arch = "wasm32") {
+                            w::Features::empty()
+                        } else {
+                            w::Features::TIMESTAMP_QUERY
+                        }),
                 ..Default::default()
             })
             .await

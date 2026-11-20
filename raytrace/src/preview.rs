@@ -103,14 +103,15 @@ pub struct PreviewSettings {
     /// The GPU traces at width and height divided by this, at first; see `gpu_frame_time`.
     pub gpu_downscale: u32,
     ///
-    /// Longest time between two updates while the GPU traces. When three frames in a row take longer, the preview
-    /// halves the GPU's resolution (down to a quarter) and, if that is not enough, goes on with the CPU, which traces
-    /// beside the frames. A frame five times longer goes at once to the resolution that would be fast enough, or to the
-    /// CPU; [RaytracePreview::availability] then says why. The first frame after the GPU starts does not count, it
+    /// Longest time the GPU may trace for one update: its own time, from timestamps at the beginning and end of the
+    /// work (in browsers from when the browser says it is done), or, on devices without timestamp queries, the time
+    /// between two updates. When three updates in a row take longer, the preview halves the GPU's resolution (down to a
+    /// quarter) and, if that is not enough, goes on with the CPU, which traces beside the frames. One five times longer
+    /// goes at once to the resolution that would be fast enough, or to the CPU (in browsers it also waits for three in a
+    /// row); [RaytracePreview::availability] then says why. The first update after the GPU starts does not count, it
     /// builds the scene's structures and uses the pipelines for the first time. Weak GPUs such as Intel HD 4000 trace
-    /// no faster than four CPU cores and would hold up every frame. `None` keeps the GPU at `gpu_downscale`. The frames
-    /// of a browser do not wait for the GPU; there it is the time the GPU takes for the work of one update, from when
-    /// the browser says it is done.
+    /// no faster than four CPU cores and would hold up every frame. `None` keeps the GPU at `gpu_downscale`. What the
+    /// application draws and reads back in a frame does not count where the GPU's time is measured.
     ///
     pub gpu_frame_time: Option<std::time::Duration>,
     /// The CPU traces at width and height divided by this, 4 by default and 8 in browsers.
@@ -244,6 +245,8 @@ pub struct RaytracePreview {
     /// Why the image started again the last time, and how many times it did
     last_restart: Option<PreviewRestart>,
     restarts: u64,
+    /// The GPU's time of the newest measured call, see [RaytracePreview::gpu_time]
+    gpu_time: Option<std::time::Duration>,
     settings: PreviewSettings,
     /// What the GPU's resolution is divided by now
     gpu_scale: u32,
@@ -367,16 +370,15 @@ type GpuTracer = Option<Box<crate::ComputeTracer>>;
 #[cfg(not(feature = "wgpu"))]
 type GpuTracer = Option<std::convert::Infallible>;
 
-/// Times of the frames while the GPU traces.
+/// Times of the GPU's work, or of the frames, while the GPU traces.
 #[derive(Default)]
 #[cfg_attr(not(feature = "wgpu"), allow(dead_code))]
 struct Pace {
     #[cfg(not(target_arch = "wasm32"))]
     last: Option<std::time::Instant>,
-    /// In the browser: whether the times of the tracer's calls before this engine were dropped
-    #[cfg(target_arch = "wasm32")]
+    /// Whether the times of the tracer's calls before this engine were dropped
     started: bool,
-    /// Times measured since the engine was made: between frames, in the browser of the GPU's calls
+    /// Times measured since the engine was made: of the GPU's calls, or between frames without timestamps
     frames: u32,
     slow: u32,
 }
@@ -509,6 +511,7 @@ impl RaytracePreview {
             restart_cause: None,
             last_restart: None,
             restarts: 0,
+            gpu_time: None,
             settings,
             gpu_scale,
             pace: Pace::default(),
@@ -657,6 +660,7 @@ impl RaytracePreview {
         if tracer.is_none() {
             if let Some((engine, texture, traced_for)) = self.parked.take() {
                 self.pace = Pace::default();
+                self.gpu_time = None;
                 self.engine = engine;
                 self.texture = texture;
                 self.traced_for = traced_for;
@@ -699,6 +703,7 @@ impl RaytracePreview {
             );
         }
         self.pace = Pace::default();
+        self.gpu_time = None;
         let old_engine = std::mem::replace(&mut self.engine, engine);
         let old_texture = std::mem::replace(&mut self.texture, texture);
         let old_traced_for = self.traced_for.take();
@@ -1045,44 +1050,51 @@ impl RaytracePreview {
     }
 
     ///
-    /// Watches the time between frames while the GPU traces and makes the preview lighter after
-    /// [SLOW_FRAMES] slow frames in a row: half the resolution, down to a quarter, then the CPU. A frame [FAR_TOO_SLOW]
-    /// times slower than the limit goes at once to the resolution that would be fast enough, or to the CPU. In the
-    /// browser, whose frames do not wait for the GPU, the time the GPU took for each call counts instead, and a far too
-    /// slow call also waits for [SLOW_FRAMES] in a row. Returns whether it did.
+    /// Watches the GPU's time of every call (without timestamp queries the time between frames) while the GPU traces
+    /// and makes the preview lighter after [SLOW_FRAMES] slow ones in a row: half the resolution, down to a quarter,
+    /// then the CPU. One [FAR_TOO_SLOW] times slower than the limit goes at once to the resolution that would be fast
+    /// enough, or to the CPU; in the browser it also waits for [SLOW_FRAMES] in a row. Returns whether it did.
     ///
     #[cfg(feature = "wgpu")]
     fn pace_gpu(&mut self) -> bool {
-        let Some(limit) = self.settings.gpu_frame_time else {
+        let limit = self.settings.gpu_frame_time;
+        let tracing = !self.is_done();
+        let Engine::Gpu { tracer, .. } = &self.engine else {
             return false;
         };
-        let tracing = !self.is_done();
-        #[cfg(not(target_arch = "wasm32"))]
-        let decision = self
-            .pace
-            .frame(std::time::Instant::now(), limit, tracing, self.gpu_scale);
-        #[cfg(target_arch = "wasm32")]
-        let decision = {
-            let Engine::Gpu { tracer, .. } = &self.engine else {
-                return false;
-            };
+        let decision = if tracer.measures_call_times() {
+            // The GPU's own time of every call
             if !self.pace.started {
                 // Calls for the engine before, at another resolution, do not count
                 tracer.restart_call_times();
                 self.pace.started = true;
                 return false;
             }
+            // In the browser not at once on one slow call: a hidden page stops its frames, and the browser may tell
+            // late about the at most two calls it still had
+            let at_once = !cfg!(target_arch = "wasm32");
             let mut decision = None;
             for busy in tracer.take_call_times() {
                 let busy = std::time::Duration::from_secs_f64(busy / 1000.0);
-                // Not at once on one slow call: a hidden page stops its frames, and the browser may tell late about
-                // the at most two calls it still had
-                decision = self.pace.step(busy, limit, false, tracing, self.gpu_scale);
-                if decision.is_some() {
-                    break;
+                self.gpu_time = Some(busy);
+                if let (None, Some(limit)) = (&decision, limit) {
+                    decision = self
+                        .pace
+                        .step(busy, limit, at_once, tracing, self.gpu_scale);
                 }
             }
             decision
+        } else {
+            // Without timestamps: the time between frames
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                limit.and_then(|limit| {
+                    self.pace
+                        .frame(std::time::Instant::now(), limit, tracing, self.gpu_scale)
+                })
+            }
+            #[cfg(target_arch = "wasm32")]
+            None
         };
         match decision {
             None => return false,
@@ -1096,6 +1108,19 @@ impl RaytracePreview {
     /// What the GPU's width and height are divided by now, raised by the preview on slow GPUs.
     pub fn gpu_downscale(&self) -> u32 {
         self.gpu_scale
+    }
+
+    ///
+    /// The GPU's own time for the newest update it traced and measured: from timestamps at the beginning and end of the
+    /// work, in browsers from when the browser said it was done. `None` on the CPU, before the first measured update,
+    /// and on devices without timestamp queries. Unlike the time between frames it does not hold what the application
+    /// draws and reads back; [PreviewSettings::gpu_frame_time] is the limit for it.
+    ///
+    pub fn gpu_time(&self) -> Option<std::time::Duration> {
+        if self.on_cpu() {
+            return None;
+        }
+        self.gpu_time
     }
 
     ///

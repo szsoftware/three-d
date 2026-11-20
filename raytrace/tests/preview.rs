@@ -351,6 +351,49 @@ fn a_slow_gpu_gets_a_lighter_preview() {
 }
 
 #[test]
+fn a_slow_application_does_not_make_the_gpu_preview_lighter() {
+    let Some(context) = context() else { return };
+    let mut preview = RaytracePreview::new(&context, 64, 32);
+    preview.wait_for_gpu();
+    if preview.kind() != TracerKind::Compute {
+        return;
+    }
+    let scene = sky_only(1000.0);
+    let camera = camera(64, 32, vec3(0.0, 0.0, 0.0));
+    // The GPU's own time, where the device has timestamp queries
+    preview.set_settings(PreviewSettings {
+        gpu_frame_time: None,
+        ..*preview.settings()
+    });
+    for _ in 0..20 {
+        if preview.gpu_time().is_some() {
+            break;
+        }
+        preview.update(&scene, &camera).unwrap();
+        finish(&context);
+    }
+    let Some(gpu_time) = preview.gpu_time() else {
+        eprintln!("skipped, the device has no timestamp queries");
+        return;
+    };
+    // Frames of the application take longer than the limit, the GPU's work is far below it
+    let limit = (gpu_time * 20).max(std::time::Duration::from_millis(50));
+    preview.set_settings(PreviewSettings {
+        gpu_frame_time: Some(limit),
+        ..*preview.settings()
+    });
+    for _ in 0..5 {
+        preview.update(&scene, &camera).unwrap();
+        std::thread::sleep(limit * 3 / 2);
+    }
+    finish(&context);
+    preview.update(&scene, &camera).unwrap();
+    assert_eq!(preview.kind(), TracerKind::Compute);
+    assert_eq!(preview.gpu_downscale(), 1);
+    assert!(preview.gpu_time().is_some_and(|time| time < limit));
+}
+
+#[test]
 fn the_cpu_goes_on_after_the_gpu_changed_its_resolution() {
     let Some(context) = context() else { return };
     let mut preview = RaytracePreview::new(&context, 64, 32);
