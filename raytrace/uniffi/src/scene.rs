@@ -128,14 +128,7 @@ impl Scene {
                 bytes.len()
             )));
         }
-        let mut texture = RtTexture::new(
-            width,
-            height,
-            bytes
-                .chunks_exact(4)
-                .map(|c| [c[0], c[1], c[2], c[3]])
-                .collect(),
-        );
+        let mut texture = RtTexture::new(width, height, bytes.as_chunks::<4>().0.to_vec());
         texture.linear = !srgb;
         Ok(self.lock().scene.add_texture(texture).0)
     }
@@ -198,7 +191,7 @@ impl Scene {
         }
         let mut s = self.lock();
         let first = s.scene.instances().len() as u32;
-        for chunk in values.chunks_exact(16) {
+        for chunk in values.as_chunks::<16>().0 {
             s.scene
                 .add_instance(MeshId(mesh), MaterialId(material), mat4(chunk)?)?;
         }
@@ -367,7 +360,9 @@ pub(crate) fn cpu_mesh(
     }
     let v3 = |values: Vec<f32>| -> Vec<Vec3> {
         values
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|c| Vec3::new(c[0], c[1], c[2]))
             .collect()
     };
@@ -377,7 +372,9 @@ pub(crate) fn cpu_mesh(
         normals: normals.map(v3),
         uvs: uvs.map(|values| {
             values
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| Vec2::new(c[0], c[1]))
                 .collect()
         }),
