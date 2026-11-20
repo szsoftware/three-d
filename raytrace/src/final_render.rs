@@ -324,6 +324,14 @@ impl FinalRender {
         self.is_done().then_some(self.pixels.as_slice())
     }
 
+    ///
+    /// The 8 bit sRGB colors, rows from the top, taken out of the final render without a copy, once the image is
+    /// complete; `None` before. For handing the pixels on as they are, for example to a buffer that owns them.
+    ///
+    pub fn into_rgba8(self) -> Option<Vec<[u8; 4]>> {
+        self.is_done().then_some(self.pixels)
+    }
+
     /// The image as PNG, once complete. Only with the feature `export`, which is on by default.
     #[cfg(feature = "export")]
     pub fn png(&self) -> Option<Vec<u8>> {
