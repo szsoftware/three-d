@@ -17,6 +17,8 @@ wgpu = ["three-d", "three-d/wgsl", "dep:wgpu", "dep:js-sys", "dep:wasm-bindgen",
 
 [dependencies]
 three-d-asset = "0.10"
+# Diagnostics through the logger of the application where one is installed
+log = "0.4"
 three-d = { path = "..", default-features = false, optional = true }
 image = { version = "0.25", default-features = false, features = ["png", "exr"], optional = true }
 # Only to let wgpu read the WGSL of the compute tracer, the same wgpu as three-d's
@@ -35,6 +37,7 @@ wasm-bindgen-futures = { version = "0.4", optional = true }
 libc = "0.2"
 
 [dev-dependencies]
+log = { version = "0.4", features = ["std"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 naga = { version = "29", features = ["wgsl-in"] }
 
