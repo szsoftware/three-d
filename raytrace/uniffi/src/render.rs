@@ -134,6 +134,7 @@ impl Renderer {
             renderer: self,
             scene,
             render: ThreadBound::new(render),
+            source: PhotoSource::Renderer,
         }))
     }
 
@@ -165,6 +166,7 @@ impl Renderer {
             state: ThreadBound::new(PreviewJobState {
                 preview: state,
                 camera,
+                photo: false,
             }),
         }))
     }
@@ -273,21 +275,74 @@ pub struct FinalJob {
     renderer: Arc<Renderer>,
     scene: Arc<Scene>,
     render: ThreadBound<FinalRender>,
+    /// The preview whose GPU traces the photo, when it goes on with that preview's samples
+    source: PhotoSource,
+}
+
+impl FinalJob {
+    pub(crate) fn new(
+        renderer: Arc<Renderer>,
+        scene: Arc<Scene>,
+        render: FinalRender,
+        source: PhotoSource,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            renderer,
+            scene,
+            render: ThreadBound::new(render),
+            source,
+        })
+    }
+}
+
+/// Which engine traces a final render.
+pub(crate) enum PhotoSource {
+    /// The renderer's own
+    Renderer,
+    /// The engine of a raytraced preview, whose image the photo goes on with
+    Preview(Arc<PreviewJob>),
+    /// The raytraced preview of a realtime view
+    View(Arc<crate::view::SceneView>),
 }
 
 #[uniffi::export]
 impl FinalJob {
     /// Traces for about the step time; true when the image is complete.
     pub fn step(&self) -> Result<bool, RtFfiError> {
-        let done = self.render.with(|render| {
-            self.renderer.state.with(|s| {
+        let on_renderer = |render: &mut FinalRender| -> Result<bool, RtFfiError> {
+            let done = self.renderer.state.with(|s| {
                 self.scene.with_rt(|scene| match &mut s.engine {
                     Some(engine) => engine.trace_final(scene, render),
                     None => render.trace_cpu(scene, s.cpu_threads),
                 })
-            })
-        })??;
-        Ok(done?)
+            })?;
+            Ok(done?)
+        };
+        self.render.with(|render| match &self.source {
+            PhotoSource::Renderer => on_renderer(render),
+            PhotoSource::Preview(job) => {
+                let done = job.state.with(|s| {
+                    let done = self
+                        .scene
+                        .with_rt(|scene| s.preview.preview.trace_final(scene, render));
+                    s.photo = matches!(done, Ok(false));
+                    done
+                })?;
+                Ok(done?)
+            }
+            PhotoSource::View(view) => {
+                match view.trace_photo(&self.scene, render)? {
+                    Some(done) => Ok(done),
+                    // The view's preview is gone (a new look): the renderer goes on
+                    None => on_renderer(render),
+                }
+            }
+        })?
+    }
+
+    /// Whether the photo went on with the samples of a preview, see [PreviewJob::photo] and [SceneView::photo].
+    pub fn continues_preview(&self) -> bool {
+        self.render.with(|r| r.continues_preview()).unwrap_or(false)
     }
 
     /// From 0 to 1.
@@ -350,14 +405,16 @@ pub struct Frame {
 /// A raytraced preview, see [Renderer::preview].
 #[derive(uniffi::Object)]
 pub struct PreviewJob {
-    renderer: Arc<Renderer>,
+    pub(crate) renderer: Arc<Renderer>,
     scene: Arc<Scene>,
-    state: ThreadBound<PreviewJobState>,
+    pub(crate) state: ThreadBound<PreviewJobState>,
 }
 
-struct PreviewJobState {
+pub(crate) struct PreviewJobState {
     preview: PreviewState,
     camera: CameraSpec,
+    /// A photo traces on this preview's engine: the preview waits
+    photo: bool,
 }
 
 /// A raytrace preview with the texture it is drawn into in sRGB and a ring of three buffers to read it into.
@@ -444,9 +501,42 @@ impl PreviewJob {
     pub fn next_frame(&self) -> Result<Option<Frame>, RtFfiError> {
         let _ = &self.renderer;
         self.state.with(|s| {
+            if s.photo {
+                // The photo traces on this preview's engine: the image stays as it is
+                return Ok(None);
+            }
             let camera = s.camera;
             s.preview.update(&self.scene, &camera)
         })?
+    }
+
+    /// Everything a display of the preview needs, from the moment after the last [PreviewJob::next_frame].
+    pub fn status(&self) -> Result<PreviewStatus, RtFfiError> {
+        self.state.with(|s| PreviewStatus::of(&s.preview.preview))
+    }
+
+    ///
+    /// A photo of the preview in its size that goes on with the samples it has, up to `samples` per pixel: no
+    /// shaders to wait for, no samples traced twice. `None` where there is nothing to go on with (the preview traces on
+    /// the CPU, at a lower resolution, or has no image yet): then [Renderer::final_render] with the same camera and
+    /// size. Step it every frame instead of [PreviewJob::next_frame]; the preview keeps its image meanwhile.
+    ///
+    pub fn photo(
+        self: Arc<Self>,
+        samples: u32,
+        step_ms: u32,
+    ) -> Result<Option<Arc<FinalJob>>, RtFfiError> {
+        let render = self
+            .state
+            .with(|s| photo_of(&s.preview.preview, samples, step_ms))?;
+        Ok(render.map(|render| {
+            FinalJob::new(
+                self.renderer.clone(),
+                self.scene.clone(),
+                render,
+                PhotoSource::Preview(self.clone()),
+            )
+        }))
     }
 
     /// GPU or CPU and why, for a tooltip.
@@ -603,4 +693,125 @@ pub(crate) fn rgba_texture(context: &Context, width: u32, height: u32) -> Textur
         three_d::Wrapping::ClampToEdge,
         three_d::Wrapping::ClampToEdge,
     )
+}
+
+/// A photo that goes on with the samples of a preview, `None` where it cannot.
+pub(crate) fn photo_of(
+    preview: &RaytracePreview,
+    samples: u32,
+    step_ms: u32,
+) -> Option<FinalRender> {
+    #[cfg(feature = "gpu")]
+    {
+        FinalRender::from_preview(preview, samples.max(1))
+            .map(|r| r.with_frame_time(Duration::from_millis(step_ms.max(1) as u64)))
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = (preview, samples, step_ms);
+        None
+    }
+}
+
+/// What traces a raytraced preview.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum TracerKind {
+    /// On the CPU
+    Cpu,
+    /// In compute shaders on the GPU
+    Compute,
+    /// With the ray queries of a GPU that traces rays
+    RayQuery,
+}
+
+/// Why a raytraced preview started its image again; every restart forgets the samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum PreviewRestart {
+    /// The first image
+    First,
+    /// The camera moved or turned
+    Camera,
+    /// The view has another size
+    Viewport,
+    /// The scene changed
+    Scene,
+    /// The preview was resized
+    Resize,
+    /// Settings that change the image
+    Settings,
+    /// Another engine: the GPU once its shaders compiled, a lower GPU resolution, or the CPU
+    Engine,
+}
+
+///
+/// Everything a display of a raytraced preview needs, from the same moment, so that Kotlin counts nothing itself.
+///
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct PreviewStatus {
+    /// What traces
+    pub tracer: TracerKind,
+    /// Why only the CPU can trace, `None` where the GPU can
+    pub cpu_reason: Option<String>,
+    /// Whether the GPU's shaders still compile (the CPU traces meanwhile)
+    pub compiling: bool,
+    /// Samples every pixel of the image shown has
+    pub samples: u32,
+    /// Samples the image ends with
+    pub max_samples: u32,
+    /// Whether the image is done and does not change any more
+    pub done: bool,
+    /// Size of the image shown, in pixels (smaller than the view while the GPU or CPU traces at a lower resolution)
+    pub width: u32,
+    pub height: u32,
+    /// Size of the preview on screen
+    pub full_width: u32,
+    pub full_height: u32,
+    /// The GPU's time of the newest measured update, in milliseconds
+    pub gpu_time_ms: Option<f32>,
+    /// How many times the image started
+    pub restarts: u64,
+    /// Why it started the last time
+    pub last_restart: Option<PreviewRestart>,
+    /// Milliseconds since the image started, up to when it was done
+    pub elapsed_ms: u64,
+    /// Milliseconds still needed for `max_samples`, `None` before the first sample
+    pub remaining_ms: Option<u64>,
+}
+
+impl PreviewStatus {
+    pub(crate) fn of(preview: &RaytracePreview) -> Self {
+        let s = preview.status();
+        Self {
+            tracer: match s.kind {
+                three_d_raytrace::TracerKind::CpuReference => TracerKind::Cpu,
+                three_d_raytrace::TracerKind::Compute => TracerKind::Compute,
+                three_d_raytrace::TracerKind::RayQuery => TracerKind::RayQuery,
+            },
+            cpu_reason: match s.availability {
+                three_d_raytrace::PreviewAvailability::Gpu => None,
+                three_d_raytrace::PreviewAvailability::CpuOnly(why) => Some(why),
+            },
+            compiling: s.compiling,
+            samples: s.samples,
+            max_samples: s.max_samples,
+            done: s.done,
+            width: s.width,
+            height: s.height,
+            full_width: s.full_width,
+            full_height: s.full_height,
+            gpu_time_ms: s.gpu_time.map(|d| d.as_secs_f32() * 1000.0),
+            restarts: s.restarts,
+            last_restart: s.last_restart.map(|r| match r {
+                three_d_raytrace::PreviewRestart::First => PreviewRestart::First,
+                three_d_raytrace::PreviewRestart::Camera => PreviewRestart::Camera,
+                three_d_raytrace::PreviewRestart::Viewport => PreviewRestart::Viewport,
+                three_d_raytrace::PreviewRestart::Scene => PreviewRestart::Scene,
+                three_d_raytrace::PreviewRestart::Resize => PreviewRestart::Resize,
+                three_d_raytrace::PreviewRestart::Settings => PreviewRestart::Settings,
+                three_d_raytrace::PreviewRestart::Engine => PreviewRestart::Engine,
+            }),
+            elapsed_ms: s.elapsed.as_millis() as u64,
+            remaining_ms: s.remaining.map(|d| d.as_millis() as u64),
+        }
+    }
 }
