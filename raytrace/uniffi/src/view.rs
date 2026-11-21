@@ -80,7 +80,8 @@ pub enum InputEvent {
         /// Steps.
         delta: f32,
     },
-    /// A key went down or up: "W", "A", "S", "D", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Shift".
+    /// A key went down or up: "W", "A", "S", "D" walk, "Shift" runs, "ArrowLeft"/"ArrowRight" turn and
+    /// "ArrowUp"/"ArrowDown" tilt the view (in [Navigation::Walk]).
     Key {
         /// The key.
         key: String,
@@ -250,13 +251,25 @@ impl SceneView {
         })
     }
 
-    /// Raster settings and the exposure.
+    /// Raster settings and the exposure. Only what changed is rebuilt: a new shadow map size or look rebuilds the
+    /// raster objects (and a new look the raytraced preview), `raytrace_when_still_ms` alone costs nothing.
     pub fn set_realtime(&self, realtime: RealtimeSpec) -> Result<(), RtFfiError> {
         self.state.with(|s| {
+            let old = s.realtime;
             s.realtime = realtime;
-            s.revision = u64::MAX;
-            s.raytrace = None;
+            if realtime.sun_shadow_map != old.sun_shadow_map || realtime.look != old.look {
+                s.revision = u64::MAX;
+            }
+            if realtime.look != old.look {
+                s.raytrace = None;
+            }
         })
+    }
+
+    /// When the raytraced preview takes over: after the camera stood still this long, `None` never (only the
+    /// rasterizer). A switch for a button; costs nothing, the preview keeps its samples while the camera does not move.
+    pub fn set_raytrace_when_still(&self, ms: Option<u32>) -> Result<(), RtFfiError> {
+        self.state.with(|s| s.realtime.raytrace_when_still_ms = ms)
     }
 
     /// Hands an event to the camera control; true if it moves the camera.
@@ -330,6 +343,10 @@ impl SceneView {
     }
 }
 
+/// How fast the arrow keys turn the view (radians per second, a quarter turn in a second) and tilt it.
+const TURN_PER_SECOND: f32 = std::f32::consts::FRAC_PI_2;
+const TILT_PER_SECOND: f32 = 0.8;
+
 impl ViewState {
     fn changed(&mut self) {
         self.last_change = Instant::now();
@@ -398,19 +415,8 @@ impl ViewState {
                     ..
                 } => {
                     // Looking around: turn around the vertical axis and tilt, the eyes stay where they are
-                    let (eye, target, up) = (
-                        self.camera.position(),
-                        self.camera.target(),
-                        self.camera.up(),
-                    );
-                    let dir = (target - eye).normalize();
-                    let yaw = -delta.0 * 0.003;
-                    let (sin, cos) = yaw.sin_cos();
-                    let turned = vec3(dir.x * cos - dir.z * sin, 0.0, dir.x * sin + dir.z * cos);
-                    let pitch: f32 = (dir.y - delta.1 * 0.003).clamp(-0.95, 0.95);
-                    let flat = turned.normalize() * (1.0 - pitch * pitch).sqrt();
-                    self.camera
-                        .set_view(eye, eye + vec3(flat.x, pitch, flat.z), up);
+                    let (yaw, tilt) = (-delta.0 * 0.003, -delta.1 * 0.003);
+                    self.look_around(yaw, tilt);
                     true
                 }
                 _ => false,
@@ -422,6 +428,23 @@ impl ViewState {
         moved
     }
 
+    /// Turns the view by `yaw` radians around the vertical axis and tilts it by `tilt` (the height of the view
+    /// direction, between -0.95 and 0.95); the eyes stay where they are.
+    fn look_around(&mut self, yaw: f32, tilt: f32) {
+        let (eye, target, up) = (
+            self.camera.position(),
+            self.camera.target(),
+            self.camera.up(),
+        );
+        let dir = (target - eye).normalize();
+        let (sin, cos) = yaw.sin_cos();
+        let turned = vec3(dir.x * cos - dir.z * sin, 0.0, dir.x * sin + dir.z * cos);
+        let pitch: f32 = (dir.y + tilt).clamp(-0.95, 0.95);
+        let flat = turned.normalize() * (1.0 - pitch * pitch).sqrt();
+        self.camera
+            .set_view(eye, eye + vec3(flat.x, pitch, flat.z), up);
+    }
+
     /// Walking with the keys held, at the time since the last frame.
     fn walk(&mut self, seconds: f32) {
         let Navigation::Walk { eye_height, speed } = self.navigation else {
@@ -430,32 +453,44 @@ impl ViewState {
         if self.keys.is_empty() {
             return;
         }
+        let held = |k: &str| self.keys.contains(k);
+        // The arrow keys look around, as the mouse does: left and right turn, up and down tilt
+        let seconds = seconds.min(0.1);
+        let turn = (held("ArrowLeft") as i32 - held("ArrowRight") as i32) as f32;
+        let tilt = (held("ArrowUp") as i32 - held("ArrowDown") as i32) as f32;
+        if turn != 0.0 || tilt != 0.0 {
+            self.look_around(
+                -turn * TURN_PER_SECOND * seconds,
+                tilt * TILT_PER_SECOND * seconds,
+            );
+            self.changed();
+        }
         let (eye, target, up) = (
             self.camera.position(),
             self.camera.target(),
             self.camera.up(),
         );
+        let held = |k: &str| self.keys.contains(k);
         let forward = vec3(target.x - eye.x, 0.0, target.z - eye.z).normalize();
         let right = forward.cross(vec3(0.0, 1.0, 0.0));
-        let held = |k: &[&str]| k.iter().any(|k| self.keys.contains(*k));
         let mut step = vec3(0.0, 0.0, 0.0);
-        if held(&["W", "ArrowUp"]) {
+        if held("W") {
             step += forward;
         }
-        if held(&["S", "ArrowDown"]) {
+        if held("S") {
             step -= forward;
         }
-        if held(&["D", "ArrowRight"]) {
+        if held("D") {
             step += right;
         }
-        if held(&["A", "ArrowLeft"]) {
+        if held("A") {
             step -= right;
         }
         if step.magnitude2() == 0.0 {
             return;
         }
-        let run = if held(&["Shift"]) { 3.0 } else { 1.0 };
-        let mut v = step.normalize() * speed * run * seconds.min(0.1);
+        let run = if held("Shift") { 3.0 } else { 1.0 };
+        let mut v = step.normalize() * speed * run * seconds;
         v.y = eye_height - eye.y;
         self.camera.set_view(eye + v, target + v, up);
         self.changed();

@@ -485,6 +485,57 @@ fn realtime_view_preview_and_pick_on_the_gpu() {
     view.next_frame().unwrap();
     let walked = view.camera().unwrap();
     assert!((walked.eye.y - 1.6).abs() < 1e-4);
+    view.input(InputEvent::Key {
+        key: "W".to_owned(),
+        down: false,
+    })
+    .unwrap();
+
+    // The arrow keys turn the view where the eyes are: left turns to the left
+    let key = |key: &str, down: bool| {
+        view.input(InputEvent::Key {
+            key: key.to_owned(),
+            down,
+        })
+        .unwrap()
+    };
+    key("ArrowLeft", true);
+    view.next_frame().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    view.next_frame().unwrap();
+    key("ArrowLeft", false);
+    let turned = view.camera().unwrap();
+    assert_eq!(turned.eye, walked.eye, "turning does not move the eyes");
+    let dir = |c: &CameraSpec| {
+        let (x, z) = (c.target.x - c.eye.x, c.target.z - c.eye.z);
+        let n = (x * x + z * z).sqrt();
+        (x / n, z / n)
+    };
+    let (before, after) = (dir(&walked), dir(&turned));
+    // Seen from above (y up, right-handed), a turn to the left is counterclockwise around +y: cross(before, after).y > 0
+    let cross_y = before.1 * after.0 - before.0 * after.1;
+    assert!(
+        cross_y > 1e-3,
+        "turned to the left: {before:?} -> {after:?}"
+    );
+
+    // The switch for the raytraced preview costs nothing and takes over when the camera stands still
+    view.set_raytrace_when_still(Some(0)).unwrap();
+    let mut traced = false;
+    for _ in 0..200 {
+        if view.next_frame().unwrap().samples > 0 {
+            traced = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(traced, "the preview took over");
+    view.set_raytrace_when_still(None).unwrap();
+    assert_eq!(
+        view.next_frame().unwrap().samples,
+        0,
+        "back to the rasterizer"
+    );
 
     let preview = renderer
         .clone()
