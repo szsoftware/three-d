@@ -822,6 +822,7 @@ fn shadow_hit(index: u32, m: Material, p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f3
     return max(max(transmittance.x, transmittance.y), transmittance.z) <= 0.0;
 }
 
+// BEGIN TRAVERSAL: the hierarchies in storage buffers, replaced by walk_ray_query.wgsl for hardware ray queries
 // Traverses the hierarchy of one instance's mesh, the ray in mesh coordinates. Returns true to stop.
 fn walk_mesh(index: u32, o: vec3<f32>, d: vec3<f32>, t_max: ptr<function, f32>, hit: ptr<function, Hit>, shadow: bool) -> bool {
     // Only the fields needed: whole instances (two matrices) kept during the traversal take many registers
@@ -984,6 +985,8 @@ fn walk(o: vec3<f32>, d: vec3<f32>, t_max_in: f32, shadow: bool) -> Hit {
     }
     return hit;
 }
+
+// END TRAVERSAL
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Surfaces

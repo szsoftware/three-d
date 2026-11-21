@@ -83,6 +83,10 @@ jobs:
       - if: startsWith(matrix.os, 'ubuntu')
         run: echo "VK_ICD_FILENAMES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -1)" >> $GITHUB_ENV
 
+      # Lavapipe has hardware ray queries (in software), so the tracer with them is compared with the one without
+      - if: startsWith(matrix.os, 'ubuntu')
+        run: echo "THREE_D_REQUIRE_RAY_QUERY=1" >> $GITHUB_ENV
+
       # macOS tests the wgpu backend on Metal and Windows on DirectX 12 (software adapter), both against what OpenGL returned on Linux
       - if: startsWith(matrix.os, 'macos')
         run: echo "THREE_D_EXPECT_BACKEND=metal" >> $GITHUB_ENV

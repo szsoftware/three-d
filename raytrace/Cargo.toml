@@ -52,3 +52,7 @@ required-features = ["wgpu"]
 [[example]]
 name = "print"
 required-features = ["wgpu"]
+
+[[example]]
+name = "ray_query_bench"
+required-features = ["wgpu"]
