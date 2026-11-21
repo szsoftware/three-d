@@ -152,6 +152,13 @@ denoised, tone mapped and read back on the GPU; without a GPU, `trace_final` tra
 view widens or narrows to the aspect of the print. `cargo run --release -p three-d-raytrace --features wgpu --example
 print -- pergola 256` writes A4 at 300 dpi as PNG.
 
+For a display next to the preview, `RaytracePreview::status()` returns everything from the same moment: samples
+and maximum, done, size of the image shown and on screen, tracer, compiling, GPU time, restarts with the last reason,
+time since the start and an estimate of the time left. A photo of the view on screen can go on with the preview's
+samples: `FinalRender::from_preview(&preview, samples)` copies the GPU's image at the full resolution with its camera
+and settings and traces on to `samples`, giving the same photo as one traced from the start. It returns `None` where
+the preview traces on the CPU or at a lower resolution; `FinalRender::new` then starts anew.
+
 ## Denoising
 
 ```rust

@@ -314,4 +314,134 @@ mod gpu {
         let (top, bottom) = (green(0..3), green(height - 3..height));
         assert!(top > bottom + 50.0, "{name}: top {top} bottom {bottom}");
     }
+
+    /// A preview at the full resolution on the GPU, without a denoiser, after some samples; `None` without compute.
+    fn preview_with_samples(
+        context: &Context,
+        scene: &RtScene,
+        samples: u32,
+    ) -> Option<RaytracePreview> {
+        let mut preview = RaytracePreview::new(context, 40, 30);
+        preview.wait_for_gpu();
+        if preview.kind() != TracerKind::Compute {
+            eprintln!("skipped, the preview runs on the CPU");
+            return None;
+        }
+        preview.set_settings(PreviewSettings {
+            gpu_frame_time: None,
+            denoiser: None,
+            max_samples: samples,
+            tone_mapping: TONE,
+            ..*preview.settings()
+        });
+        let mut camera = camera();
+        camera.set_viewport(Viewport::new_at_origo(40, 30));
+        for _ in 0..10_000 {
+            preview.update(scene, &camera).unwrap();
+            // As a frame of an application would, which presents its surface
+            if let Some(gpu) = GpuDevice::from_context(context) {
+                let _ = gpu
+                    .device
+                    .poll(three_d::wgpu::PollType::wait_indefinitely());
+            }
+            if preview.is_done() {
+                break;
+            }
+        }
+        assert_eq!(preview.sample_count(), samples);
+        Some(preview)
+    }
+
+    #[test]
+    fn a_photo_goes_on_with_the_samples_of_the_preview() {
+        let Some(context) = context() else { return };
+        let scene = scene();
+        let Some(mut preview) = preview_with_samples(&context, &scene, 3) else {
+            return;
+        };
+        let continued = FinalRender::from_preview(&preview, 8).expect("full resolution on the GPU");
+        assert!(continued.continues_preview());
+        assert_eq!((continued.width(), continued.height()), (40, 30));
+        // Already 3 of 8 samples
+        assert!(continued.progress() > 0.3, "{}", continued.progress());
+        let continued = on_gpu(&mut preview, continued);
+        // The same photo traced from the start
+        let mut camera = camera();
+        camera.set_viewport(Viewport::new_at_origo(40, 30));
+        let fresh = FinalRender::new(&camera, 40, 30, 8)
+            .with_tone_mapping(TONE)
+            .with_denoiser(None)
+            .with_settings(TraceSettings {
+                max_bounces: preview.settings().max_bounces,
+                caustic_photons: preview.settings().gpu_caustic_photons,
+                ..Default::default()
+            });
+        let fresh = on_gpu(&mut preview, fresh);
+        let largest = continued
+            .rgba8()
+            .unwrap()
+            .iter()
+            .zip(fresh.rgba8().unwrap())
+            .flat_map(|(a, b)| (0..3).map(move |c| a[c].abs_diff(b[c])))
+            .max()
+            .unwrap();
+        assert!(largest <= 1, "the photos differ by {largest}");
+        // The preview keeps its image
+        assert_eq!(preview.sample_count(), 3);
+    }
+
+    #[test]
+    fn a_photo_of_a_preview_on_the_cpu_starts_anew() {
+        let Some(context) = context() else { return };
+        let mut preview = RaytracePreview::new_on_cpu(&context, 40, 30);
+        preview.update(&scene(), &camera()).unwrap();
+        assert!(FinalRender::from_preview(&preview, 8).is_none());
+    }
+
+    #[test]
+    fn the_status_tells_samples_size_and_times_from_the_same_moment() {
+        let Some(context) = context() else { return };
+        let scene = scene();
+        let Some(mut preview) = preview_with_samples(&context, &scene, 4) else {
+            return;
+        };
+        let status = preview.status();
+        assert_eq!(status.kind, TracerKind::Compute);
+        assert!(!status.compiling);
+        assert_eq!((status.samples, status.max_samples), (4, 4));
+        assert!(status.done);
+        assert_eq!((status.width, status.height), (40, 30));
+        assert_eq!((status.full_width, status.full_height), (40, 30));
+        // The change of the limit in preview_with_samples started the image once more
+        assert!(status.restarts >= 1);
+        assert!(status.last_restart.is_some());
+        let restarts = status.restarts;
+        assert_eq!(status.remaining, Some(std::time::Duration::ZERO));
+        // Done: the time stands still
+        preview.update(&scene, &camera_40x30()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(preview.status().elapsed, status.elapsed);
+        // More samples asked for: not done, the time goes on and there is an estimate
+        preview.set_settings(PreviewSettings {
+            max_samples: 6,
+            ..*preview.settings()
+        });
+        preview.update(&scene, &camera_40x30()).unwrap();
+        let status = preview.status();
+        assert!(!status.done || status.samples == 6);
+        assert!(status.remaining.is_some());
+        // A camera that moves starts again
+        let mut moved = camera_40x30();
+        moved.rotate_around_with_fixed_up(vec3(0.0, 1.0, -1.0), 0.1, 0.0);
+        preview.update(&scene, &moved).unwrap();
+        let status = preview.status();
+        assert_eq!(status.restarts, restarts + 1);
+        assert_eq!(status.last_restart, Some(PreviewRestart::Camera));
+    }
+
+    fn camera_40x30() -> Camera {
+        let mut camera = camera();
+        camera.set_viewport(Viewport::new_at_origo(40, 30));
+        camera
+    }
 }

@@ -68,6 +68,8 @@ pub struct FinalRender {
     total: u64,
     started: Option<Instant>,
     cpu: Option<CpuReferenceTracer>,
+    /// Whether it went on with the samples of a preview
+    continued: bool,
 }
 
 /// The band in progress.
@@ -215,9 +217,53 @@ impl FinalRender {
             total: 0,
             started: None,
             cpu: None,
+            continued: false,
         };
         render.count();
         render
+    }
+
+    ///
+    /// A final render that goes on with the samples of a preview on the GPU, for a photo of the view on screen: in the
+    /// preview's size at the full resolution, with its camera, bounces, caustic photons, depth of field, tone mapping
+    /// and denoiser, up to `samples` per pixel (at least the samples it has). The random numbers depend only on pixel
+    /// and sample, so the photo is the same as one traced from the start.
+    ///
+    /// `None` where there is nothing to go on with: the preview traces on the CPU, has no image yet, or its GPU traces
+    /// at a lower resolution and has not begun the full one (see
+    /// [PreviewSettings::gpu_sharp_when_still](crate::PreviewSettings::gpu_sharp_when_still)). Then
+    /// [FinalRender::new] with the same camera traces the photo from the start. The preview keeps its own image.
+    ///
+    #[cfg(feature = "wgpu")]
+    pub fn from_preview(preview: &crate::RaytracePreview, samples: u32) -> Option<Self> {
+        let (image, camera, settings, tile_ms) = preview.full_resolution_image()?;
+        let preview_settings = preview.settings();
+        let mut render = Self::new(
+            &camera,
+            image.width(),
+            image.height(),
+            samples.max(image.sample_count()),
+        )
+        .with_settings(settings)
+        .with_tone_mapping(preview_settings.tone_mapping)
+        .with_denoiser(if image.has_features() {
+            preview_settings.denoiser
+        } else {
+            None
+        })
+        // One band: the whole image, as the preview traced it
+        .with_band_pixels(u32::MAX);
+        render.work = Some(Work::Gpu {
+            image: image.duplicate(),
+            tile_ms,
+        });
+        render.continued = true;
+        Some(render)
+    }
+
+    /// Whether the final render went on with the samples of a preview, see [FinalRender::from_preview].
+    pub fn continues_preview(&self) -> bool {
+        self.continued
     }
 
     /// Bounces, caustic photons, depth of field and seed; samples per call and view region are the renderer's.
