@@ -52,6 +52,49 @@ pub enum PreviewRestart {
     Engine,
 }
 
+///
+/// What a preview shows and how far it is, all from the same moment, for a display next to the image; see
+/// [RaytracePreview::status]. Taking every number from here, right after [RaytracePreview::update], keeps them in step
+/// with each other and with the image.
+///
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreviewStatus {
+    /// What traces: the GPU or the CPU
+    pub kind: TracerKind,
+    /// What the context can run, with the reason to show
+    pub availability: PreviewAvailability,
+    /// Whether the GPU's shaders still compile (the CPU traces meanwhile)
+    pub compiling: bool,
+    /// Samples every pixel of the image shown has
+    pub samples: u32,
+    /// Samples the image ends with, [PreviewSettings::max_samples]
+    pub max_samples: u32,
+    /// Whether the image is done and does not change any more
+    pub done: bool,
+    /// Width of the image shown, in pixels
+    pub width: u32,
+    /// Height of the image shown, in pixels
+    pub height: u32,
+    /// Width of the preview on screen, which the image has at the full resolution
+    pub full_width: u32,
+    /// Height of the preview on screen
+    pub full_height: u32,
+    /// The GPU's time of the newest measured update, see [RaytracePreview::gpu_time]
+    pub gpu_time: Option<std::time::Duration>,
+    /// How many times the image started, see [RaytracePreview::restarts]
+    pub restarts: u64,
+    /// Why it started the last time, see [RaytracePreview::last_restart]
+    pub last_restart: Option<PreviewRestart>,
+    /// Time since the image started, up to when it was done
+    pub elapsed: std::time::Duration,
+    ///
+    /// Time still needed for [PreviewStatus::max_samples] at the pace of the image shown so far; `None` before its
+    /// first sample. Once the image at the full resolution is shown (see [PreviewSettings::gpu_sharp_when_still]) its
+    /// samples count from 4 on and the estimate is for it.
+    ///
+    pub remaining: Option<std::time::Duration>,
+}
+
 impl PreviewAvailability {
     /// What a context can run.
     pub fn of(#[allow(unused_variables)] context: &Context) -> Self {
@@ -255,6 +298,13 @@ pub struct RaytracePreview {
     /// Why the image started again the last time, and how many times it did
     last_restart: Option<PreviewRestart>,
     restarts: u64,
+    /// When the image started the last time, when the samples of the image shown began (a restart, or the image at
+    /// the full resolution shown), and when it was done; see [RaytracePreview::status]
+    restarted_at: Option<Instant>,
+    counting_since: Option<Instant>,
+    done_at: std::sync::Mutex<Option<Instant>>,
+    /// The camera of the image, as given to the update that started it
+    traced_camera: Option<Camera>,
     /// The GPU's time of the newest measured call, see [RaytracePreview::gpu_time]
     gpu_time: Option<std::time::Duration>,
     settings: PreviewSettings,
@@ -577,6 +627,10 @@ impl RaytracePreview {
             restart_cause: None,
             last_restart: None,
             restarts: 0,
+            restarted_at: None,
+            counting_since: None,
+            done_at: std::sync::Mutex::new(None),
+            traced_camera: None,
             gpu_time: None,
             settings,
             gpu_scale,
@@ -901,6 +955,104 @@ impl RaytracePreview {
     }
 
     ///
+    /// Everything a display of the preview needs, from the same moment: samples, size, state and times. Read it right
+    /// after [RaytracePreview::update], instead of counting frames or samples on the side of the application.
+    ///
+    pub fn status(&self) -> PreviewStatus {
+        let now = Instant::now();
+        let done = self.is_done();
+        // The time stands still from the first status that saw the image done
+        let end = if done {
+            *self
+                .done_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert(now)
+        } else {
+            now
+        };
+        let elapsed = self
+            .restarted_at
+            .map(|start| end.saturating_duration_since(start))
+            .unwrap_or_default();
+        let samples = self.sample_count();
+        let max_samples = self.settings.max_samples;
+        let remaining = if done {
+            Some(std::time::Duration::ZERO)
+        } else {
+            match self.counting_since {
+                Some(since) if samples > 0 => {
+                    let counted = now.saturating_duration_since(since);
+                    Some(
+                        counted
+                            .mul_f64(max_samples.saturating_sub(samples) as f64 / samples as f64),
+                    )
+                }
+                _ => None,
+            }
+        };
+        PreviewStatus {
+            kind: self.kind(),
+            availability: self.availability().clone(),
+            compiling: self.is_compiling(),
+            samples,
+            max_samples,
+            done,
+            width: self.texture.width(),
+            height: self.texture.height(),
+            full_width: self.width,
+            full_height: self.height,
+            gpu_time: self.gpu_time(),
+            restarts: self.restarts,
+            last_restart: self.last_restart,
+            elapsed,
+            remaining,
+        }
+    }
+
+    /// Notes the times and the camera of an image that starts.
+    fn started_again(&mut self, camera: &Camera) {
+        let now = Instant::now();
+        self.restarted_at = Some(now);
+        self.counting_since = Some(now);
+        *self.done_at.get_mut().unwrap_or_else(|e| e.into_inner()) = None;
+        self.traced_camera = Some(camera.clone());
+    }
+
+    ///
+    /// The GPU's image at the full resolution with the camera and settings it is traced with, for a final render that
+    /// goes on with its samples; see [FinalRender::from_preview](crate::FinalRender::from_preview).
+    ///
+    #[cfg(feature = "wgpu")]
+    pub(crate) fn full_resolution_image(
+        &self,
+    ) -> Option<(&crate::GpuRenderImage, Camera, TraceSettings, Option<f64>)> {
+        let (image, tile_ms) = match (&self.sharp, &self.engine) {
+            (Some(sharp), _) => (&sharp.image, sharp.tile_ms),
+            (None, Engine::Gpu { image, .. })
+                if image.width() == self.width && image.height() == self.height =>
+            {
+                (image, None)
+            }
+            _ => return None,
+        };
+        self.traced_for.as_ref()?;
+        let mut camera = self.traced_camera.clone()?;
+        camera.set_viewport(three_d_asset::Viewport::new_at_origo(
+            image.width(),
+            image.height(),
+        ));
+        // As in update on the GPU
+        let settings = TraceSettings {
+            max_bounces: self.settings.max_bounces,
+            caustic_photons: self.settings.gpu_caustic_photons,
+            depth_of_field: self.settings.depth_of_field,
+            ..Default::default()
+        };
+        Some((image, camera, settings, tile_ms))
+    }
+
+    ///
     /// Why the image started again the last time, `None` before the first [RaytracePreview::update]. For finding out
     /// what in an application starts the preview again, for example a camera or scene made anew in every frame, or a
     /// size passed on while the window is minimized; see [RaytracePreview::restarts].
@@ -1069,6 +1221,10 @@ impl RaytracePreview {
     /// whenever it changed.
     ///
     pub fn update(&mut self, scene: &RtScene, camera: &Camera) -> Result<bool, crate::RtError> {
+        // Not done any more after more samples were asked for: the time in the status goes on
+        if !self.is_done() {
+            *self.done_at.get_mut().unwrap_or_else(|e| e.into_inner()) = None;
+        }
         // Nothing to see, for example in a minimized window: the image waits
         if camera.viewport().width == 0 || camera.viewport().height == 0 {
             return Ok(false);
@@ -1116,6 +1272,11 @@ impl RaytracePreview {
                 self.last_restart = reason;
                 self.restarts += 1;
                 self.traced_for = Some(key);
+                let now = Instant::now();
+                self.restarted_at = Some(now);
+                self.counting_since = Some(now);
+                *self.done_at.get_mut().unwrap_or_else(|e| e.into_inner()) = None;
+                self.traced_camera = Some(camera.clone());
             } else {
                 worker.adjust(
                     self.settings.max_samples,
@@ -1178,6 +1339,7 @@ impl RaytracePreview {
             self.last_restart = reason;
             self.restarts += 1;
             self.traced_for = Some(key);
+            self.started_again(camera);
         }
         #[cfg(feature = "wgpu")]
         if self.wants_sharp() {
@@ -1258,6 +1420,8 @@ impl RaytracePreview {
             if !sharp.shown {
                 std::mem::swap(&mut self.texture, &mut sharp.texture);
                 sharp.shown = true;
+                // The samples shown count from here
+                self.counting_since = Some(Instant::now());
                 if crate::compute::timing::enabled() {
                     crate::compute::timing::log(&format!(
                         "preview shows the full resolution, {:?} ms per tile, {tiles} tile(s) per update",

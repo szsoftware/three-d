@@ -1243,6 +1243,25 @@ impl GpuRenderImage {
         self.features
     }
 
+    ///
+    /// A copy on the GPU with the same samples, also of a sample in progress, that goes on independently, for
+    /// example to trace more samples into it while the original stays as it is.
+    ///
+    pub fn duplicate(&self) -> Self {
+        let mut copy = Self::create(&self.gpu, self.width, self.height, self.features);
+        let mut encoder = self
+            .gpu
+            .device
+            .create_command_encoder(&w::CommandEncoderDescriptor {
+                label: Some("copy render image"),
+            });
+        encoder.copy_buffer_to_buffer(&self.sums, 0, &copy.sums, 0, self.sums.size());
+        self.gpu.queue.submit([encoder.finish()]);
+        copy.samples = self.samples;
+        copy.next_tile = self.next_tile;
+        copy
+    }
+
     fn create(gpu: &GpuDevice, width: u32, height: u32, features: bool) -> Self {
         let words = if features { 3 } else { 1 };
         let sums = gpu.device.create_buffer(&w::BufferDescriptor {
