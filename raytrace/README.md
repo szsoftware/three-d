@@ -125,6 +125,24 @@ the GPU. `ComputeTracer` also implements `Tracer` and then reads every call back
 can not wait for. Its random numbers differ from the CPU tracer's, so the images agree in their averages, not in their
 noise.
 
+### Hardware ray queries (experimental, opt-in)
+
+On graphics cards with ray tracing units (Vulkan, DirectX 12, Metal) the compute tracer can find its hits with
+hardware ray queries instead of walking the hierarchies in the shader. Set `THREE_D_RAY_QUERY=1` before the three-d
+context is made: the device then gets wgpu's experimental `EXPERIMENTAL_RAY_QUERY`, and `ComputeTracer::from_context`
+uses it (`uses_ray_queries()`, off again with `with_ray_queries(false)`). The meshes go into bottom level acceleration
+structures and the instances into a top level one; only the traversal of the shader is replaced
+(`compute/walk_ray_query.wgsl` between the `TRAVERSAL` markers of `trace.wgsl`), everything after the hit is the same.
+Without the variable, without ray queries on the device and in browsers (WebGPU has none) the tracer stays as before.
+
+Both tracers draw the same random numbers: on lavapipe the garden, pergola, caustics and downlights give the same image
+pixel for pixel (`tests/ray_query.rs`). Where surfaces of two solids lie exactly on each other (the tank's front walls
+and its floor plate in the aquarium) rounding decides which of them a ray enters first, and the hardware rounds
+otherwise. The structures are built again whenever the scene's buffers are, also when only an instance moved.
+
+`cargo run --release -p three-d-raytrace --features wgpu --example ray_query_bench -- 64 960 600` measures both on the
+demo scenes and writes their images.
+
 ## Demo scenes and print size
 
 `three_d_raytrace::scenes` holds the scenes of the examples and tests, each with its start camera, exposure and

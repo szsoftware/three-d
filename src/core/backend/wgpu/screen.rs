@@ -60,6 +60,18 @@ pub(crate) enum AdapterPreference {
     Software,
 }
 
+///
+/// The environment variable that asks for hardware ray queries (wgpu's experimental `EXPERIMENTAL_RAY_QUERY`) on
+/// devices whose adapter has them (Vulkan, DirectX 12 and Metal on graphics cards with ray tracing units), for
+/// example `THREE_D_RAY_QUERY=1`. Without it devices are made without them. Never in a browser, WebGPU has none.
+///
+pub(crate) const RAY_QUERY_VARIABLE: &str = "THREE_D_RAY_QUERY";
+
+fn ray_queries_requested() -> bool {
+    !cfg!(target_arch = "wasm32")
+        && std::env::var(RAY_QUERY_VARIABLE).is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
 impl WgpuBackend {
     ///
     /// Asks for an adapter and a device and creates a backend with the device.
@@ -106,13 +118,36 @@ impl WgpuBackend {
         // The browser's device itself, for what wgpu does not pass on
         #[cfg(target_arch = "wasm32")]
         let capture = super::browser::DeviceCapture::install();
+        // Hardware ray queries only on request, see RAY_QUERY_VARIABLE: they are experimental in wgpu
+        let ray_queries = ray_queries_requested()
+            && adapter
+                .features()
+                .contains(w::Features::EXPERIMENTAL_RAY_QUERY);
         let (device, queue) = adapter
             .request_device(&w::DeviceDescriptor {
                 label: Some("three-d"),
                 // Optional features are used when the adapter has them. Timestamps measure the GPU's own time of
                 // work (the ray tracer's preview paces itself by it)
-                required_features: adapter.features()
-                    & (w::Features::FLOAT32_FILTERABLE | w::Features::TIMESTAMP_QUERY),
+                required_features: (adapter.features()
+                    & (w::Features::FLOAT32_FILTERABLE | w::Features::TIMESTAMP_QUERY))
+                    | if ray_queries {
+                        w::Features::EXPERIMENTAL_RAY_QUERY
+                    } else {
+                        w::Features::empty()
+                    },
+                // SAFETY: wgpu asks to acknowledge that experimental features may have bugs and change between
+                // versions; only ray queries are experimental here, and they are only asked for on request
+                // The limits of acceleration structures are zero unless asked for
+                required_limits: if ray_queries {
+                    w::Limits::default().using_acceleration_structure_values(adapter.limits())
+                } else {
+                    w::Limits::default()
+                },
+                experimental_features: if ray_queries {
+                    unsafe { w::ExperimentalFeatures::enabled() }
+                } else {
+                    w::ExperimentalFeatures::disabled()
+                },
                 ..Default::default()
             })
             .await

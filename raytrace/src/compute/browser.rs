@@ -45,6 +45,7 @@ fn spec(slots: &[(u32, Slot)]) -> Array {
                 Slot::Uniform { dynamic, min_size } => ("uniform", dynamic, min_size),
                 Slot::Storage { read_only: true } => ("read-only-storage", false, 0),
                 Slot::Storage { read_only: false } => ("storage", false, 0),
+                Slot::Structure => unreachable!("WebGPU has no ray queries"),
             };
             Array::of4(
                 &JsValue::from(binding),

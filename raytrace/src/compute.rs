@@ -31,8 +31,15 @@ const TILE_BYTES: u64 = 32;
 /// A binding of the tracer's bind groups, all of them buffers seen by compute shaders.
 #[derive(Clone, Copy)]
 enum Slot {
-    Uniform { dynamic: bool, min_size: u64 },
-    Storage { read_only: bool },
+    Uniform {
+        dynamic: bool,
+        min_size: u64,
+    },
+    Storage {
+        read_only: bool,
+    },
+    /// The scene for hardware ray queries, see [RayQueryScene]
+    Structure,
 }
 
 const PARAMS: Slot = Slot::Uniform {
@@ -78,6 +85,31 @@ const PHOTON_ENTRIES: [&str; 4] = [
     "find_cell_starts",
     "sort_photons",
 ];
+/// The binding of the scene for hardware ray queries in the trace and photon kernels (walk_ray_query.wgsl).
+const STRUCTURE_SLOT: (u32, Slot) = (10, Slot::Structure);
+
+/// The source of the trace and photon kernels: with hardware ray queries, the traversal of the hierarchies in storage
+/// buffers (between the TRAVERSAL markers of trace.wgsl) is replaced by walk_ray_query.wgsl.
+fn trace_source(ray_queries: bool) -> std::borrow::Cow<'static, str> {
+    const SOURCE: &str = include_str!("compute/trace.wgsl");
+    if !ray_queries {
+        return SOURCE.into();
+    }
+    let begin = SOURCE
+        .find("// BEGIN TRAVERSAL")
+        .expect("marker in trace.wgsl");
+    let end = SOURCE
+        .find("// END TRAVERSAL")
+        .expect("marker in trace.wgsl");
+    format!(
+        "enable wgpu_ray_query;\n{}{}{}",
+        &SOURCE[..begin],
+        include_str!("compute/walk_ray_query.wgsl"),
+        &SOURCE[end..]
+    )
+    .into()
+}
+
 /// The constants of the tracer for scenes with participating media.
 const MEDIA_CONSTANTS: [(&str, f64); 1] = [("MEDIA", 1.0)];
 
@@ -154,6 +186,8 @@ pub struct ComputeTracer {
     clock: Option<clock::GpuClock>,
     /// Calls of [ComputeTracer::trace_gpu] logged so far, see [set_gpu_timing_log]
     timed_calls: u32,
+    /// Whether the kernels find hits with hardware ray queries, see [ComputeTracer::uses_ray_queries]
+    ray_queries: bool,
 }
 
 /// How long the GPU took for the calls of [ComputeTracer::trace_gpu], see [ComputeTracer::take_call_times].
@@ -201,6 +235,10 @@ impl ComputeTracer {
     /// which knows more in a browser than the device.
     ///
     pub(crate) fn for_adapter(gpu: &GpuDevice, adapter: Option<w::AdapterInfo>) -> Self {
+        Self::build(gpu, adapter, has_ray_queries(gpu))
+    }
+
+    fn build(gpu: &GpuDevice, adapter: Option<w::AdapterInfo>, ray_queries: bool) -> Self {
         let device = &gpu.device;
         let adapter = adapter.unwrap_or_else(|| device.adapter_info());
         let constants = pipeline_constants(&adapter);
@@ -212,18 +250,27 @@ impl ComputeTracer {
                 .map(|&(binding, slot)| w::BindGroupLayoutEntry {
                     binding,
                     visibility: w::ShaderStages::COMPUTE,
-                    ty: w::BindingType::Buffer {
-                        ty: match slot {
-                            Slot::Uniform { .. } => w::BufferBindingType::Uniform,
-                            Slot::Storage { read_only } => {
-                                w::BufferBindingType::Storage { read_only }
-                            }
-                        },
-                        has_dynamic_offset: matches!(slot, Slot::Uniform { dynamic: true, .. }),
-                        min_binding_size: match slot {
-                            Slot::Uniform { min_size, .. } => std::num::NonZeroU64::new(min_size),
-                            Slot::Storage { .. } => None,
-                        },
+                    ty: if let Slot::Structure = slot {
+                        w::BindingType::AccelerationStructure {
+                            vertex_return: false,
+                        }
+                    } else {
+                        w::BindingType::Buffer {
+                            ty: match slot {
+                                Slot::Uniform { .. } => w::BufferBindingType::Uniform,
+                                Slot::Storage { read_only } => {
+                                    w::BufferBindingType::Storage { read_only }
+                                }
+                                Slot::Structure => unreachable!(),
+                            },
+                            has_dynamic_offset: matches!(slot, Slot::Uniform { dynamic: true, .. }),
+                            min_binding_size: match slot {
+                                Slot::Uniform { min_size, .. } => {
+                                    std::num::NonZeroU64::new(min_size)
+                                }
+                                _ => None,
+                            },
+                        }
                     },
                     count: None,
                 })
@@ -233,10 +280,17 @@ impl ComputeTracer {
                 entries: &entries,
             })
         };
-        let layout = layout_of("ray tracing", &TRACE_SLOTS);
+        let with_structure = |slots: &[(u32, Slot)]| {
+            let mut slots = slots.to_vec();
+            if ray_queries {
+                slots.push(STRUCTURE_SLOT);
+            }
+            slots
+        };
+        let layout = layout_of("ray tracing", &with_structure(&TRACE_SLOTS));
         let module = device.create_shader_module(w::ShaderModuleDescriptor {
             label: Some("ray tracing"),
-            source: w::ShaderSource::Wgsl(include_str!("compute/trace.wgsl").into()),
+            source: w::ShaderSource::Wgsl(trace_source(ray_queries)),
         });
         let pipeline_layout = device.create_pipeline_layout(&w::PipelineLayoutDescriptor {
             label: Some("ray tracing"),
@@ -254,7 +308,7 @@ impl ComputeTracer {
             },
             cache: None,
         });
-        let photon_layout = layout_of("caustic photons", &PHOTON_SLOTS);
+        let photon_layout = layout_of("caustic photons", &with_structure(&PHOTON_SLOTS));
         let photon_pipeline_layout = device.create_pipeline_layout(&w::PipelineLayoutDescriptor {
             label: Some("caustic photons"),
             bind_group_layouts: &[Some(&photon_layout)],
@@ -299,7 +353,34 @@ impl ComputeTracer {
             call_times: Default::default(),
             clock: clock::GpuClock::new(&gpu.device, &gpu.queue),
             timed_calls: 0,
+            ray_queries,
         }
+    }
+
+    ///
+    /// Whether the tracer finds the hits of its rays with hardware ray queries (ray tracing units of the graphics
+    /// card) instead of walking the hierarchies of the CPU builder in a compute shader. The images are the same.
+    ///
+    /// By default the tracer uses them when the device has them, which three-d's devices only have on request: the
+    /// environment variable `THREE_D_RAY_QUERY=1` when the context is made, on Vulkan, DirectX 12 and Metal with
+    /// graphics cards that have them. They are experimental in wgpu. Never in a browser, WebGPU has none.
+    ///
+    pub fn uses_ray_queries(&self) -> bool {
+        self.ray_queries
+    }
+
+    ///
+    /// The tracer with or without hardware ray queries, see [ComputeTracer::uses_ray_queries]. Without them on the
+    /// device the tracer stays without them. Makes the kernels again if it changes, the scene is built again on the
+    /// next call.
+    ///
+    pub fn with_ray_queries(self, use_them: bool) -> Self {
+        let use_them = use_them && has_ray_queries(&self.gpu);
+        if use_them == self.ray_queries {
+            return self;
+        }
+        let tile_size = self.tile_size;
+        Self::build(&self.gpu, Some(self.adapter.clone()), use_them).with_tile_size(tile_size)
     }
 
     ///
@@ -743,7 +824,10 @@ impl ComputeTracer {
                     binding: 9,
                     resource: buffers.texels.as_entire_binding(),
                 },
-            ],
+            ]
+            .into_iter()
+            .chain(buffers.structure_entry())
+            .collect::<Vec<_>>(),
         });
 
         let photon_bind_group = caustics.as_ref().map(|_| {
@@ -773,7 +857,10 @@ impl ComputeTracer {
                     entry(6, &buffers.materials),
                     entry(7, extras),
                     entry(9, &buffers.texels),
-                ],
+                ]
+                .into_iter()
+                .chain(buffers.structure_entry())
+                .collect::<Vec<_>>(),
             })
         });
 
@@ -1157,6 +1244,7 @@ impl Tracer for ComputeTracer {
                 &self.gpu,
                 scene,
                 self.accel.as_ref().expect("built"),
+                self.ray_queries,
             ));
         }
         Ok(())
@@ -1716,9 +1804,19 @@ struct SceneBuffers {
     /// The profiles of luminaires and the words where their tables start
     profiles: Vec<(std::sync::Arc<crate::IesProfile>, u32)>,
     texels: w::Buffer,
+    /// The scene for hardware ray queries, if the tracer uses them
+    structure: Option<RayQueryScene>,
 }
 
 impl SceneBuffers {
+    /// The binding of the scene for hardware ray queries, if the tracer uses them.
+    fn structure_entry(&self) -> Option<w::BindGroupEntry<'_>> {
+        self.structure.as_ref().map(|s| w::BindGroupEntry {
+            binding: STRUCTURE_SLOT.0,
+            resource: s.tlas.as_binding(),
+        })
+    }
+
     /// Bytes on the GPU.
     fn bytes(&self) -> u64 {
         [
@@ -1767,7 +1865,7 @@ impl Words {
 }
 
 impl SceneBuffers {
-    fn new(gpu: &GpuDevice, scene: &RtScene, accel: &CpuAccel) -> Self {
+    fn new(gpu: &GpuDevice, scene: &RtScene, accel: &CpuAccel, ray_queries: bool) -> Self {
         let device = &gpu.device;
         let limits = device.limits();
         let max_bytes = limits
@@ -1792,17 +1890,27 @@ impl SceneBuffers {
         let mut vertices = Words::default();
         let mut mesh_nodes = Vec::new();
         let mut mesh_triangles = Vec::new();
+        // For hardware ray queries: the first vertex of each mesh and the triangles in the order of triangles, with
+        // the indices of their vertices in the mesh
+        let mut mesh_vertices = Vec::new();
+        let mut local_indices = Words::default();
         for (mesh, bvh) in scene.meshes().iter().zip(accel.mesh_hierarchies()) {
             mesh_nodes.push((nodes.0.len() / 8) as u32);
             mesh_triangles.push((triangles.0.len() / 4) as u32);
             push_nodes(&mut nodes, bvh);
             let first_vertex = (vertices.0.len() / 12) as u32;
+            mesh_vertices.push(first_vertex);
             for &t in &bvh.indices {
                 let [a, b, c] = mesh.triangles[t as usize];
                 triangles.u(first_vertex + a);
                 triangles.u(first_vertex + b);
                 triangles.u(first_vertex + c);
                 triangles.u(t);
+                if ray_queries {
+                    local_indices.u(a);
+                    local_indices.u(b);
+                    local_indices.u(c);
+                }
             }
             for (i, p) in mesh.positions.iter().enumerate() {
                 let uv = mesh.uvs.as_ref().map_or(vec2(0.0, 0.0), |uvs| uvs[i]);
@@ -1971,16 +2079,169 @@ impl SceneBuffers {
             filled_buffer(gpu, label, &words.bytes(), w::BufferUsages::STORAGE)
         };
         let texels = texel_words(scene.textures(), max_bytes);
+        // The positions of the vertices are also the input of the structures for ray queries
+        let vertices = filled_buffer(
+            gpu,
+            "ray tracing vertices",
+            &vertices.bytes(),
+            if ray_queries {
+                w::BufferUsages::STORAGE | w::BufferUsages::BLAS_INPUT
+            } else {
+                w::BufferUsages::STORAGE
+            },
+        );
+        let structure = ray_queries.then(|| {
+            RayQueryScene::new(
+                gpu,
+                scene,
+                top,
+                &vertices,
+                &local_indices,
+                &mesh_vertices,
+                &mesh_triangles,
+            )
+        });
         Self {
             revision: scene.revision(),
             nodes: storage("ray tracing nodes", &nodes),
             triangles: storage("ray tracing triangles", &triangles),
-            vertices: storage("ray tracing vertices", &vertices),
+            vertices,
+            structure,
             instances: storage("ray tracing instances", &instances),
             materials: storage("ray tracing materials", &materials),
             lights,
             profiles,
             texels: storage("ray tracing textures", &texels),
+        }
+    }
+}
+
+/// Whether the device has hardware ray queries, see [ComputeTracer::uses_ray_queries].
+fn has_ray_queries(gpu: &GpuDevice) -> bool {
+    gpu.device
+        .features()
+        .contains(w::Features::EXPERIMENTAL_RAY_QUERY)
+}
+
+///
+/// The scene in acceleration structures for hardware ray queries (walk_ray_query.wgsl): a bottom level structure per
+/// mesh, two for meshes whose instances differ in whether their hits need the shader, and the instances in the top
+/// level structure, in the order of the instances buffer, which their custom data is the index into.
+///
+#[derive(Debug)]
+struct RayQueryScene {
+    tlas: w::Tlas,
+    /// Kept with the top level structure, which refers to them
+    _blas: Vec<w::Blas>,
+    _indices: w::Buffer,
+}
+
+impl RayQueryScene {
+    fn new(
+        gpu: &GpuDevice,
+        scene: &RtScene,
+        top: &crate::Bvh,
+        vertices: &w::Buffer,
+        local_indices: &Words,
+        mesh_vertices: &[u32],
+        mesh_triangles: &[u32],
+    ) -> Self {
+        let device = &gpu.device;
+        let indices = filled_buffer(
+            gpu,
+            "ray tracing triangles for ray queries",
+            &local_indices.bytes(),
+            w::BufferUsages::BLAS_INPUT,
+        );
+        // Per mesh and kind (0 opaque, 1 hits tested in the shader): the index into blas, made when an instance needs it
+        let meshes = scene.meshes();
+        let mut wanted = vec![[None::<usize>; 2]; meshes.len()];
+        let mut kinds = Vec::new();
+        let mut sizes = Vec::new();
+        let mut blas = Vec::new();
+        let mut placed = Vec::new();
+        for (k, &i) in top.indices.iter().enumerate() {
+            let instance = &scene.instances()[i as usize];
+            let material = &scene.materials()[instance.material.0 as usize];
+            let mesh = instance.mesh.0 as usize;
+            if material.is_cut_out_everywhere() || meshes[mesh].triangles.is_empty() {
+                continue;
+            }
+            // Cut-outs, and surfaces that let light through: shadow rays pass them, and paths pass the surfaces of
+            // the solid they just left (CONTACT)
+            let kind = usize::from(material.cuts_out_by_texture() || material.transmission > 0.0);
+            let b = *wanted[mesh][kind].get_or_insert_with(|| {
+                let size = w::BlasTriangleGeometrySizeDescriptor {
+                    vertex_format: w::VertexFormat::Float32x3,
+                    vertex_count: meshes[mesh].positions.len() as u32,
+                    index_format: Some(w::IndexFormat::Uint32),
+                    index_count: Some(3 * meshes[mesh].triangles.len() as u32),
+                    flags: if kind == 0 {
+                        w::AccelerationStructureGeometryFlags::OPAQUE
+                    } else {
+                        w::AccelerationStructureGeometryFlags::empty()
+                    },
+                };
+                blas.push(device.create_blas(
+                    &w::CreateBlasDescriptor {
+                        label: Some("ray tracing mesh"),
+                        flags: w::AccelerationStructureFlags::PREFER_FAST_TRACE,
+                        update_mode: w::AccelerationStructureUpdateMode::Build,
+                    },
+                    w::BlasGeometrySizeDescriptors::Triangles {
+                        descriptors: vec![size.clone()],
+                    },
+                ));
+                sizes.push(size);
+                kinds.push(mesh);
+                blas.len() - 1
+            });
+            placed.push((k, b, instance.transform));
+        }
+        let mut tlas = device.create_tlas(&w::CreateTlasDescriptor {
+            label: Some("ray tracing instances"),
+            max_instances: placed.len().max(1) as u32,
+            flags: w::AccelerationStructureFlags::PREFER_FAST_TRACE,
+            update_mode: w::AccelerationStructureUpdateMode::Build,
+        });
+        for (slot, &(k, b, transform)) in placed.iter().enumerate() {
+            // Rows of the 3x4 matrix, the transform is in columns
+            let c: &[[f32; 4]; 4] = transform.as_ref();
+            let rows = [
+                c[0][0], c[1][0], c[2][0], c[3][0], c[0][1], c[1][1], c[2][1], c[3][1], c[0][2],
+                c[1][2], c[2][2], c[3][2],
+            ];
+            tlas[slot] = Some(w::TlasInstance::new(&blas[b], rows, k as u32, 0xff));
+        }
+        let entries: Vec<w::BlasBuildEntry<'_>> = blas
+            .iter()
+            .zip(&sizes)
+            .zip(&kinds)
+            .map(|((blas, size), &mesh)| w::BlasBuildEntry {
+                blas,
+                geometry: w::BlasGeometries::TriangleGeometries(vec![w::BlasTriangleGeometry {
+                    size,
+                    vertex_buffer: vertices,
+                    first_vertex: mesh_vertices[mesh],
+                    // Vertex in trace.wgsl: position, normal and tangent, four floats each
+                    vertex_stride: 48,
+                    index_buffer: Some(&indices),
+                    first_index: Some(3 * mesh_triangles[mesh]),
+                    transform_buffer: None,
+                    transform_buffer_offset: None,
+                }]),
+            })
+            .collect();
+        let mut encoder = device.create_command_encoder(&w::CommandEncoderDescriptor {
+            label: Some("ray tracing structures"),
+        });
+        encoder.build_acceleration_structures(entries.iter(), [&tlas]);
+        gpu.queue.submit([encoder.finish()]);
+        drop(entries);
+        Self {
+            tlas,
+            _blas: blas,
+            _indices: indices,
         }
     }
 }
@@ -2428,5 +2689,21 @@ mod tests {
             .validate(&module)
             .unwrap_or_else(|e| panic!("{name}: {e:?}"));
         }
+    }
+
+    #[test]
+    fn shader_with_ray_queries_is_valid() {
+        let source = trace_source(true);
+        let module = naga::front::wgsl::parse_str(&source)
+            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&source)));
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::RAY_QUERY,
+        )
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("{e:?}"));
+        // The traversal in storage buffers is gone, the rest is the same
+        assert!(!source.contains("fn walk_mesh"));
+        assert!(source.contains("fn trace_photon"));
     }
 }
