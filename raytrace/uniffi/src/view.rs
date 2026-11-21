@@ -1,4 +1,4 @@
-use crate::render::{rgba_texture, PreviewState, Readback};
+use crate::render::{photo_of, rgba_texture, PhotoSource, PreviewState, Readback};
 use crate::thread::ThreadBound;
 use crate::*;
 use std::collections::{HashMap, HashSet};
@@ -114,6 +114,7 @@ pub struct RealtimeSpec {
 /// The realtime view of a scene: three-d's rasterizer at frame rate, see [Renderer::scene_view].
 #[derive(uniffi::Object)]
 pub struct SceneView {
+    renderer: Arc<Renderer>,
     scene: Arc<Scene>,
     state: ThreadBound<ViewState>,
 }
@@ -147,6 +148,8 @@ struct ViewState {
     cpu_threads: usize,
     pick: Option<(f32, f32)>,
     picked: Option<Option<Hit>>,
+    /// A photo traces on the engine of the raytraced preview: the view shows the preview's image meanwhile
+    photo: bool,
 }
 
 #[derive(Default)]
@@ -202,9 +205,11 @@ impl Renderer {
             cpu_threads: threads,
             pick: None,
             picked: None,
+            photo: false,
             context,
         };
         Ok(Arc::new(SceneView {
+            renderer: self,
             scene,
             state: ThreadBound::new(state),
         }))
@@ -270,6 +275,38 @@ impl SceneView {
     /// rasterizer). A switch for a button; costs nothing, the preview keeps its samples while the camera does not move.
     pub fn set_raytrace_when_still(&self, ms: Option<u32>) -> Result<(), RtFfiError> {
         self.state.with(|s| s.realtime.raytrace_when_still_ms = ms)
+    }
+
+    /// The state of the raytraced preview, `None` while the rasterizer draws and no preview was started yet.
+    pub fn preview_status(&self) -> Result<Option<PreviewStatus>, RtFfiError> {
+        self.state
+            .with(|s| s.raytrace.as_ref().map(|p| PreviewStatus::of(&p.preview)))
+    }
+
+    ///
+    /// A photo of the view in its size that goes on with the samples of the raytraced preview, up to `samples` per
+    /// pixel: no shaders to wait for, no samples traced twice. `None` where there is nothing to go on with (no preview,
+    /// the preview on the CPU or at a lower resolution): then [Renderer::final_render] with [SceneView::camera] and the
+    /// view's size. While the photo is not done the view shows the preview's last image; step it every frame.
+    ///
+    pub fn photo(
+        self: Arc<Self>,
+        samples: u32,
+        step_ms: u32,
+    ) -> Result<Option<Arc<FinalJob>>, RtFfiError> {
+        let render = self.state.with(|s| {
+            s.raytrace
+                .as_ref()
+                .and_then(|p| photo_of(&p.preview, samples, step_ms))
+        })?;
+        Ok(render.map(|render| {
+            FinalJob::new(
+                self.renderer.clone(),
+                self.scene.clone(),
+                render,
+                PhotoSource::View(self.clone()),
+            )
+        }))
     }
 
     /// Hands an event to the camera control; true if it moves the camera.
@@ -346,6 +383,25 @@ impl SceneView {
 /// How fast the arrow keys turn the view (radians per second, a quarter turn in a second) and tilt it.
 const TURN_PER_SECOND: f32 = std::f32::consts::FRAC_PI_2;
 const TILT_PER_SECOND: f32 = 0.8;
+
+impl SceneView {
+    /// One step of a photo on the engine of the view's preview; `None` when the preview is gone.
+    pub(crate) fn trace_photo(
+        &self,
+        scene: &Scene,
+        render: &mut three_d_raytrace::FinalRender,
+    ) -> Result<Option<bool>, RtFfiError> {
+        self.state.with(|s| {
+            let Some(preview) = &mut s.raytrace else {
+                s.photo = false;
+                return Ok(None);
+            };
+            let done = scene.with_rt(|rt| preview.preview.trace_final(rt, render))?;
+            s.photo = !done;
+            Ok(Some(done))
+        })?
+    }
+}
 
 impl ViewState {
     fn changed(&mut self) {
@@ -565,6 +621,13 @@ impl ViewState {
                 // The browser cannot wait for the GPU: the ray goes through the scene on the CPU instead
                 self.picked =
                     Some(scene.with_rt(|rt| cpu_pick(rt, &self.camera, x, self.height as f32 - y)));
+            }
+        }
+
+        // A photo traces on the preview's engine: its image stays on screen
+        if self.photo {
+            if let Some(preview) = &mut self.raytrace {
+                return Ok(preview.read());
             }
         }
 
