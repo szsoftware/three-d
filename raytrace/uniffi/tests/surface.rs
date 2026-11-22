@@ -530,6 +530,42 @@ fn realtime_view_preview_and_pick_on_the_gpu() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert!(traced, "the preview took over");
+
+    // Its status in one call, and a photo that goes on with its samples once it traces at the full resolution
+    let mut status = view.preview_status().unwrap().expect("a preview");
+    for _ in 0..400 {
+        if status.width == status.full_width && status.samples >= 4 {
+            break;
+        }
+        view.next_frame().unwrap();
+        status = view.preview_status().unwrap().unwrap();
+    }
+    assert_eq!((status.full_width, status.full_height), (64, 48));
+    assert!(
+        status.samples > 0 && status.last_restart.is_some(),
+        "{status:?}"
+    );
+    if status.tracer != TracerKind::Cpu && status.width == status.full_width {
+        let photo = view
+            .clone()
+            .photo(status.samples + 4, 50)
+            .unwrap()
+            .expect("goes on with the preview");
+        assert!(photo.continues_preview());
+        assert_eq!(photo.size(), vec![64, 48]);
+        let mut steps = 0;
+        while !photo.step().unwrap() {
+            // The view shows the preview's image meanwhile and does not trace on
+            assert!(view.next_frame().unwrap().samples > 0);
+            steps += 1;
+            assert!(steps < 2000, "the photo does not finish");
+        }
+        assert!(photo.rgba().unwrap().is_some());
+        assert!(photo.elapsed_ms() > 0 || steps == 0);
+    } else {
+        eprintln!("the preview stayed on the CPU or below the full resolution: {status:?}");
+        assert!(view.clone().photo(16, 50).unwrap().is_none());
+    }
     view.set_raytrace_when_still(None).unwrap();
     assert_eq!(
         view.next_frame().unwrap().samples,
@@ -556,6 +592,16 @@ fn realtime_view_preview_and_pick_on_the_gpu() {
         "the preview traced: {}",
         preview.availability().unwrap()
     );
+    let status = preview.status().unwrap();
+    assert!(status.samples > 0 && (status.full_width, status.full_height) == (32, 24));
+    if let Some(photo) = preview.clone().photo(status.samples + 2, 50).unwrap() {
+        assert!(photo.continues_preview());
+        while !photo.step().unwrap() {
+            // The preview waits while the photo traces on its engine
+            assert!(preview.next_frame().unwrap().is_none());
+        }
+        assert!(preview.next_frame().is_ok());
+    }
 
     let job = renderer
         .final_render(demo.scene, demo.camera, 32, 24, 2, demo.look, 50)
