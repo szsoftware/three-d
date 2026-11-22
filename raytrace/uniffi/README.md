@@ -31,6 +31,12 @@ the graphics card, WebGL2 otherwise. The canvas may stay hidden, the views hand 
 crate with its own context hands it over with `Renderer::with_context` from Rust. `Renderer::headless` is for desktop and
 Android.
 
+The raytraced preview of a `SceneView` decides by itself between GPU and CPU and lowers the GPU's resolution when it
+is slow. For tests, benchmarks and demonstrations `setPreviewOptions(PreviewOptions(tracer, gpuDownscale,
+cpuDownscale, denoise))` fixes it: `TracerChoice.GPU` never goes to the CPU, `gpuDownscale = 1u` keeps the full
+resolution. `previewCapabilities()` says what the device can (GPU with the reason why not, ray query, timestamp
+queries, the downscales), to show impossible switches as disabled with the reason as a tooltip.
+
 ### In the application crate
 
 A dependency on this crate is not enough: the linker drops everything the application's cdylib does not use, and with

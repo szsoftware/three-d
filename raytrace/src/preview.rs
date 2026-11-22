@@ -159,6 +159,12 @@ pub struct PreviewSettings {
     ///
     pub gpu_frame_time: Option<std::time::Duration>,
     ///
+    /// Whether the preview goes on with the CPU when the GPU is too slow for `gpu_frame_time` even at a quarter of
+    /// the resolution. Off, it stays on the GPU at a quarter, for example where the GPU was chosen by hand to compare
+    /// or measure it. On by default.
+    ///
+    pub gpu_falls_back_to_cpu: bool,
+    ///
     /// When the GPU traces at a lower resolution (`gpu_downscale`, or lowered by `gpu_frame_time`) and camera and
     /// scene stand still for 16 of its samples, it goes on at the full resolution: a sample spread over several
     /// updates, as many tiles in each as fit into `gpu_frame_time`, and shown once it has 4 samples; until then the
@@ -224,6 +230,7 @@ impl Default for PreviewSettings {
             gpu_samples_per_frame: 1,
             gpu_downscale: 1,
             gpu_frame_time: Some(std::time::Duration::from_millis(40)),
+            gpu_falls_back_to_cpu: true,
             gpu_sharp_when_still: true,
             cpu_downscale: if cfg!(target_arch = "wasm32") { 8 } else { 4 },
             cpu_frame_time: if cfg!(target_arch = "wasm32") {
@@ -718,9 +725,10 @@ impl RaytracePreview {
 
     ///
     /// Changes the settings. A new CPU resolution starts the preview again. A new
-    /// [PreviewSettings::gpu_frame_time] goes back to [PreviewSettings::gpu_downscale] and watches the GPU's time
-    /// anew, also from the CPU when the preview went there because the GPU was too slow: `None` keeps the GPU at the
-    /// full resolution (with a `gpu_downscale` of 1) from then on.
+    /// [PreviewSettings::gpu_frame_time] (or turning [PreviewSettings::gpu_falls_back_to_cpu] off) goes back to
+    /// [PreviewSettings::gpu_downscale] and watches the GPU's time anew, also from the CPU when the preview went there
+    /// because the GPU was too slow: `None` keeps the GPU at the full resolution (with a `gpu_downscale` of 1) from
+    /// then on.
     ///
     pub fn set_settings(&mut self, settings: PreviewSettings) {
         #[allow(unused_mut)]
@@ -746,7 +754,8 @@ impl RaytracePreview {
             || settings.gpu_caustic_photons != self.settings.gpu_caustic_photons
             || settings.depth_of_field != self.settings.depth_of_field;
         #[cfg(feature = "wgpu")]
-        let new_limit = settings.gpu_frame_time != self.settings.gpu_frame_time;
+        let new_limit = settings.gpu_frame_time != self.settings.gpu_frame_time
+            || (self.settings.gpu_falls_back_to_cpu && !settings.gpu_falls_back_to_cpu);
         self.settings = settings;
         #[cfg(feature = "wgpu")]
         if new_limit {
@@ -1603,6 +1612,13 @@ impl RaytracePreview {
         match decision {
             None => return false,
             Some(Ok(scale)) => self.gpu_scale = scale,
+            // Kept on the GPU by hand: at the lowest resolution it has
+            Some(Err(_)) if !self.settings.gpu_falls_back_to_cpu => {
+                if self.gpu_scale >= MAX_GPU_DOWNSCALE {
+                    return false;
+                }
+                self.gpu_scale = MAX_GPU_DOWNSCALE;
+            }
             Some(Err(why)) => {
                 self.availability =
                     PreviewAvailability::CpuOnly(format!("{why} Measured: {measured}."));

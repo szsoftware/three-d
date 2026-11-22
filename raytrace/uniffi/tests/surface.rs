@@ -609,3 +609,98 @@ fn realtime_view_preview_and_pick_on_the_gpu() {
     while !job.step().unwrap() {}
     assert!(job.png().unwrap().is_some());
 }
+
+/// Preview options set by hand: the CPU, a fixed resolution on the GPU, and what the device can do.
+#[test]
+fn preview_options_by_hand() {
+    if std::env::var_os("THREE_D_SKIP_GPU_TESTS").is_some() {
+        return;
+    }
+    let renderer = Renderer::headless(true);
+    if renderer.cpu_reason().is_some() && std::env::var("THREE_D_REQUIRE_WGPU").is_err() {
+        eprintln!("no GPU: {:?}", renderer.cpu_reason());
+        return;
+    }
+    let demo = demo_scene("pergola".to_owned()).unwrap();
+    let realtime = RealtimeSpec {
+        sun_shadow_map: 512,
+        raytrace_when_still_ms: Some(0),
+        look: demo.look,
+    };
+    let view = renderer
+        .clone()
+        .scene_view(demo.scene.clone(), demo.camera, 64, 48, realtime)
+        .unwrap();
+    let caps = view.preview_capabilities().unwrap();
+    assert!(caps.gpu, "{caps:?}");
+    assert_eq!(caps.gpu_reason, None);
+    assert_eq!(caps.gpu_downscales, vec![1, 2, 4]);
+    assert_eq!(view.preview_options().unwrap(), PreviewOptions::AUTOMATIC);
+
+    // Downscales the preview cannot have are errors, the options stay
+    let wrong = PreviewOptions {
+        gpu_downscale: Some(3),
+        ..PreviewOptions::AUTOMATIC
+    };
+    assert!(view.set_preview_options(wrong).is_err());
+    assert_eq!(view.preview_options().unwrap(), PreviewOptions::AUTOMATIC);
+
+    let traced = |view: &SceneView| {
+        for _ in 0..400 {
+            if view.next_frame().unwrap().samples > 0 {
+                return view.preview_status().unwrap().expect("a preview");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the preview did not trace");
+    };
+
+    // The CPU by hand, at half the resolution
+    view.set_preview_options(PreviewOptions {
+        tracer: TracerChoice::Cpu,
+        cpu_downscale: Some(2),
+        denoise: false,
+        ..PreviewOptions::AUTOMATIC
+    })
+    .unwrap();
+    let status = traced(&view);
+    assert_eq!(status.tracer, TracerKind::Cpu, "{status:?}");
+    assert_eq!((status.width, status.height), (32, 24), "{status:?}");
+
+    // The GPU by hand at a quarter of the resolution, fixed: after the shaders compiled it stays there
+    view.set_preview_options(PreviewOptions {
+        tracer: TracerChoice::Gpu,
+        gpu_downscale: Some(4),
+        cpu_downscale: None,
+        denoise: true,
+    })
+    .unwrap();
+    let mut status = traced(&view);
+    for _ in 0..2000 {
+        if !status.compiling && status.tracer != TracerKind::Cpu {
+            break;
+        }
+        view.next_frame().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        status = view.preview_status().unwrap().unwrap();
+    }
+    assert_ne!(status.tracer, TracerKind::Cpu, "{status:?}");
+    for _ in 0..20 {
+        view.next_frame().unwrap();
+    }
+    let status = view.preview_status().unwrap().unwrap();
+    assert_ne!(status.tracer, TracerKind::Cpu, "{status:?}");
+    assert_eq!((status.width, status.height), (16, 12), "{status:?}");
+
+    // A new downscale changes the running preview
+    view.set_preview_options(PreviewOptions {
+        tracer: TracerChoice::Gpu,
+        gpu_downscale: Some(1),
+        cpu_downscale: None,
+        denoise: true,
+    })
+    .unwrap();
+    let status = traced(&view);
+    assert_ne!(status.tracer, TracerKind::Cpu, "{status:?}");
+    assert_eq!((status.width, status.height), (64, 48), "{status:?}");
+}

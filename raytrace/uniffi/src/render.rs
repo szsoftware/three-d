@@ -158,6 +158,7 @@ impl Renderer {
                 height,
                 look,
                 s.cpu_threads,
+                PreviewOptions::default(),
             ))
         })??;
         Ok(Arc::new(PreviewJob {
@@ -428,10 +429,20 @@ pub(crate) struct PreviewState {
 }
 
 impl PreviewState {
-    pub fn new(context: &Context, width: u32, height: u32, look: Look, threads: usize) -> Self {
+    pub fn new(
+        context: &Context,
+        width: u32,
+        height: u32,
+        look: Look,
+        threads: usize,
+        options: PreviewOptions,
+    ) -> Self {
         let (width, height) = (width.max(1), height.max(1));
-        let mut preview = RaytracePreview::new(context, width, height);
-        preview.set_settings(PreviewSettings {
+        let mut preview = match options.tracer {
+            TracerChoice::Cpu => RaytracePreview::new_on_cpu(context, width, height),
+            TracerChoice::Auto | TracerChoice::Gpu => RaytracePreview::new(context, width, height),
+        };
+        let settings = options.apply(PreviewSettings {
             tone_mapping: look.tone_mapping(),
             max_bounces: look.max_bounces,
             gpu_caustic_photons: look.caustic_photons,
@@ -439,6 +450,7 @@ impl PreviewState {
             cpu_threads: threads,
             ..*preview.settings()
         });
+        preview.set_settings(settings);
         Self {
             preview,
             context: context.clone(),
@@ -710,6 +722,153 @@ pub(crate) fn photo_of(
     {
         let _ = (preview, samples, step_ms);
         None
+    }
+}
+
+/// Which tracer a raytraced preview of a [SceneView] uses, see [SceneView::set_preview_options].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, uniffi::Enum)]
+pub enum TracerChoice {
+    /// The GPU where it can and is fast enough, else the CPU (the default)
+    #[default]
+    Auto,
+    /// The GPU only, also when it is slow: at most a quarter of the resolution, never the CPU. While the shaders
+    /// compile the CPU traces (`PreviewStatus.compiling`). Only where `PreviewCapabilities.gpu` is true.
+    Gpu,
+    /// The CPU only
+    Cpu,
+}
+
+///
+/// What a raytraced preview of a [SceneView] does, set by hand for tests, benchmarks and demonstrations; the default
+/// decides everything by itself. See [SceneView::set_preview_options].
+///
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct PreviewOptions {
+    /// Which tracer
+    pub tracer: TracerChoice,
+    ///
+    /// Width and height on the GPU divided by this, fixed: 1, 2 or 4. `None` starts at the full resolution and lowers
+    /// it when the GPU needs more than 40 ms per frame (then, for `Auto`, on to the CPU).
+    ///
+    #[uniffi(default)]
+    pub gpu_downscale: Option<u32>,
+    /// Width and height on the CPU divided by this, 1 to 16; `None` for 4 (8 in browsers).
+    #[uniffi(default)]
+    pub cpu_downscale: Option<u32>,
+    /// Smooths the noise of the first samples (on by default)
+    #[uniffi(default = true)]
+    pub denoise: bool,
+}
+
+impl Default for PreviewOptions {
+    fn default() -> Self {
+        Self::AUTOMATIC
+    }
+}
+
+impl PreviewOptions {
+    /// The defaults: everything automatic, with the denoiser.
+    pub const AUTOMATIC: Self = Self {
+        tracer: TracerChoice::Auto,
+        gpu_downscale: None,
+        cpu_downscale: None,
+        denoise: true,
+    };
+
+    /// Downscales that are not 1, 2 or 4 on the GPU or not 1 to 16 on the CPU.
+    pub fn check(&self) -> Result<(), RtFfiError> {
+        if let Some(n) = self.gpu_downscale {
+            if !GPU_DOWNSCALES.contains(&n) {
+                return Err(invalid(format!(
+                    "gpu_downscale {n}: 1, 2 or 4, or None for automatic"
+                )));
+            }
+        }
+        if let Some(n) = self.cpu_downscale {
+            if !(1..=MAX_CPU_DOWNSCALE).contains(&n) {
+                return Err(invalid(format!(
+                    "cpu_downscale {n}: 1 to {MAX_CPU_DOWNSCALE}, or None for automatic"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The settings with these options in place of what they decide.
+    pub fn apply(&self, settings: PreviewSettings) -> PreviewSettings {
+        let default = PreviewSettings::default();
+        let (gpu_downscale, gpu_frame_time) = match self.gpu_downscale {
+            Some(n) => (n, None),
+            None => (default.gpu_downscale, default.gpu_frame_time),
+        };
+        PreviewSettings {
+            gpu_downscale,
+            gpu_frame_time,
+            gpu_falls_back_to_cpu: self.tracer != TracerChoice::Gpu,
+            cpu_downscale: self.cpu_downscale.unwrap_or(default.cpu_downscale),
+            denoiser: if self.denoise {
+                settings.denoiser.or(default.denoiser)
+            } else {
+                None
+            },
+            ..settings
+        }
+    }
+}
+
+/// The fixed divisors of width and height on the GPU, see [PreviewOptions::gpu_downscale].
+const GPU_DOWNSCALES: [u32; 3] = [1, 2, 4];
+/// The largest divisor of width and height on the CPU, see [PreviewOptions::cpu_downscale].
+const MAX_CPU_DOWNSCALE: u32 = 16;
+
+///
+/// What a raytraced preview can do on the device of a [SceneView], to show options that cannot work as disabled,
+/// with the reason as a tooltip. See [SceneView::preview_capabilities].
+///
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PreviewCapabilities {
+    /// The GPU can trace: [TracerChoice::Gpu] and [PreviewOptions::gpu_downscale] work
+    pub gpu: bool,
+    /// Why not, where `gpu` is false: no compute shaders (OpenGL, WebGL2), or a driver known to crash
+    pub gpu_reason: Option<String>,
+    /// The GPU traces with hardware ray queries ([TracerKind::RayQuery]), not with hierarchies in storage buffers
+    pub ray_query: bool,
+    /// The GPU measures its own time per frame (timestamp queries): `PreviewStatus.gpu_time_ms` and the sharp image
+    /// at the full resolution when still. Without, the time between two frames counts.
+    pub timestamp_queries: bool,
+    /// The values [PreviewOptions::gpu_downscale] takes: 1, 2 and 4
+    pub gpu_downscales: Vec<u32>,
+    /// The largest [PreviewOptions::cpu_downscale]
+    pub max_cpu_downscale: u32,
+}
+
+impl PreviewCapabilities {
+    pub(crate) fn of(context: &Context) -> Self {
+        let gpu_reason = match three_d_raytrace::PreviewAvailability::of(context) {
+            three_d_raytrace::PreviewAvailability::Gpu => None,
+            three_d_raytrace::PreviewAvailability::CpuOnly(why) => Some(why),
+        };
+        #[cfg(feature = "gpu")]
+        let (ray_query, timestamp_queries) = (
+            gpu_reason.is_none()
+                && three_d_raytrace::RaytraceSupport::of(context)
+                    == three_d_raytrace::RaytraceSupport::HardwareRayQuery,
+            context.as_wgpu().is_some_and(|(device, _)| {
+                device
+                    .features()
+                    .contains(three_d::wgpu::Features::TIMESTAMP_QUERY)
+            }),
+        );
+        #[cfg(not(feature = "gpu"))]
+        let (ray_query, timestamp_queries) = (false, false);
+        Self {
+            gpu: gpu_reason.is_none(),
+            gpu_reason,
+            ray_query,
+            timestamp_queries,
+            gpu_downscales: GPU_DOWNSCALES.to_vec(),
+            max_cpu_downscale: MAX_CPU_DOWNSCALE,
+        }
     }
 }
 
