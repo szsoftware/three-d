@@ -319,7 +319,10 @@ fn an_unchanged_panel_is_painted_again() {
         let again = frame(&context, &overlay);
         assert!(ran == again, "{name}: the painted again frame differs");
         assert!(near(pixel(&again, 300, 150), [255, 0, 0], 0), "{name}");
-        assert!(!near(pixel(&again, 20, 150), [255, 0, 0], 40), "{name}: no panel");
+        assert!(
+            !near(pixel(&again, 20, 150), [255, 0, 0], 40),
+            "{name}: no panel"
+        );
 
         let before = frame(&context, &overlay);
         assert_eq!(
