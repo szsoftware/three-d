@@ -17,6 +17,8 @@ pub(crate) struct GlBackend {
     vao: crate::context::VertexArray,
     /// What stands in for the default framebuffer if the context has no window, see [GlBackend::set_offscreen_screen].
     screen: std::sync::Mutex<Option<OffscreenScreen>>,
+    /// A framebuffer of the application that is the screen, see [GlBackend::set_external_screen]. It wins over `screen`.
+    external: std::sync::Mutex<Option<ExternalScreen>>,
     /// What has to live as long as the context if this backend created it.
     #[allow(dead_code)]
     pub(super) keep_alive: Option<KeepAlive>,
@@ -49,6 +51,40 @@ struct OffscreenScreen {
     resolved: Option<crate::context::Framebuffer>,
 }
 
+///
+/// A framebuffer that belongs to the application and is used wherever the screen is asked for.
+///
+struct ExternalScreen {
+    /// The framebuffer of the application, which this crate never deletes.
+    framebuffer: crate::context::Framebuffer,
+    width: u32,
+    height: u32,
+    /// If the framebuffer of the application has no depth buffer and one was asked for: a framebuffer of this crate
+    /// with the color buffer of the application's framebuffer and a depth buffer.
+    depth: Option<AddedDepth>,
+}
+
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+struct AddedDepth {
+    framebuffer: crate::context::Framebuffer,
+    renderbuffer: crate::context::Renderbuffer,
+    /// The color buffer of the application's framebuffer that is attached, as GL object type and name.
+    color: (u32, u32),
+}
+
+impl Drop for GlBackend {
+    fn drop(&mut self) {
+        // The context of the application lives on, so what this crate added to its framebuffer is deleted
+        let external = self.external.get_mut().unwrap_or_else(|e| e.into_inner());
+        if let Some(added) = external.take().and_then(|external| external.depth) {
+            unsafe {
+                self.context.delete_framebuffer(added.framebuffer);
+                self.context.delete_renderbuffer(added.renderbuffer);
+            }
+        }
+    }
+}
+
 impl GlBackend {
     pub fn new(context: Arc<crate::context::Context>) -> Result<Self, CoreError> {
         unsafe {
@@ -68,6 +104,7 @@ impl GlBackend {
                 context,
                 vao,
                 screen: std::sync::Mutex::new(None),
+                external: std::sync::Mutex::new(None),
                 keep_alive: None,
                 lost: Default::default(),
             }
@@ -207,11 +244,277 @@ impl GlBackend {
 
     #[allow(dead_code)]
     pub fn has_offscreen_screen(&self) -> bool {
-        self.screen_framebuffer().is_some()
+        self.screen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 
-    /// The framebuffer that is the screen: the offscreen screen if there is one, otherwise the default framebuffer.
+    ///
+    /// Makes a framebuffer of the application the screen, or with `None` the screen that was used before.
+    /// See [Context::set_screen_framebuffer](crate::core::Context::set_screen_framebuffer).
+    ///
+    pub fn set_external_screen(
+        &self,
+        external: Option<(crate::context::Framebuffer, u32, u32, bool)>,
+    ) -> Result<(), CoreError> {
+        let result = self.replace_external_screen(external);
+        // After an error, the screen is the one without the application's framebuffer
+        unsafe {
+            self.context
+                .bind_framebuffer(crate::context::FRAMEBUFFER, self.screen_framebuffer());
+        }
+        result
+    }
+
+    fn replace_external_screen(
+        &self,
+        external: Option<(crate::context::Framebuffer, u32, u32, bool)>,
+    ) -> Result<(), CoreError> {
+        use crate::context as gl;
+        let context = &self.context;
+        let mut screen = self.external.lock().unwrap_or_else(|e| e.into_inner());
+        let former = screen.take();
+        let delete = |added: AddedDepth| unsafe {
+            context.delete_framebuffer(added.framebuffer);
+            context.delete_renderbuffer(added.renderbuffer);
+        };
+        let Some((framebuffer, width, height, depth)) = external else {
+            if let Some(added) = former.and_then(|former| former.depth) {
+                delete(added);
+            }
+            return Ok(());
+        };
+        let (width, height) = (width.max(1), height.max(1));
+        let attachment = |attachment: u32, parameter: u32| unsafe {
+            context.get_framebuffer_attachment_parameter_i32(gl::FRAMEBUFFER, attachment, parameter)
+        };
+        unsafe { context.bind_framebuffer(gl::FRAMEBUFFER, Some(framebuffer)) };
+        let has_depth = attachment(gl::DEPTH_ATTACHMENT, gl::FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE)
+            as u32
+            != gl::NONE;
+        let former_size = former.as_ref().map(|former| (former.width, former.height));
+        let added = former.and_then(|former| former.depth);
+        if !depth || has_depth {
+            if let Some(added) = added {
+                delete(added);
+            }
+            *screen = Some(ExternalScreen {
+                framebuffer,
+                width,
+                height,
+                depth: None,
+            });
+            return Ok(());
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (added, former_size);
+            Err(CoreError::ContextError(
+                "WebGL cannot add a depth buffer to a framebuffer without one, attach a depth buffer to it"
+                    .to_string(),
+            ))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        unsafe {
+            let no_color = || {
+                CoreError::ContextError(
+                    "the screen framebuffer has no color buffer at GL_COLOR_ATTACHMENT0, which is needed to add a depth buffer"
+                        .to_string(),
+                )
+            };
+            let kind = attachment(
+                gl::COLOR_ATTACHMENT0,
+                gl::FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE,
+            ) as u32;
+            let name = attachment(
+                gl::COLOR_ATTACHMENT0,
+                gl::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+            ) as u32;
+            let name = match std::num::NonZeroU32::new(name) {
+                Some(name) if kind == gl::TEXTURE || kind == gl::RENDERBUFFER => name,
+                _ => {
+                    if let Some(added) = added {
+                        delete(added);
+                    }
+                    return Err(no_color());
+                }
+            };
+            let (level, face) = if kind == gl::TEXTURE {
+                (
+                    attachment(
+                        gl::COLOR_ATTACHMENT0,
+                        gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL,
+                    ),
+                    attachment(
+                        gl::COLOR_ATTACHMENT0,
+                        gl::FRAMEBUFFER_ATTACHMENT_TEXTURE_CUBE_MAP_FACE,
+                    ) as u32,
+                )
+            } else {
+                (0, 0)
+            };
+            let resized = former_size != Some((width, height));
+            let mut added = match added {
+                // Nothing changed: the framebuffer of this crate can be used as it is
+                Some(added) if !resized && added.color == (kind, name.get()) => {
+                    *screen = Some(ExternalScreen {
+                        framebuffer,
+                        width,
+                        height,
+                        depth: Some(added),
+                    });
+                    return Ok(());
+                }
+                Some(added) => added,
+                None => AddedDepth {
+                    framebuffer: context
+                        .create_framebuffer()
+                        .map_err(CoreError::ContextCreation)?,
+                    renderbuffer: match context.create_renderbuffer() {
+                        Ok(renderbuffer) => renderbuffer,
+                        Err(e) => return Err(CoreError::ContextCreation(e)),
+                    },
+                    color: (0, 0),
+                },
+            };
+            if resized || added.color == (0, 0) {
+                context.bind_renderbuffer(gl::RENDERBUFFER, Some(added.renderbuffer));
+                context.renderbuffer_storage(
+                    gl::RENDERBUFFER,
+                    gl::DEPTH_COMPONENT32F,
+                    width as i32,
+                    height as i32,
+                );
+                context.bind_renderbuffer(gl::RENDERBUFFER, None);
+            }
+            context.bind_framebuffer(gl::FRAMEBUFFER, Some(added.framebuffer));
+            if kind == gl::TEXTURE {
+                context.framebuffer_texture_2d(
+                    gl::FRAMEBUFFER,
+                    gl::COLOR_ATTACHMENT0,
+                    if face != 0 { face } else { gl::TEXTURE_2D },
+                    Some(crate::context::NativeTexture(name)),
+                    level,
+                );
+            } else {
+                context.framebuffer_renderbuffer(
+                    gl::FRAMEBUFFER,
+                    gl::COLOR_ATTACHMENT0,
+                    gl::RENDERBUFFER,
+                    Some(crate::context::NativeRenderbuffer(name)),
+                );
+            }
+            context.framebuffer_renderbuffer(
+                gl::FRAMEBUFFER,
+                gl::DEPTH_ATTACHMENT,
+                gl::RENDERBUFFER,
+                Some(added.renderbuffer),
+            );
+            context.draw_buffers(&[gl::COLOR_ATTACHMENT0]);
+            context.read_buffer(gl::COLOR_ATTACHMENT0);
+            let status = context.check_framebuffer_status(gl::FRAMEBUFFER);
+            if status != gl::FRAMEBUFFER_COMPLETE {
+                delete(added);
+                return Err(CoreError::ContextError(format!(
+                    "the screen framebuffer with an added depth buffer is not complete (status {status:#x}), \
+                     its color buffer has to be a 2D texture or a renderbuffer"
+                )));
+            }
+            added.color = (kind, name.get());
+            *screen = Some(ExternalScreen {
+                framebuffer,
+                width,
+                height,
+                depth: Some(added),
+            });
+            Ok(())
+        }
+    }
+
+    ///
+    /// Sets the OpenGL state that this crate expects but does not set before each draw call, after other code changed it.
+    /// See [Context::reset_gl_state](crate::core::Context::reset_gl_state).
+    ///
+    pub fn reset_state(&self) {
+        use crate::context as gl;
+        let context = &self.context;
+        let embedded = context.version().is_embedded;
+        unsafe {
+            context.bind_framebuffer(gl::FRAMEBUFFER, self.screen_framebuffer());
+            // Pixel transfer as set when the backend was created, from and to memory
+            for (parameter, value) in [
+                (gl::UNPACK_ALIGNMENT, 1),
+                (gl::UNPACK_ROW_LENGTH, 0),
+                (gl::UNPACK_IMAGE_HEIGHT, 0),
+                (gl::UNPACK_SKIP_PIXELS, 0),
+                (gl::UNPACK_SKIP_ROWS, 0),
+                (gl::UNPACK_SKIP_IMAGES, 0),
+                (gl::PACK_ALIGNMENT, 1),
+                (gl::PACK_ROW_LENGTH, 0),
+                (gl::PACK_SKIP_PIXELS, 0),
+                (gl::PACK_SKIP_ROWS, 0),
+            ] {
+                context.pixel_store_i32(parameter, value);
+            }
+            for target in [
+                gl::PIXEL_UNPACK_BUFFER,
+                gl::PIXEL_PACK_BUFFER,
+                gl::ARRAY_BUFFER,
+                gl::UNIFORM_BUFFER,
+            ] {
+                context.bind_buffer(target, None);
+            }
+            context.bind_vertex_array(None);
+            context.use_program(None);
+            // A sampler object bound to a texture unit overrides the parameters this crate sets on its textures
+            let units = context.get_parameter_i32(gl::MAX_COMBINED_TEXTURE_IMAGE_UNITS);
+            for unit in 0..units.max(0) as u32 {
+                context.bind_sampler(unit, None);
+            }
+            context.active_texture(gl::TEXTURE0);
+            for capability in [
+                gl::STENCIL_TEST,
+                gl::POLYGON_OFFSET_FILL,
+                gl::SAMPLE_ALPHA_TO_COVERAGE,
+                gl::SAMPLE_COVERAGE,
+                gl::RASTERIZER_DISCARD,
+            ] {
+                context.disable(capability);
+            }
+            context.enable(gl::DITHER);
+            context.front_face(gl::CCW);
+            context.depth_range_f32(0.0, 1.0);
+            context.blend_color(0.0, 0.0, 0.0, 0.0);
+            context.stencil_mask(!0);
+            #[cfg(not(target_arch = "wasm32"))]
+            context.disable(gl::PRIMITIVE_RESTART_FIXED_INDEX);
+            if !embedded {
+                context.disable(gl::PRIMITIVE_RESTART);
+                context.disable(gl::COLOR_LOGIC_OP);
+                context.disable(gl::FRAMEBUFFER_SRGB);
+                context.polygon_mode(gl::FRONT_AND_BACK, gl::FILL);
+                context.enable(gl::TEXTURE_CUBE_MAP_SEAMLESS);
+            }
+        }
+    }
+
+    /// The framebuffer that is the screen: the application's framebuffer if there is one, otherwise the offscreen screen if there is one,
+    /// otherwise the default framebuffer.
     fn screen_framebuffer(&self) -> Option<crate::context::Framebuffer> {
+        if let Some(external) = self
+            .external
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            return Some(
+                external
+                    .depth
+                    .as_ref()
+                    .map_or(external.framebuffer, |added| added.framebuffer),
+            );
+        }
         self.screen
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -231,7 +534,13 @@ impl GlBackend {
     /// and binds that one for reading.
     ///
     fn resolve_offscreen_screen(&self, source: &PassTarget) {
-        if source.framebuffer.is_some() {
+        if source.framebuffer.is_some()
+            || self
+                .external
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+        {
             return;
         }
         let screen = self.screen.lock().unwrap_or_else(|e| e.into_inner());

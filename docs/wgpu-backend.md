@@ -62,6 +62,25 @@ context.resize_offscreen_screen(new_width, new_height)?;
 - Before you drop such a context while the application keeps running, empty its program cache with `context.programs.write().unwrap().clear()`. The cached programs hold the context, so otherwise it and its graphics device are never freed.
 - This is only for native targets, since reading has to wait for the graphics card. In a browser use a canvas.
 
+## Drawing into a framebuffer of the application (OpenGL)
+
+A user interface toolkit that renders with OpenGL itself (for example Skia in Compose) can hand a framebuffer to `three-d` and show its color texture without reading the pixels back. Create the context from the toolkit's OpenGL context with `Context::from_gl_context` and make that framebuffer the screen each frame:
+
+```rust
+// inside the toolkit's callback, with its OpenGL context current
+context.set_screen_framebuffer(framebuffer, width, height, true)?;
+context.reset_gl_state()?;
+let screen = RenderTarget::screen(&context, width, height);
+screen.clear(ClearState::default()).render(&camera, &objects, &lights);
+```
+
+- Everything that uses the screen uses that framebuffer: `RenderTarget::screen`, clearing, viewport and scissor box, `read_color` and copies. `context.unset_screen_framebuffer()` goes back to the default framebuffer (or the offscreen screen). `three-d` never deletes the framebuffer.
+- **Depth.** Toolkits usually hand over a framebuffer with only a color texture. With `true` as the last argument, `three-d` adds a depth buffer: it renders into a framebuffer of its own with the toolkit's color texture (or renderbuffer) and a depth buffer of the given size, and leaves the toolkit's framebuffer as it is. Calling the function each frame is cheap, it only does work when the framebuffer, its color buffer or the size changed. WebGL cannot do this, there the framebuffer needs its own depth buffer.
+- **Sharing the OpenGL state.** `three-d` sets viewport, scissor box, blending, depth test, culling and write mask for every draw call and binds its own program, vertex array, buffers and textures. It does not save and restore any state. It relies on the rest being as it left it: pixel store parameters, no bound pixel buffers or sampler objects, stencil test, polygon offset, sample coverage, rasterizer discard, primitive restart, logic operations and sRGB conversion off, counter-clockwise front faces, filled polygons. Skia changes several of these (sampler objects, pixel store, stencil, sRGB), so call `context.reset_gl_state()` before drawing.
+- In the other direction, the toolkit has to be told that `three-d` changed its state. Skia caches the GL state, so after `three-d` has drawn, call `DirectContext::resetContext()` (Skiko: `DirectContext.resetGLAll()`) before Skia draws again, unless the toolkit already does so around its interop callback. Restoring the framebuffer binding and viewport, as compose-native does, is not enough for Skia.
+- Only the OpenGL backend has these functions, they return an error for other contexts. Multisampling the toolkit's framebuffer is not part of it; render into a multisampled texture and copy it to the screen if needed.
+- The image is in OpenGL's orientation: the first row of the texture is the bottom row. The toolkit draws it as a texture with origin bottom left.
+
 ## wgpu on top of OpenGL
 
 With the feature `wgpu-gl`, the wgpu backend can also draw with OpenGL (3.3 or newer) or OpenGL ES 3 on native targets:

@@ -284,6 +284,91 @@ impl Context {
     }
 
     ///
+    /// Makes a framebuffer of the application the screen of this context, for a context that shares its OpenGL context with
+    /// another renderer, for example a user interface toolkit that shows the color texture of `framebuffer` itself.
+    /// Only the OpenGL backend has this, it returns an error for every other context.
+    ///
+    /// From now on everything that uses the screen uses `framebuffer` instead of the default framebuffer
+    /// (or the offscreen screen of [Context::new_headless_gl_with_screen]): [RenderTarget::screen] and with it
+    /// `FrameInput::screen`, clearing, the viewport and scissor box, reading with [RenderTarget::read_color] and copying.
+    /// `width` and `height` are the size of the framebuffer in pixels, pass the same size to [RenderTarget::screen].
+    /// This crate never deletes `framebuffer`.
+    ///
+    /// If `depth` is set and `framebuffer` has no depth buffer, this crate adds one: it renders into a framebuffer of its own with
+    /// the color buffer of `framebuffer` (a 2D texture or a renderbuffer at `GL_COLOR_ATTACHMENT0`) and a depth buffer of the given size.
+    /// `framebuffer` itself is not changed. Without a depth buffer, depth testing on the screen has no effect, so most 3D scenes
+    /// need `depth`. Adding a depth buffer is not possible with WebGL, where this returns an error.
+    ///
+    /// Call this every frame before drawing, with the framebuffer the application hands over for that frame. It only does work
+    /// if the framebuffer, its color buffer or the size changed. [Context::unset_screen_framebuffer] goes back to the former screen.
+    ///
+    /// # Sharing the OpenGL context
+    ///
+    /// This crate sets the viewport, scissor box, blending, depth test, culling and write mask for each draw call and binds its own
+    /// vertex array, program, buffers and textures, but it expects the rest of the state to be as it left it. Other code in
+    /// the same OpenGL context, such as Skia, changes that state, so call [Context::reset_gl_state] after this function each frame.
+    /// The other renderer usually caches the state as well and has to be told that this crate changed it: with Skia, call
+    /// `DirectContext::resetContext` (`resetGLAll` in Skiko) after this crate has drawn, before Skia draws again.
+    ///
+    /// ```no_run
+    /// # use three_d::*;
+    /// # fn frame(context: &Context, framebuffer: context::Framebuffer, width: u32, height: u32) -> Result<(), CoreError> {
+    /// // Inside the callback of the application, with its OpenGL context current
+    /// context.set_screen_framebuffer(framebuffer, width, height, true)?;
+    /// context.reset_gl_state()?;
+    /// RenderTarget::screen(context, width, height)
+    ///     .clear(ClearState::color_and_depth(0.8, 0.8, 0.8, 1.0, 1.0));
+    /// // ... render
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    pub fn set_screen_framebuffer(
+        &self,
+        framebuffer: crate::context::Framebuffer,
+        width: u32,
+        height: u32,
+        depth: bool,
+    ) -> Result<(), CoreError> {
+        self.gl_only("set_screen_framebuffer")?
+            .set_external_screen(Some((framebuffer, width, height, depth)))
+    }
+
+    ///
+    /// Goes back to the screen that was used before [Context::set_screen_framebuffer]: the default framebuffer or the offscreen screen.
+    /// Deletes the depth buffer this crate added. Returns an error if this context does not use the OpenGL backend.
+    ///
+    pub fn unset_screen_framebuffer(&self) -> Result<(), CoreError> {
+        self.gl_only("unset_screen_framebuffer")?
+            .set_external_screen(None)
+    }
+
+    ///
+    /// Sets the OpenGL state that this crate relies on but does not set before each draw call, for a context that other code
+    /// changes as well, see [Context::set_screen_framebuffer]. Returns an error if this context does not use the OpenGL backend.
+    ///
+    /// Binds the screen framebuffer, sets the pixel store parameters this crate uses (alignment 1, no row length or skipping),
+    /// unbinds pixel, vertex and uniform buffers, the vertex array, the program and all sampler objects, makes texture unit 0 active,
+    /// disables stencil test, polygon offset, sample coverage, rasterizer discard, primitive restart, logic operations and sRGB conversion,
+    /// and sets front face, depth range, polygon mode and seamless cube maps to the values this crate expects.
+    ///
+    pub fn reset_gl_state(&self) -> Result<(), CoreError> {
+        self.gl_only("reset_gl_state")?.reset_state();
+        Ok(())
+    }
+
+    #[cfg_attr(not(any(test, feature = "wgpu")), allow(unused_variables))]
+    fn gl_only(&self, function: &str) -> Result<&backend::gl::GlBackend, CoreError> {
+        match &*self.backend {
+            backend::Backend::Gl(gl) => Ok(gl),
+            #[cfg(any(test, feature = "wgpu"))]
+            _ => Err(CoreError::ContextError(format!(
+                "Context::{function} is only available with the OpenGL backend"
+            ))),
+        }
+    }
+
+    ///
     /// Returns the wgpu device and queue if this context uses the wgpu backend, otherwise `None`.
     ///
     #[cfg(feature = "wgpu")]
