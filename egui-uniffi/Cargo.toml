@@ -1,0 +1,28 @@
+[package]
+name = "three-d-egui-uniffi"
+version = "0.1.0"
+edition = "2021"
+description = "Panels, switches and options of egui described from Kotlin (or any uniffi language) as a tree of nodes, drawn by three-d into the same picture as the 3D view, with the clicks and changed values handed back"
+license = "MIT"
+publish = false
+
+[lib]
+# lib: linked into the cdylib of an application crate (the KMP library), which then has these types in its bindings;
+# cdylib: bindings and tests of this crate on its own
+crate-type = ["lib", "cdylib"]
+
+[features]
+default = ["wgpu"]
+# Draws on contexts of three-d's wgpu backend too (with three-d's core painter); OpenGL/WebGL always works
+wgpu = ["three-d/wgpu"]
+
+[dependencies]
+uniffi = "0.32"
+# ThreadBound of the cargo-uniffi Gradle plugin; the same tag as three-d-raytrace-uniffi, so that both share one copy in an application
+cargo-uniffi-support = { git = "https://github.com/szsoftware/cargo-uniffi-gradle-plugin", tag = "support-v0.4.0-alpha.19", default-features = false, features = ["thread-bound"] }
+three-d = { path = "..", default-features = false, features = ["egui-gui"] }
+web-time = "1"
+
+# OpenGL through EGL without a window for the tests
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+three-d = { path = "..", default-features = false, features = ["egui-gui", "headless-gl"] }
