@@ -296,7 +296,7 @@ impl SceneView {
             if options.tracer != old.tracer {
                 s.raytrace = None;
             } else if let Some(r) = &mut s.raytrace {
-                let settings = options.apply(*r.preview.settings());
+                let settings = options.apply(*r.preview.settings(), s.cpu_threads);
                 r.preview.set_settings(settings);
             }
             Ok(())

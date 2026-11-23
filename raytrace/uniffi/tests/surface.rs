@@ -643,6 +643,17 @@ fn preview_options_by_hand() {
         ..PreviewOptions::AUTOMATIC
     };
     assert!(view.set_preview_options(wrong).is_err());
+    assert!(caps.cpu_cores >= 1, "{caps:?}");
+    for threads in [0, caps.cpu_cores + 1] {
+        let wrong = PreviewOptions {
+            cpu_threads: Some(threads),
+            ..PreviewOptions::AUTOMATIC
+        };
+        assert!(
+            view.set_preview_options(wrong).is_err(),
+            "{threads} threads"
+        );
+    }
     assert_eq!(view.preview_options().unwrap(), PreviewOptions::AUTOMATIC);
 
     let traced = |view: &SceneView| {
@@ -660,12 +671,34 @@ fn preview_options_by_hand() {
         tracer: TracerChoice::Cpu,
         cpu_downscale: Some(2),
         denoise: false,
+        cpu_threads: Some(1),
         ..PreviewOptions::AUTOMATIC
     })
     .unwrap();
     let status = traced(&view);
     assert_eq!(status.tracer, TracerKind::Cpu, "{status:?}");
     assert_eq!((status.width, status.height), (32, 24), "{status:?}");
+    assert_eq!(view.preview_options().unwrap().cpu_threads, Some(1));
+    // More threads for the running preview: it goes on tracing
+    view.set_preview_options(PreviewOptions {
+        tracer: TracerChoice::Cpu,
+        cpu_downscale: Some(2),
+        denoise: false,
+        cpu_threads: Some(caps.cpu_cores),
+        ..PreviewOptions::AUTOMATIC
+    })
+    .unwrap();
+    let samples = status.samples;
+    let mut more = false;
+    for _ in 0..400 {
+        view.next_frame().unwrap();
+        if view.preview_status().unwrap().unwrap().samples > samples {
+            more = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(more, "the CPU traced on with more threads");
 
     // The GPU by hand at a quarter of the resolution, fixed: after the shaders compiled it stays there
     view.set_preview_options(PreviewOptions {
@@ -673,6 +706,7 @@ fn preview_options_by_hand() {
         gpu_downscale: Some(4),
         cpu_downscale: None,
         denoise: true,
+        cpu_threads: None,
     })
     .unwrap();
     let mut status = traced(&view);
@@ -698,6 +732,7 @@ fn preview_options_by_hand() {
         gpu_downscale: Some(1),
         cpu_downscale: None,
         denoise: true,
+        cpu_threads: None,
     })
     .unwrap();
     let status = traced(&view);
