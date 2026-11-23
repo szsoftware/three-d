@@ -49,7 +49,9 @@ overlay.paint(&context, &RenderTarget::screen(&context, width, height), Viewport
 
 `paint_color` paints onto a `ColorTarget` (the texture of a view that is read back), `paint_with_events` takes a window's
 three-d events as well and marks those egui uses as handled, like three-d's `GUI`.
-OpenGL/WebGL paint with egui_glow, the wgpu backend with three-d's own painter. Painting belongs to the thread that
+A frame in which nothing changed (no new tree, no input, no animation of egui, the same size) paints egui's meshes of
+the frame before again without running egui (three-d's `GUI::render_previous`), so a resting panel costs only its
+drawing. OpenGL/WebGL paint with egui_glow, the wgpu backend with three-d's own painter. Painting belongs to the thread that
 painted first; on another three-d context the overlay makes a new egui (and loses what egui remembered).
 
 The crate uses `cargo-uniffi-support` with the same tag as `three-d-raytrace-uniffi`, so that an application with both

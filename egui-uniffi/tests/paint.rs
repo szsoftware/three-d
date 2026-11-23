@@ -304,6 +304,49 @@ fn an_overlay_without_changes_asks_for_no_frames() {
     }
 }
 
+/// A frame without changes paints egui's meshes of the frame before, without running egui: the same picture, also on a
+/// new picture under it, and the next click works as before.
+#[test]
+fn an_unchanged_panel_is_painted_again() {
+    for (name, context) in contexts() {
+        let overlay = EguiOverlay::new();
+        overlay.set_tree(tree(false)).unwrap();
+        for _ in 0..5 {
+            frame(&context, &overlay);
+        }
+        assert!(!overlay.needs_repaint(), "{name}");
+        let ran = frame(&context, &overlay);
+        let again = frame(&context, &overlay);
+        assert!(ran == again, "{name}: the painted again frame differs");
+        assert!(near(pixel(&again, 300, 150), [255, 0, 0], 0), "{name}");
+        assert!(!near(pixel(&again, 20, 150), [255, 0, 0], 40), "{name}: no panel");
+
+        let before = frame(&context, &overlay);
+        assert_eq!(
+            click(&context, &overlay, center(&overlay, 2)),
+            [true, true, true],
+            "{name}"
+        );
+        assert_eq!(
+            overlay.take_events(),
+            vec![UiEvent::Checked {
+                id: 2,
+                checked: true
+            }],
+            "{name}"
+        );
+        // The checked box shows, also in the frames after, when egui rests again
+        let checked = frame(&context, &overlay);
+        assert!(checked != before, "{name}: the click does not show");
+        for _ in 0..5 {
+            frame(&context, &overlay);
+        }
+        assert!(frame(&context, &overlay) == checked, "{name}");
+        drop(overlay);
+        release(context);
+    }
+}
+
 #[test]
 fn an_overlay_moves_to_a_new_context() {
     let first = contexts();
