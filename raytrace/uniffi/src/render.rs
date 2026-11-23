@@ -442,14 +442,17 @@ impl PreviewState {
             TracerChoice::Cpu => RaytracePreview::new_on_cpu(context, width, height),
             TracerChoice::Auto | TracerChoice::Gpu => RaytracePreview::new(context, width, height),
         };
-        let settings = options.apply(PreviewSettings {
-            tone_mapping: look.tone_mapping(),
-            max_bounces: look.max_bounces,
-            gpu_caustic_photons: look.caustic_photons,
-            cpu_caustic_photons: look.caustic_photons / 10,
-            cpu_threads: threads,
-            ..*preview.settings()
-        });
+        let settings = options.apply(
+            PreviewSettings {
+                tone_mapping: look.tone_mapping(),
+                max_bounces: look.max_bounces,
+                gpu_caustic_photons: look.caustic_photons,
+                cpu_caustic_photons: look.caustic_photons / 10,
+                cpu_threads: threads,
+                ..*preview.settings()
+            },
+            threads,
+        );
         preview.set_settings(settings);
         Self {
             preview,
@@ -755,6 +758,11 @@ pub struct PreviewOptions {
     pub cpu_downscale: Option<u32>,
     /// Smooths the noise of the first samples (on by default)
     pub denoise: bool,
+    ///
+    /// Threads the CPU traces with, 1 to `PreviewCapabilities.cpu_cores`; changes the running preview. `None` for the
+    /// renderer's `cpu_threads` (one less than the machine has, at least one). Browsers trace in one thread.
+    ///
+    pub cpu_threads: Option<u32>,
 }
 
 impl Default for PreviewOptions {
@@ -770,10 +778,19 @@ impl PreviewOptions {
         gpu_downscale: None,
         cpu_downscale: None,
         denoise: true,
+        cpu_threads: None,
     };
 
     /// Downscales that are not 1, 2 or 4 on the GPU or not 1 to 16 on the CPU.
     pub fn check(&self) -> Result<(), RtFfiError> {
+        if let Some(n) = self.cpu_threads {
+            let cores = cpu_cores();
+            if !(1..=cores).contains(&n) {
+                return Err(invalid(format!(
+                    "cpu_threads {n}: 1 to {cores}, or None for automatic"
+                )));
+            }
+        }
         if let Some(n) = self.gpu_downscale {
             if !GPU_DOWNSCALES.contains(&n) {
                 return Err(invalid(format!(
@@ -792,7 +809,8 @@ impl PreviewOptions {
     }
 
     /// The settings with these options in place of what they decide.
-    pub fn apply(&self, settings: PreviewSettings) -> PreviewSettings {
+    /// `threads` is what the CPU traces with for `cpu_threads: None`.
+    pub fn apply(&self, settings: PreviewSettings, threads: usize) -> PreviewSettings {
         let default = PreviewSettings::default();
         let (gpu_downscale, gpu_frame_time) = match self.gpu_downscale {
             Some(n) => (n, None),
@@ -803,6 +821,7 @@ impl PreviewOptions {
             gpu_frame_time,
             gpu_falls_back_to_cpu: self.tracer != TracerChoice::Gpu,
             cpu_downscale: self.cpu_downscale.unwrap_or(default.cpu_downscale),
+            cpu_threads: self.cpu_threads.map_or(threads, |n| n as usize),
             denoiser: if self.denoise {
                 settings.denoiser.or(default.denoiser)
             } else {
@@ -811,6 +830,11 @@ impl PreviewOptions {
             ..settings
         }
     }
+}
+
+/// Logical cores of the machine, 1 where it does not say (browsers).
+fn cpu_cores() -> u32 {
+    std::thread::available_parallelism().map_or(1, |n| n.get() as u32)
 }
 
 /// The fixed divisors of width and height on the GPU, see [PreviewOptions::gpu_downscale].
@@ -837,6 +861,8 @@ pub struct PreviewCapabilities {
     pub gpu_downscales: Vec<u32>,
     /// The largest [PreviewOptions::cpu_downscale]
     pub max_cpu_downscale: u32,
+    /// Logical cores of the machine, the most [PreviewOptions::cpu_threads]; 1 in browsers
+    pub cpu_cores: u32,
 }
 
 impl PreviewCapabilities {
@@ -865,6 +891,7 @@ impl PreviewCapabilities {
             timestamp_queries,
             gpu_downscales: GPU_DOWNSCALES.to_vec(),
             max_cpu_downscale: MAX_CPU_DOWNSCALE,
+            cpu_cores: cpu_cores(),
         }
     }
 }
