@@ -78,6 +78,55 @@ pub enum NoticeLevel {
     Error,
 }
 
+/// How a [PlotSeries] is drawn.
+#[derive(Debug, Clone, PartialEq, uniffi::Enum)]
+pub enum SeriesKind {
+    /// The points joined by a line.
+    Line {
+        /// In points.
+        width: f32,
+        /// Shades the area between the line and 0.
+        fill: bool,
+    },
+    /// Each point as a dot.
+    Points {
+        /// In points.
+        radius: f32,
+    },
+    /// A bar per value, standing on 0.
+    Bars {
+        /// In units of the x axis (1 is as wide as the step from one category to the next).
+        width: f64,
+        /// A group: the bars of the series with the same group stand on each other in the order of the series (bar i
+        /// on bar i), as the parts of a frame time.
+        stack: Option<String>,
+    },
+    /// A box per five values of [PlotSeries::y] (lower whisker, first quartile, median, third quartile, upper
+    /// whisker), at one value of [PlotSeries::x] each: how frame times spread.
+    Boxes {
+        /// In units of the x axis.
+        width: f64,
+    },
+    /// A dashed line across the whole plot at each value of [PlotSeries::y], for example the 16.7 ms of 60 frames per
+    /// second; [PlotSeries::x] stays empty.
+    HLine,
+}
+
+/// One line, set of dots, bars or boxes of a [Widget::Plot].
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct PlotSeries {
+    /// In the legend and when the pointer rests on it; unique within the plot (the legend hides series by name).
+    pub name: String,
+    /// How it is drawn.
+    pub kind: SeriesKind,
+    /// Where on the x axis, empty for 0, 1, 2 … (the categories of [Widget::Plot]).
+    pub x: Vec<f64>,
+    /// The values; five per box for [SeriesKind::Boxes].
+    pub y: Vec<f64>,
+    /// As ARGB, `None` the next color of egui_plot.
+    pub color: Option<u32>,
+}
+
 /// What a node is. The first five stand at the top of the tree (no parent), the containers hold other nodes, the rest
 /// are widgets. Sizes are in points of egui (pixels divided by [crate::EguiOverlay::set_scale]).
 #[derive(Debug, Clone, PartialEq, uniffi::Enum)]
@@ -263,6 +312,37 @@ pub enum Widget {
     },
     /// A small turning circle: something is busy.
     Spinner,
+    /// A diagram of lines, dots, bars and boxes (egui_plot), for benchmarks: frame times over time, a bar per scene.
+    /// The pointer on a series shows its values; with [Widget::Plot::interactive] dragging moves it, the wheel with
+    /// Ctrl (or a pinch) zooms, and a double click shows everything again.
+    Plot {
+        /// What it shows, drawn in this order.
+        series: Vec<PlotSeries>,
+        /// In points.
+        height: f32,
+        /// In points, `None` all the width there is.
+        width: Option<f32>,
+        /// Under the x axis, empty for none.
+        x_label: String,
+        /// Beside the y axis, empty for none.
+        y_label: String,
+        /// After the values the pointer shows, for example " ms" (the axes leave it out, so say it in the label).
+        x_unit: String,
+        /// After the values the pointer shows, for example " ms".
+        y_unit: String,
+        /// Names for x = 0, 1, 2 … on the x axis: the scenes of a bar chart. Empty for numbers.
+        categories: Vec<String>,
+        /// The names of the series in a corner; a click on one hides it.
+        legend: bool,
+        /// Dragging, zooming and the double click; `false` keeps it showing all of its series (still with values).
+        interactive: bool,
+        /// Plots with the same link show the same part of the x axis and the pointer's position together.
+        link: Option<String>,
+        /// Values the x axis always shows.
+        include_x: Vec<f64>,
+        /// Values the y axis always shows, for example 0 so that frame times start at the bottom.
+        include_y: Vec<f64>,
+    },
     /// A line in the color of its level: "takes effect after a restart".
     Notice {
         /// What it says.
@@ -325,6 +405,7 @@ impl Widget {
             Self::TextField { .. } => "TextField",
             Self::ProgressBar { .. } => "ProgressBar",
             Self::Spinner => "Spinner",
+            Self::Plot { .. } => "Plot",
             Self::Notice { .. } => "Notice",
         }
     }
@@ -365,6 +446,36 @@ impl Widget {
                 max: Some(max),
                 ..
             } if out_of_order(*min, *max) => Some(format!("min {min} > max {max}")),
+            Self::Plot { height, .. } if height.is_nan() || *height <= 0.0 => {
+                Some(format!("a plot needs a height above 0, it has {height}"))
+            }
+            Self::Plot { series, .. } => series.iter().find_map(PlotSeries::check),
+            _ => None,
+        }
+    }
+}
+
+impl PlotSeries {
+    /// Why its values do not fit together, if they do not.
+    fn check(&self) -> Option<String> {
+        let name = &self.name;
+        let (x, y) = (self.x.len(), self.y.len());
+        match self.kind {
+            SeriesKind::Boxes { .. } if y % 5 != 0 => Some(format!(
+                "the boxes '{name}' need five values each, they have {y}"
+            )),
+            SeriesKind::Boxes { .. } if x != 0 && x * 5 != y => Some(format!(
+                "the boxes '{name}' have {x} places for {} boxes",
+                y / 5
+            )),
+            SeriesKind::HLine if x != 0 => {
+                Some(format!("the lines across '{name}' take no x values"))
+            }
+            SeriesKind::Line { .. } | SeriesKind::Points { .. } | SeriesKind::Bars { .. }
+                if x != 0 && x != y =>
+            {
+                Some(format!("'{name}' has {x} x values for {y} y values"))
+            }
             _ => None,
         }
     }

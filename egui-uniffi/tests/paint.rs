@@ -509,3 +509,150 @@ fn an_options_panel_as_in_the_raytrace_window() {
         release(context);
     }
 }
+
+/// A benchmark window: frame times as a line with the 60 fps mark, and per scene the parts of a frame as stacked bars.
+/// With `THREE_D_EGUI_PICTURE=<dir>` it writes `<dir>/plot-<backend>.rgba` (`W` x `H`).
+#[test]
+fn plots_of_a_benchmark() {
+    const GREEN: u32 = 0xFF2ECC71;
+    const BLUE: u32 = 0xFF3498DB;
+    const ORANGE: u32 = 0xFFF39C12;
+    let series = |name: &str, kind, y: Vec<f64>, color| PlotSeries {
+        name: name.into(),
+        kind,
+        x: vec![],
+        y,
+        color: Some(color),
+    };
+    let plot = |series, categories: Vec<String>| Widget::Plot {
+        series,
+        height: 110.0,
+        width: None,
+        x_label: String::new(),
+        y_label: "ms".into(),
+        x_unit: String::new(),
+        y_unit: " ms".into(),
+        categories,
+        legend: true,
+        interactive: true,
+        link: None,
+        include_x: vec![],
+        include_y: vec![0.0],
+    };
+    let bars = |stack: &str| SeriesKind::Bars {
+        width: 0.6,
+        stack: Some(stack.into()),
+    };
+    let times: Vec<f64> = (0..60)
+        .map(|i| 12.0 + 3.0 * (i as f64 / 6.0).sin())
+        .collect();
+    let nodes = vec![
+        node(
+            1,
+            None,
+            Widget::Window {
+                title: "Benchmark".into(),
+                x: 10.0,
+                y: 10.0,
+                width: Some(370.0),
+                closable: false,
+                collapsible: false,
+                resizable: false,
+            },
+        ),
+        node(
+            2,
+            Some(1),
+            plot(
+                vec![
+                    series(
+                        "Frame time",
+                        SeriesKind::Line {
+                            width: 1.5,
+                            fill: true,
+                        },
+                        times,
+                        GREEN,
+                    ),
+                    series("60 fps", SeriesKind::HLine, vec![16.7], 0xFFE74C3C),
+                ],
+                vec![],
+            ),
+        ),
+        node(
+            3,
+            Some(1),
+            plot(
+                vec![
+                    series("Trace", bars("frame"), vec![9.0, 14.0, 6.0], BLUE),
+                    series("Denoise", bars("frame"), vec![3.0, 3.0, 3.0], ORANGE),
+                ],
+                vec!["Cloister".into(), "Garden".into(), "Hall".into()],
+            ),
+        ),
+    ];
+    let argb = |c: u32| {
+        let [_, r, g, b] = c.to_be_bytes();
+        [r, g, b]
+    };
+    for (name, context) in contexts() {
+        let overlay = EguiOverlay::new();
+        overlay.set_tree(nodes.clone()).unwrap();
+        // Until the window faded in and the axes found their widths
+        for _ in 0..100 {
+            frame(&context, &overlay);
+            if !overlay.needs_repaint() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let picture = frame(&context, &overlay);
+        if let Some(dir) = std::env::var_os("THREE_D_EGUI_PICTURE") {
+            let bytes: Vec<u8> = picture.iter().flatten().copied().collect();
+            std::fs::write(
+                std::path::Path::new(&dir).join(format!("plot-{name}.rgba")),
+                bytes,
+            )
+            .unwrap();
+        }
+        let in_plot = |id: u64, color: u32| {
+            let r = overlay.bounds(id).expect("drawn");
+            let mut ys = Vec::new();
+            for y in r.y as u32..(r.y + r.height) as u32 {
+                for x in r.x as u32..(r.x + r.width) as u32 {
+                    if near(pixel(&picture, x, y), argb(color), 24) {
+                        ys.push(y as f64);
+                    }
+                }
+            }
+            ys
+        };
+        let line = in_plot(2, GREEN);
+        assert!(
+            line.len() > 50,
+            "{name}: the line has {} pixels",
+            line.len()
+        );
+        let (trace, denoise) = (in_plot(3, BLUE), in_plot(3, ORANGE));
+        assert!(
+            trace.len() > 50 && denoise.len() > 50,
+            "{name}: bars {} {}",
+            trace.len(),
+            denoise.len()
+        );
+        // The denoise part stands on the trace part
+        let mean = |ys: &[f64]| ys.iter().sum::<f64>() / ys.len() as f64;
+        assert!(
+            mean(&denoise) < mean(&trace),
+            "{name}: the denoise bars are not on top"
+        );
+        // The pointer on a plot belongs to egui, which shows the values there
+        let (x, y) = center(&overlay, 3);
+        assert!(
+            overlay.input(UiInput::Move { x, y }) && overlay.needs_repaint(),
+            "{name}"
+        );
+        drop(overlay);
+        release(context);
+    }
+}
