@@ -37,6 +37,12 @@ cpuDownscale, denoise, cpuThreads))` fixes it: `TracerChoice.GPU` never goes to 
 resolution. `previewCapabilities()` says what the device can (GPU with the reason why not, ray query, timestamp
 queries, the downscales, the logical cores for `cpuThreads`), to show impossible switches as disabled with the reason as a tooltip.
 
+`SceneView.setOverlay(overlay)` puts egui over the view: an `EguiOverlay` of `three-d-egui-uniffi`, whose tree Kotlin
+describes (see that crate). The view draws it over every frame, the rasterizer's and the raytraced preview's, before the
+pixels are read, and hands it the events of `input` first: a click on a panel is egui's and leaves the camera alone (ask
+`overlay.covers(x, y)` before picking), a drag that starts beside the panels turns the camera. Characters for text
+fields go to `overlay.input(UiInput.Text(...))` directly. Hovering over the panel does not restart the raytraced preview.
+
 ### In the application crate
 
 A dependency on this crate is not enough: the linker drops everything the application's cdylib does not use, and with

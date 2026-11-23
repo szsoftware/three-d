@@ -4,7 +4,7 @@ use crate::{UiError, UiEvent, UiInput, UiNode, UiRect};
 use cargo_uniffi_support::ThreadBound;
 use std::sync::{Arc, Mutex, MutexGuard};
 use three_d::egui;
-use three_d::{Context, Event, RenderTarget, Viewport, GUI};
+use three_d::{ColorTarget, Context, CoreError, Event, RenderTarget, Viewport, GUI};
 use web_time::Instant;
 
 /// Colors of the overlay: egui's dark or light look with an accent of the application.
@@ -266,6 +266,33 @@ impl EguiOverlay {
         viewport: Viewport,
         events: &mut [Event],
     ) -> Result<(), UiError> {
+        self.paint_into(context, viewport, events, |render| {
+            target.write(render).map(|_| ())
+        })
+    }
+
+    ///
+    /// [EguiOverlay::paint] onto a color target, for example the texture of a view that is read back afterwards.
+    ///
+    pub fn paint_color(
+        &self,
+        context: &Context,
+        target: &ColorTarget<'_>,
+        viewport: Viewport,
+    ) -> Result<(), UiError> {
+        self.paint_into(context, viewport, &mut [], |render| {
+            target.write(render).map(|_| ())
+        })
+    }
+
+    /// Runs egui for a frame; `write` draws egui's meshes with the given closure into its target.
+    fn paint_into(
+        &self,
+        context: &Context,
+        viewport: Viewport,
+        events: &mut [Event],
+        write: impl FnOnce(&dyn Fn() -> Result<(), CoreError>) -> Result<(), CoreError>,
+    ) -> Result<(), UiError> {
         let mut painting = lock(&self.painting);
         let fresh = match painting.as_ref() {
             Some(p) => !p.with(|p| Arc::ptr_eq(&p.context.programs, &context.programs))?,
@@ -305,7 +332,7 @@ impl EguiOverlay {
                 *given = handled;
             }
             drop(all);
-            target.write(|| p.gui.render())?;
+            write(&|| p.gui.render())?;
             Ok(())
         })?
     }

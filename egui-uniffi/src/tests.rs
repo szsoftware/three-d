@@ -587,3 +587,37 @@ fn every_widget_draws() {
     // The panels are noted for telling whether the pointer is on egui
     assert_eq!(run.state.panels.len(), 3);
 }
+
+#[test]
+fn text_in_an_area_at_the_edge_does_not_wrap() {
+    let tree = |text: &str| {
+        vec![
+            node(
+                1,
+                None,
+                Widget::Area {
+                    anchor: Anchor::TopRight,
+                    dx: -8.0,
+                    dy: 8.0,
+                    frame: true,
+                },
+            ),
+            node(
+                2,
+                Some(1),
+                Widget::Text {
+                    text: text.into(),
+                    style: TextStyle::Monospace,
+                    color: None,
+                },
+            ),
+        ]
+    };
+    // egui keeps the size of an area from frame to frame: a longer text after a short one must not wrap
+    let mut run = Run::new(tree("0.0 ms"));
+    run.state.set_tree(tree("312.9 ms per frame")).unwrap();
+    run.frame(vec![]);
+    run.frame(vec![]);
+    let line = run.state.bounds[&2];
+    assert!(line.height < 20.0 && line.width > 100.0, "{line:?}");
+}
