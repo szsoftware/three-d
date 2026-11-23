@@ -53,6 +53,18 @@ impl std::fmt::Display for RtFfiError {
 
 impl std::error::Error for RtFfiError {}
 
+impl From<three_d_egui_uniffi::UiError> for RtFfiError {
+    fn from(e: three_d_egui_uniffi::UiError) -> Self {
+        match e {
+            three_d_egui_uniffi::UiError::WrongThread => Self::WrongThread,
+            three_d_egui_uniffi::UiError::Busy => Self::Busy,
+            e => Self::Gpu {
+                why: format!("egui: {e}"),
+            },
+        }
+    }
+}
+
 impl From<RtError> for RtFfiError {
     fn from(e: RtError) -> Self {
         match e {

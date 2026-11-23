@@ -739,3 +739,147 @@ fn preview_options_by_hand() {
     assert_ne!(status.tracer, TracerKind::Cpu, "{status:?}");
     assert_eq!((status.width, status.height), (64, 48), "{status:?}");
 }
+
+/// egui over the realtime view and over the raytraced preview: it lies over both pictures, clicks on it are egui's and
+/// leave the camera alone, drags beside it turn the camera.
+#[test]
+fn realtime_view_with_egui_over_it() {
+    use three_d_egui_uniffi::*;
+    if std::env::var_os("THREE_D_SKIP_GPU_TESTS").is_some() {
+        return;
+    }
+    let renderer = Renderer::headless(true);
+    if renderer.cpu_reason().is_some() && std::env::var("THREE_D_REQUIRE_WGPU").is_err() {
+        eprintln!("no GPU: {:?}", renderer.cpu_reason());
+        return;
+    }
+    let (w, h) = (240u32, 160u32);
+    let demo = demo_scene("pergola".to_owned()).unwrap();
+    let realtime = RealtimeSpec {
+        sun_shadow_map: 512,
+        raytrace_when_still_ms: None,
+        look: demo.look,
+    };
+    let view = renderer
+        .clone()
+        .scene_view(demo.scene.clone(), demo.camera, w, h, realtime)
+        .unwrap();
+    let overlay = EguiOverlay::new();
+    let node = |id, parent, widget| UiNode {
+        id,
+        parent,
+        widget,
+        enabled: true,
+        tooltip: None,
+    };
+    overlay
+        .set_tree(vec![
+            node(
+                1,
+                None,
+                Widget::SidePanel {
+                    side: Side::Left,
+                    title: None,
+                    width: 80.0,
+                    resizable: false,
+                },
+            ),
+            node(
+                2,
+                Some(1),
+                Widget::Checkbox {
+                    text: "Sun".into(),
+                    checked: false,
+                },
+            ),
+        ])
+        .unwrap();
+    view.set_overlay(Some(overlay.clone())).unwrap();
+    let gray = |frame: &Frame, x: u32, y: u32| {
+        let pixels = unsafe {
+            std::slice::from_raw_parts(frame.rgba.address as *const u8, frame.rgba.length as usize)
+        };
+        let p = &pixels[((y * w + x) * 4) as usize..][..3];
+        p.iter().all(|&c| c.abs_diff(27) <= 3)
+    };
+    view.next_frame().unwrap();
+    let frame = view.next_frame().unwrap();
+    assert!(gray(&frame, 70, 150), "egui's panel over the raster frame");
+    assert!(!gray(&frame, 200, 80), "the scene beside the panel");
+
+    // A drag that starts on the panel is egui's to its end: the camera stays
+    let camera = view.camera().unwrap();
+    let b = overlay.bounds(2).unwrap();
+    let (x, y) = (b.x + b.width / 2.0, b.y + b.height / 2.0);
+    let moved = |x, dx, button| InputEvent::Move {
+        x,
+        y,
+        dx,
+        dy: 0.0,
+        button,
+    };
+    assert!(view.input(InputEvent::Press { x, y, button: 0 }).unwrap());
+    assert!(view.input(moved(x + 120.0, 120.0, Some(0))).unwrap());
+    assert!(view
+        .input(InputEvent::Release {
+            x: x + 120.0,
+            y,
+            button: 0
+        })
+        .unwrap());
+    view.next_frame().unwrap();
+    // A click on the checkbox ticks it
+    assert!(view.input(moved(x, 0.0, None)).unwrap());
+    view.next_frame().unwrap();
+    assert!(view.input(InputEvent::Press { x, y, button: 0 }).unwrap());
+    view.next_frame().unwrap();
+    assert!(view.input(InputEvent::Release { x, y, button: 0 }).unwrap());
+    view.next_frame().unwrap();
+    assert_eq!(view.camera().unwrap(), camera);
+    assert_eq!(
+        overlay.take_events(),
+        vec![UiEvent::Checked {
+            id: 2,
+            checked: true
+        }]
+    );
+    // A drag beside the panel turns the camera, also when it passes over the panel
+    view.input(InputEvent::Press {
+        x: 200.0,
+        y: 80.0,
+        button: 0,
+    })
+    .unwrap();
+    assert!(view
+        .input(InputEvent::Move {
+            x: 60.0,
+            y: 80.0,
+            dx: -140.0,
+            dy: 0.0,
+            button: Some(0)
+        })
+        .unwrap());
+    view.input(InputEvent::Release {
+        x: 60.0,
+        y: 80.0,
+        button: 0,
+    })
+    .unwrap();
+    assert_ne!(view.camera().unwrap(), camera);
+
+    // The raytraced preview has the panel too
+    view.set_raytrace_when_still(Some(0)).unwrap();
+    for _ in 0..400 {
+        let frame = view.next_frame().unwrap();
+        if frame.samples > 0 {
+            assert!(gray(&frame, 70, 150), "egui's panel over the preview");
+            assert!(!gray(&frame, 200, 80), "the preview beside the panel");
+            view.set_overlay(None).unwrap();
+            let frame = view.next_frame().unwrap();
+            assert!(!gray(&frame, 70, 150), "without the overlay");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("the preview did not trace");
+}

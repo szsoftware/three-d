@@ -19,6 +19,7 @@ bindings, with Compose as the model.
 | `setStyle(UiStyle(dark, accent))` | egui's dark or light look with an accent color (ARGB) |
 | `covers(x, y)`, `bounds(id)` | whether a pixel is on egui, where a node was drawn (for tests that click on it) |
 | `paint(context, target, viewport)` | Rust only: draws over the application's picture, on the thread of its three-d context |
+| `SceneView.setOverlay(overlay)` | three-d-raytrace-uniffi's view paints it itself and hands it its input first |
 
 ## The tree
 
@@ -46,7 +47,8 @@ The application paints after its own drawing and before the pixels are read or s
 overlay.paint(&context, &RenderTarget::screen(&context, width, height), Viewport::new_at_origo(width, height))?;
 ```
 
-`paint_with_events` takes a window's three-d events as well and marks those egui uses as handled, like three-d's `GUI`.
+`paint_color` paints onto a `ColorTarget` (the texture of a view that is read back), `paint_with_events` takes a window's
+three-d events as well and marks those egui uses as handled, like three-d's `GUI`.
 OpenGL/WebGL paint with egui_glow, the wgpu backend with three-d's own painter. Painting belongs to the thread that
 painted first; on another three-d context the overlay makes a new egui (and loses what egui remembered).
 

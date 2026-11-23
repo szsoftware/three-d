@@ -486,17 +486,30 @@ impl PreviewState {
 
     /// The current image as a frame.
     pub fn read(&mut self) -> Frame {
+        self.read_with(None)
+            .expect("without an overlay nothing can fail")
+    }
+
+    /// [PreviewState::read] with egui drawn over the preview's image, as the view shows it.
+    pub fn read_with(
+        &mut self,
+        overlay: Option<&three_d_egui_uniffi::EguiOverlay>,
+    ) -> Result<Frame, RtFfiError> {
         self.preview
             .render_to_color(&self.target.as_color_target(None));
+        if let Some(overlay) = overlay {
+            let viewport = three_d::Viewport::new_at_origo(self.width, self.height);
+            overlay.paint_color(&self.context, &self.target.as_color_target(None), viewport)?;
+        }
         let bytes = self
             .readback
             .read(&self.target.as_color_target(None), self.width, self.height);
-        Frame {
+        Ok(Frame {
             rgba: NativeBytes::of(bytes),
             width: self.width,
             height: self.height,
             samples: self.preview.sample_count(),
-        }
+        })
     }
 }
 

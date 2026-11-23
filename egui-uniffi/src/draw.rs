@@ -148,6 +148,8 @@ impl Frame<'_> {
                 let r = egui::Area::new(id)
                     .anchor(align, [*dx, *dy])
                     .show(ui.ctx(), |ui| {
+                        // An area is as wide as its content: a frame time near the edge does not wrap
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                         if *frame {
                             egui::Frame::popup(ui.style()).show(ui, |ui| self.inside(ui, node));
                         } else {

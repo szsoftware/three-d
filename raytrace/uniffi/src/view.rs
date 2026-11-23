@@ -93,6 +93,25 @@ pub enum InputEvent {
     },
 }
 
+impl InputEvent {
+    /// The same event for egui.
+    fn to_ui(&self) -> three_d_egui_uniffi::UiInput {
+        use three_d_egui_uniffi::UiInput;
+        match self.clone() {
+            Self::Press { x, y, button } => UiInput::Press { x, y, button },
+            Self::Release { x, y, button } => UiInput::Release { x, y, button },
+            Self::Move { x, y, .. } => UiInput::Move { x, y },
+            Self::Wheel { x, y, delta } => UiInput::Wheel {
+                x,
+                y,
+                dx: 0.0,
+                dy: delta,
+            },
+            Self::Key { key, down } => UiInput::Key { key, down },
+        }
+    }
+}
+
 /// What a pick hit.
 #[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
 pub struct Hit {
@@ -155,6 +174,8 @@ struct ViewState {
     picked: Option<Option<Hit>>,
     /// A photo traces on the engine of the raytraced preview: the view shows the preview's image meanwhile
     photo: bool,
+    /// egui over the picture, see [SceneView::set_overlay]
+    overlay: Option<Arc<three_d_egui_uniffi::EguiOverlay>>,
 }
 
 #[derive(Default)]
@@ -212,6 +233,7 @@ impl Renderer {
             pick: None,
             picked: None,
             photo: false,
+            overlay: None,
             context,
         };
         Ok(Arc::new(SceneView {
@@ -354,9 +376,36 @@ impl SceneView {
         }))
     }
 
-    /// Hands an event to the camera control; true if it moves the camera.
+    /// Hands an event to the overlay (if there is one, see [SceneView::set_overlay]) and else to the camera control; true
+    /// if the picture changes: the camera moves or egui used the event. A click egui used is no click on the scene:
+    /// ask `overlay.covers(x, y)` before picking.
     pub fn input(&self, event: InputEvent) -> Result<bool, RtFfiError> {
-        self.state.with(|s| s.input(event))
+        self.state.with(|s| {
+            if let Some(overlay) = &s.overlay {
+                let released = matches!(event, InputEvent::Key { down: false, .. });
+                // No change of the camera: the raytraced preview goes on under the overlay
+                if overlay.input(event.to_ui()) {
+                    // A key that went down for the camera goes up there too, also while a text field has the focus
+                    if released {
+                        s.input(event);
+                    }
+                    return true;
+                }
+            }
+            s.input(event)
+        })
+    }
+
+    ///
+    /// egui over the picture: the overlay is drawn over every frame (the rasterizer and the raytraced preview) before it
+    /// is read, and gets the events of [SceneView::input] first. `None` takes it away. Characters for its text fields go
+    /// straight to `overlay.input(UiInput.Text(...))`. The overlay may serve one view at a time.
+    ///
+    pub fn set_overlay(
+        &self,
+        overlay: Option<Arc<three_d_egui_uniffi::EguiOverlay>>,
+    ) -> Result<(), RtFfiError> {
+        self.state.with(|s| s.overlay = overlay)
     }
 
     /// A new size in pixels.
@@ -672,7 +721,7 @@ impl ViewState {
         // A photo traces on the preview's engine: its image stays on screen
         if self.photo {
             if let Some(preview) = &mut self.raytrace {
-                return Ok(preview.read());
+                return preview.read_with(self.overlay.as_deref());
             }
         }
 
@@ -694,7 +743,7 @@ impl ViewState {
                 });
                 preview.update(scene, &camera)?;
                 if preview.preview.sample_count() > 0 {
-                    return Ok(preview.read());
+                    return preview.read_with(self.overlay.as_deref());
                 }
             } else {
                 // Moving again: the preview starts over when the camera stands still next time
@@ -733,6 +782,9 @@ impl ViewState {
         };
         target.render(&self.camera, self.groups.iter().map(|g| &g.gm), &lights);
         let (w, h) = (self.width, self.height);
+        if let Some(overlay) = &self.overlay {
+            overlay.paint(&self.context, &target, Viewport::new_at_origo(w, h))?;
+        }
         let bytes = self.readback.read(&self.color.as_color_target(None), w, h);
         Ok(Frame {
             rgba: NativeBytes::of(bytes),
