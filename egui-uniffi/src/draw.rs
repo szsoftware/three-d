@@ -624,7 +624,9 @@ fn plot(ui: &mut Ui, node: &UiNode) -> Response {
                 }
                 SeriesKind::Boxes { width } => {
                     let boxes =
-                        s.y.chunks_exact(5)
+                        s.y.as_chunks::<5>()
+                            .0
+                            .iter()
                             .enumerate()
                             .map(|(i, v)| {
                                 egui_plot::BoxElem::new(
