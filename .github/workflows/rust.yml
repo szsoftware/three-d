@@ -73,6 +73,10 @@ jobs:
       - name: Clippy ray tracing for Kotlin
         run: cargo clippy -p three-d-raytrace-uniffi --all-targets -- -D warnings
 
+      # egui described from Kotlin (egui-uniffi)
+      - name: Clippy egui for Kotlin
+        run: cargo clippy -p three-d-egui-uniffi --all-targets -- -D warnings
+
       # Software drivers for Vulkan and OpenGL (through EGL), so that the tests of the wgpu backend run without a GPU and compare it with the OpenGL backend
       - if: startsWith(matrix.os, 'ubuntu')
         run: sudo apt-get install -y mesa-vulkan-drivers libegl1 libegl-mesa0 libgl1-mesa-dri && echo "THREE_D_EXPECT_BACKEND=vulkan" >> $GITHUB_ENV
@@ -133,6 +137,11 @@ jobs:
             export THREE_D_SKIP_GPU_TESTS=1
           fi
           cargo test -p three-d-raytrace-uniffi
+
+      # egui described from Kotlin: the tree, events and input without a GPU, painting and clicks on OpenGL (Linux) and wgpu
+      - name: Test egui for Kotlin
+        shell: bash
+        run: cargo test -p three-d-egui-uniffi
 
       # The same tests with wgpu on top of OpenGL (feature wgpu-gl), again on the software driver
       - name: Test wgpu on OpenGL
@@ -200,6 +209,9 @@ jobs:
 
       - name: Check ray tracing for Kotlin on the web
         run: cargo check -p three-d-raytrace-uniffi --target wasm32-unknown-unknown
+
+      - name: Check egui for Kotlin on the web
+        run: cargo check -p three-d-egui-uniffi --target wasm32-unknown-unknown
 
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh

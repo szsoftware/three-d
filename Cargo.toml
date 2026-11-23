@@ -9,7 +9,7 @@ readme = "README.md"
 repository = "https://github.com/asny/three-d"
 categories = ["graphics", "rendering", "visualization", "wasm", "web-programming"]
 keywords = ["3d", "gamedev", "webassembly", "opengl", "webgl"]
-exclude = ["/examples", ".gitignore", "/web", "/raytrace", "/vendor"]
+exclude = ["/examples", ".gitignore", "/web", "/raytrace", "/egui-uniffi", "/vendor"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -219,7 +219,7 @@ path = "examples/logo/src/main.rs"
 
 # Fork addition: further crates of the fork live next to three-d, the examples stay separate crates
 [workspace]
-members = ["raytrace", "raytrace/uniffi"]
+members = ["raytrace", "raytrace/uniffi", "egui-uniffi"]
 exclude = ["examples", "vendor"]
 
 # Fork addition: wgpu-hal with a patch, so that wgpu notices a reset of the graphics card on OpenGL and reports a lost device,
