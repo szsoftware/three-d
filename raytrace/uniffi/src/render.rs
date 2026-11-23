@@ -750,13 +750,10 @@ pub struct PreviewOptions {
     /// Width and height on the GPU divided by this, fixed: 1, 2 or 4. `None` starts at the full resolution and lowers
     /// it when the GPU needs more than 40 ms per frame (then, for `Auto`, on to the CPU).
     ///
-    #[uniffi(default)]
     pub gpu_downscale: Option<u32>,
     /// Width and height on the CPU divided by this, 1 to 16; `None` for 4 (8 in browsers).
-    #[uniffi(default)]
     pub cpu_downscale: Option<u32>,
     /// Smooths the noise of the first samples (on by default)
-    #[uniffi(default = true)]
     pub denoise: bool,
 }
 
