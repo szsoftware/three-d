@@ -1,4 +1,7 @@
-use crate::render::{photo_of, rgba_texture, PhotoSource, PreviewState, Readback};
+use crate::render::{
+    photo_of, rgba_texture, PhotoSource, PreviewCapabilities, PreviewOptions, PreviewState,
+    Readback, TracerChoice,
+};
 use crate::thread::ThreadBound;
 use crate::*;
 use std::collections::{HashMap, HashSet};
@@ -145,6 +148,8 @@ struct ViewState {
     last_change: Instant,
     last_frame: Instant,
     raytrace: Option<PreviewState>,
+    /// What the raytraced preview does, by hand or automatically
+    preview_options: PreviewOptions,
     cpu_threads: usize,
     pick: Option<(f32, f32)>,
     picked: Option<Option<Hit>>,
@@ -202,6 +207,7 @@ impl Renderer {
             last_change: Instant::now(),
             last_frame: Instant::now(),
             raytrace: None,
+            preview_options: PreviewOptions::AUTOMATIC,
             cpu_threads: threads,
             pick: None,
             picked: None,
@@ -269,6 +275,45 @@ impl SceneView {
                 s.raytrace = None;
             }
         })
+    }
+
+    ///
+    /// Sets by hand what the raytraced preview does, for tests, benchmarks and demonstrations:
+    /// [PreviewOptions::AUTOMATIC] (the default) decides everything by itself. A new tracer makes the preview anew
+    /// (when the camera stands still next time); downscales and denoiser change the running one. [TracerChoice::Gpu]
+    /// where [SceneView::preview_capabilities] has no GPU is an error with the reason, as are downscales it does not
+    /// list; the options stay as they were then.
+    ///
+    pub fn set_preview_options(&self, options: PreviewOptions) -> Result<(), RtFfiError> {
+        options.check()?;
+        self.state.with(|s| {
+            if options.tracer == TracerChoice::Gpu {
+                if let Some(why) = PreviewCapabilities::of(&s.context).gpu_reason {
+                    return Err(RtFfiError::Gpu { why });
+                }
+            }
+            let old = std::mem::replace(&mut s.preview_options, options);
+            if options.tracer != old.tracer {
+                s.raytrace = None;
+            } else if let Some(r) = &mut s.raytrace {
+                let settings = options.apply(*r.preview.settings());
+                r.preview.set_settings(settings);
+            }
+            Ok(())
+        })?
+    }
+
+    /// The options of the raytraced preview, see [SceneView::set_preview_options].
+    pub fn preview_options(&self) -> Result<PreviewOptions, RtFfiError> {
+        self.state.with(|s| s.preview_options)
+    }
+
+    ///
+    /// What the raytraced preview can do on this device: options that cannot work shown as disabled, with
+    /// `gpu_reason` as the tooltip. Costs nothing, the preview need not exist.
+    ///
+    pub fn preview_capabilities(&self) -> Result<PreviewCapabilities, RtFfiError> {
+        self.state.with(|s| PreviewCapabilities::of(&s.context))
     }
 
     /// When the raytraced preview takes over: after the camera stood still this long, `None` never (only the
@@ -636,16 +681,17 @@ impl ViewState {
         if let Some(after) = self.realtime.raytrace_when_still_ms {
             if still >= after {
                 let camera = CameraSpec::from_camera(&self.camera);
-                let (w, h, look, threads) = (
+                let (w, h, look, threads, options) = (
                     self.width,
                     self.height,
                     self.realtime.look,
                     self.cpu_threads,
+                    self.preview_options,
                 );
                 let context = self.context.clone();
-                let preview = self
-                    .raytrace
-                    .get_or_insert_with(|| PreviewState::new(&context, w, h, look, threads));
+                let preview = self.raytrace.get_or_insert_with(|| {
+                    PreviewState::new(&context, w, h, look, threads, options)
+                });
                 preview.update(scene, &camera)?;
                 if preview.preview.sample_count() > 0 {
                     return Ok(preview.read());

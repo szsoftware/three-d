@@ -353,6 +353,50 @@ fn a_slow_gpu_gets_a_lighter_preview() {
 }
 
 #[test]
+fn a_slow_gpu_kept_by_hand_stays_on_the_gpu_at_a_quarter() {
+    let Some(context) = context() else { return };
+    let mut preview = RaytracePreview::new(&context, 64, 32);
+    preview.wait_for_gpu();
+    if preview.kind() != TracerKind::Compute {
+        return;
+    }
+    // Far too slow as above, but the GPU was chosen by hand: the lowest resolution, never the CPU
+    preview.set_settings(PreviewSettings {
+        gpu_frame_time: Some(std::time::Duration::from_nanos(1)),
+        gpu_falls_back_to_cpu: false,
+        cpu_in_background: false,
+        ..*preview.settings()
+    });
+    let scene = sky_only(1000.0);
+    for _ in 0..40 {
+        preview
+            .update(&scene, &camera(64, 32, vec3(0.0, 0.0, 0.0)))
+            .unwrap();
+        assert_eq!(preview.kind(), TracerKind::Compute);
+    }
+    assert_eq!(preview.gpu_downscale(), 4);
+    assert_eq!(preview.availability(), &PreviewAvailability::Gpu);
+
+    // From the CPU, where the fallback had taken it, back to the GPU when it is turned off
+    preview.set_settings(PreviewSettings {
+        gpu_falls_back_to_cpu: true,
+        ..*preview.settings()
+    });
+    for _ in 0..40 {
+        preview
+            .update(&scene, &camera(64, 32, vec3(0.0, 0.0, 0.0)))
+            .unwrap();
+    }
+    assert_eq!(preview.kind(), TracerKind::CpuReference);
+    preview.set_settings(PreviewSettings {
+        gpu_falls_back_to_cpu: false,
+        ..*preview.settings()
+    });
+    assert_eq!(preview.kind(), TracerKind::Compute);
+    finish(&context);
+}
+
+#[test]
 fn a_slow_application_does_not_make_the_gpu_preview_lighter() {
     let Some(context) = context() else { return };
     let mut preview = RaytracePreview::new(&context, 64, 32);
