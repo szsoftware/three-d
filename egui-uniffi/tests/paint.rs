@@ -1951,7 +1951,7 @@ fn the_theme_fonts_zoom_and_saved_state_from_kotlin_change_the_picture() {
         overlay.set_fonts(vec![]).unwrap();
         overlay.set_theme(UiTheme::default());
         frames(&context, &overlay);
-        // Ctrl and = zoom by a tenth, egui gets nothing of it
+        // Ctrl (Command on a Mac) and = zoom by a tenth, egui gets nothing of it
         let small = overlay.bounds(4).unwrap();
         let key = |key: &str, down| {
             overlay.input(UiInput::Key {
@@ -1959,10 +1959,15 @@ fn the_theme_fonts_zoom_and_saved_state_from_kotlin_change_the_picture() {
                 down,
             })
         };
-        key("Control", true);
+        let command = if cfg!(target_os = "macos") {
+            "Meta"
+        } else {
+            "Control"
+        };
+        key(command, true);
         assert!(key("=", true), "{name}: the zoom keys belong to egui");
         key("=", false);
-        key("Control", false);
+        key(command, false);
         frames(&context, &overlay);
         assert_eq!(
             overlay.take_events(),
