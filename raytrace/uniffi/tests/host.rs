@@ -5,7 +5,6 @@
 
 use std::sync::Arc;
 use three_d::*;
-use three_d_egui_uniffi::{EguiOverlay, Side, UiNode, Widget};
 use three_d_raytrace_uniffi::*;
 
 const HOST: (u32, u32) = (96, 64);
@@ -150,6 +149,7 @@ fn a_host_on_wgpu_draws_the_view_into_its_texture() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_host_on_opengl_draws_the_view_onto_its_screen() {
+    use three_d_egui_uniffi::{EguiOverlay, Side, UiNode, Widget};
     let context = match Context::new_headless_gl_with_screen(HOST.0, HOST.1, true, false) {
         Ok(context) => context,
         Err(e) => {
