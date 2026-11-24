@@ -3,9 +3,10 @@
 use crate::state::Focus;
 use crate::state::{Local, UiRect, UiState};
 use crate::{
-    Align, Anchor, Arrangement, NoticeLevel, PlotSeries, PopupClose, PopupSide, ScrollDirection,
-    SeriesKind, Side, SliderClamping, SliderHandle, TextSpan, TextStyle, Tree, UiDate, UiEvent,
-    UiInsets, UiModifier, UiNode, Widget,
+    Align, Anchor, Arrangement, ColumnWidth, NoticeLevel, PlotSeries, PopupClose, PopupSide,
+    ScrollDirection, SeriesKind, Side, SliderClamping, SliderHandle, StripSize, TableColumn,
+    TableSelection, TableSort, TextSpan, TextStyle, Tree, UiDate, UiEvent, UiInsets, UiModifier,
+    UiNode, Widget,
 };
 use std::collections::HashMap;
 use three_d::egui::{self, Color32, Id, Layout, Response, RichText, Ui, UiBuilder};
@@ -432,6 +433,322 @@ impl Frame<'_> {
         self.attached(&response, node);
     }
 
+    /// A [Widget::Table]: the header from a header row or the titles of the columns, then the rows from nodes or from
+    /// the table's data; only the rows that are seen are drawn.
+    fn table(&mut self, ui: &mut Ui, node: &UiNode) {
+        let Widget::Table {
+            columns,
+            data,
+            striped,
+            resizable,
+            selection,
+            selected,
+            sort,
+            row_height,
+            max_height,
+            stick_to_end,
+            scroll_to,
+        } = &node.widget
+        else {
+            return;
+        };
+        let tree = self.tree;
+        let rows = tree.children(node.id);
+        let (header_row, body_rows) = match rows.first() {
+            Some(&first)
+                if matches!(
+                    tree.nodes[first].widget,
+                    Widget::TableRow { header: true, .. }
+                ) =>
+            {
+                (Some(&tree.nodes[first]), &rows[1..])
+            }
+            _ => (None, rows),
+        };
+        let line = ui
+            .text_style_height(&egui::TextStyle::Body)
+            .max(ui.spacing().interact_size.y);
+        let height = row_height.unwrap_or(line);
+        let row_height_of = |row: &UiNode| match row.widget {
+            Widget::TableRow {
+                height: Some(h), ..
+            } => h,
+            _ => height,
+        };
+        let (selected, sort) = match self.state.local(node.id) {
+            Some(Local::Rows(rows)) => (rows.clone(), *sort),
+            Some(Local::Sort(s)) => (selected.clone(), Some(*s)),
+            _ => (selected.clone(), *sort),
+        };
+        let id = node_id(node);
+        // Scrolls when Kotlin names another row, not in every frame (the user scrolls too)
+        let scroll_key = id.with("scroll_to");
+        let scroll = ui.data_mut(|d| {
+            let last = d.get_temp::<Option<u64>>(scroll_key);
+            d.insert_temp(scroll_key, *scroll_to);
+            if last == Some(*scroll_to) {
+                None
+            } else {
+                *scroll_to
+            }
+        });
+        // egui_extras takes 200 points at least once rows scroll, also in a smaller cell: the rows take what the
+        // container leaves them, in one that shrinks to its content what is seen below the header
+        let titled = columns.iter().any(|c| !c.title.is_empty());
+        let header_height = match header_row {
+            Some(header) => row_height_of(header) + ui.spacing().item_spacing.y,
+            None if titled => line + ui.spacing().item_spacing.y,
+            None => 0.0,
+        };
+        let least = if ui.available_height() < 1.0 {
+            (room_below(ui) - header_height).max(0.0)
+        } else {
+            0.0
+        };
+        // In egui's sizing pass (the first frame of a window) egui_extras makes each column as wide as its content,
+        // which resizable columns would keep: they take their widths anew in the first frame after it
+        let sizing = ui.is_sizing_pass();
+        let sizing_key = id.with("sizing");
+        let after_sizing = ui.data_mut(|d| {
+            let was = d.get_temp::<bool>(sizing_key).unwrap_or(false);
+            d.insert_temp(sizing_key, sizing);
+            was
+        });
+        let mut builder = egui_extras::TableBuilder::new(ui)
+            .id_salt(id)
+            .striped(*striped)
+            .resizable(*resizable)
+            .stick_to_bottom(*stick_to_end)
+            .max_scroll_height(max_height.unwrap_or(f32::INFINITY))
+            .min_scrolled_height(max_height.map_or(least, |max| least.min(max)))
+            .cell_layout(Layout::left_to_right(egui::Align::Center));
+        if after_sizing && !sizing {
+            builder.reset();
+        }
+        if selection.is_some() {
+            builder = builder.sense(egui::Sense::click());
+        }
+        if let Some(row) = scroll {
+            builder = builder.scroll_to_row(row as usize, Some(egui::Align::Center));
+        }
+        for c in columns {
+            builder = builder.column(column(c));
+        }
+        // What the user did, applied after the table let go of the frame
+        let mut clicked: Option<u64> = None;
+        let mut sorted: Option<TableSort> = None;
+        let this = std::cell::RefCell::new(&mut *self);
+        let body = |body: egui_extras::TableBody<'_>| {
+            let mut react = |row: &mut egui_extras::TableRow<'_, '_>| {
+                if selection.is_some() {
+                    let r = row.response();
+                    if r.clicked() {
+                        clicked = Some(row.index() as u64);
+                    }
+                }
+            };
+            match data {
+                Some(key) => {
+                    let this = this.borrow();
+                    let Some(data) = this.state.tables.get(key) else {
+                        return;
+                    };
+                    let shown = data.columns.min(columns.len());
+                    body.rows(height, data.rows(), |mut row| {
+                        let index = row.index();
+                        row.set_selected(selected.contains(&(index as u64)));
+                        for (c, column) in columns.iter().enumerate().take(shown) {
+                            row.col(|ui| {
+                                aligned(ui, column.align, |ui| {
+                                    let text = styled(
+                                        data.cell(index, c),
+                                        column.style.unwrap_or(TextStyle::Body),
+                                        None,
+                                    );
+                                    // A column that grows with its cells needs their whole text, others cut it
+                                    let label = egui::Label::new(text).selectable(false);
+                                    let grows = column.width.unwrap_or(ColumnWidth::Auto)
+                                        == ColumnWidth::Auto
+                                        && !column.resizable.unwrap_or(*resizable);
+                                    ui.add(if grows {
+                                        label.extend()
+                                    } else {
+                                        label.truncate()
+                                    });
+                                });
+                            });
+                        }
+                        react(&mut row);
+                    });
+                }
+                None => {
+                    body.heterogeneous_rows(
+                        body_rows.iter().map(|&r| row_height_of(&tree.nodes[r])),
+                        |mut row| {
+                            let index = row.index();
+                            let row_node = &tree.nodes[body_rows[index]];
+                            row.set_selected(selected.contains(&(index as u64)));
+                            this.borrow_mut().cells(
+                                &mut row,
+                                row_node,
+                                columns,
+                                selection.is_some(),
+                            );
+                            react(&mut row);
+                        },
+                    );
+                }
+            }
+        };
+        match header_row {
+            Some(header) => builder
+                .header(row_height_of(header), |mut row| {
+                    this.borrow_mut().cells(&mut row, header, columns, false)
+                })
+                .body(body),
+            None if titled => builder
+                .header(line, |mut row| {
+                    for (i, c) in columns.iter().enumerate() {
+                        row.col(|ui| {
+                            let cell = ui.max_rect();
+                            let mut text = c.title.clone();
+                            let by_it = sort.filter(|s| s.column as usize == i);
+                            if let Some(s) = by_it {
+                                text.push_str(if s.ascending { " ⏶" } else { " ⏷" });
+                            }
+                            // The whole cell of a sortable title answers, lit while the pointer is on it
+                            let hovered = c.sortable && ui.rect_contains_pointer(cell);
+                            let mut text = RichText::new(text).strong();
+                            if hovered {
+                                text = text.color(ui.visuals().widgets.hovered.fg_stroke.color);
+                            }
+                            aligned(ui, c.align, |ui| {
+                                ui.add(egui::Label::new(text).selectable(false))
+                            });
+                            if c.sortable
+                                && ui
+                                    .interact(cell, ui.id().with(("sort", i)), egui::Sense::click())
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .clicked()
+                            {
+                                sorted = Some(TableSort {
+                                    column: i as u32,
+                                    ascending: !by_it.is_some_and(|s| s.ascending),
+                                });
+                            }
+                        });
+                    }
+                })
+                .body(body),
+            None => builder.body(body),
+        };
+        if let Some(sort) = sorted {
+            self.state.change(
+                Local::Sort(sort),
+                UiEvent::SortChanged { id: node.id, sort },
+            );
+        }
+        if let (Some(row), Some(selection)) = (clicked, selection) {
+            let anchor_key = id.with("anchor");
+            let modifiers = ui.input(|i| i.modifiers);
+            let anchor = ui.data(|d| d.get_temp::<u64>(anchor_key));
+            let rows = select_rows(*selection, &selected, row, modifiers, anchor);
+            if !(*selection == TableSelection::Multiple && modifiers.shift) {
+                ui.data_mut(|d| d.insert_temp(anchor_key, row));
+            }
+            if rows != selected {
+                self.state.change(
+                    Local::Rows(rows.clone()),
+                    UiEvent::RowsSelected { id: node.id, rows },
+                );
+            }
+            // The second click on the same row within egui's time for a double click opens it, a third does not
+            // again. egui's own count takes a click within 0.6 s of the one before the last for a third one, wherever
+            // that was, so a double click right after a click elsewhere would not count
+            let now = ui.input(|i| i.time);
+            let delay = ui.ctx().options(|o| o.input_options.max_double_click_delay);
+            let clicks_key = id.with("clicks");
+            let count = ui.data_mut(|d| {
+                let count = match d.get_temp::<(u64, f64, u32)>(clicks_key) {
+                    Some((last, at, n)) if last == row && now - at < delay => n + 1,
+                    _ => 1,
+                };
+                d.insert_temp(clicks_key, (row, now, count));
+                count
+            });
+            if count == 2 {
+                self.state.push(UiEvent::RowActivated { id: node.id, row });
+            }
+        }
+    }
+
+    /// The nodes of a [Widget::TableRow] in its cells, each in the place its column says. In a row that is selected
+    /// with a click, text is not selectable: a click on it selects the row.
+    fn cells(
+        &mut self,
+        row: &mut egui_extras::TableRow<'_, '_>,
+        node: &UiNode,
+        columns: &[TableColumn],
+        selectable: bool,
+    ) {
+        let cells = self.tree.children(node.id);
+        if cells.is_empty() {
+            // A row needs a cell to answer clicks
+            row.col(|_| {});
+        }
+        for (&cell, column) in cells.iter().zip(columns) {
+            row.col(|ui| {
+                if selectable {
+                    ui.style_mut().interaction.selectable_labels = false;
+                }
+                aligned(ui, column.align, |ui| self.node(ui, &self.tree.nodes[cell]))
+            });
+        }
+        self.state
+            .bounds
+            .insert(node.id, row.response().rect.into());
+    }
+
+    /// A [Widget::Strip]: a cell per size, a node in each.
+    fn strip(
+        &mut self,
+        ui: &mut Ui,
+        node: &UiNode,
+        sizes: &[StripSize],
+        vertical: bool,
+        clip: bool,
+    ) -> Response {
+        let tree = self.tree;
+        let children = tree.children(node.id);
+        let mut draw = |ui: &mut Ui| {
+            let mut builder = egui_extras::StripBuilder::new(ui).clip(clip);
+            for &size in sizes {
+                builder = builder.size(strip_size(size));
+            }
+            let cells = |mut strip: egui_extras::Strip<'_, '_>| {
+                for i in 0..sizes.len() {
+                    match children.get(i) {
+                        Some(&child) => strip.cell(|ui| self.node(ui, &tree.nodes[child])),
+                        None => strip.empty(),
+                    }
+                }
+            };
+            if vertical {
+                builder.vertical(cells)
+            } else {
+                builder.horizontal(cells)
+            }
+        };
+        // A strip divides the room its container leaves it; one that shrinks to its content leaves none, the strip
+        // then divides what is seen below it
+        if ui.available_height() < 1.0 {
+            let room = egui::vec2(ui.available_width(), room_below(ui));
+            ui.allocate_ui(room, |ui| draw(ui)).inner
+        } else {
+            draw(ui)
+        }
+    }
+
     /// A [Widget::Shortcut]: [UiEvent::Clicked] when its keys are pressed. Without Ctrl or Alt it waits while a text
     /// field has the keyboard, which needs the keys itself.
     fn shortcut(&mut self, ctx: &egui::Context, node: &UiNode) {
@@ -746,6 +1063,17 @@ impl Frame<'_> {
                 return None;
             }
             Widget::Group => ui.group(|ui| self.children(ui, node)).response,
+            Widget::Table { .. } => {
+                self.table(ui, node);
+                return None;
+            }
+            // Drawn by their table
+            Widget::TableRow { .. } => return None,
+            Widget::Strip {
+                sizes,
+                vertical,
+                clip,
+            } => self.strip(ui, node, sizes, *vertical, *clip),
             Widget::MenuBar => {
                 egui::MenuBar::new()
                     .ui(ui, |ui| self.children(ui, node))
@@ -785,7 +1113,8 @@ impl Frame<'_> {
                     }
                     egui::Label::new(job)
                 };
-                label = label.selectable(*selectable);
+                // A row of a table that is selected with a click turns selecting text off
+                label = label.selectable(*selectable && ui.style().interaction.selectable_labels);
                 if let Some(wrap) = wrap {
                     label = label.wrap_mode((*wrap).into());
                 }
@@ -1300,6 +1629,103 @@ impl Frame<'_> {
 }
 
 /// A text in its style and color.
+/// A column of egui_extras for `c`.
+fn column(c: &TableColumn) -> egui_extras::Column {
+    let mut column = match c.width.unwrap_or(ColumnWidth::Auto) {
+        ColumnWidth::Auto => egui_extras::Column::auto(),
+        ColumnWidth::Initial { width } => egui_extras::Column::initial(width),
+        ColumnWidth::Exact { width } => egui_extras::Column::exact(width),
+        ColumnWidth::Remainder => egui_extras::Column::remainder(),
+    };
+    if let Some(min) = c.min_width {
+        column = column.at_least(min);
+    }
+    if let Some(max) = c.max_width {
+        column = column.at_most(max);
+    }
+    if let Some(resizable) = c.resizable {
+        column = column.resizable(resizable);
+    }
+    if c.clip {
+        column = column.clip(true);
+    }
+    column
+}
+
+/// A size of egui_extras for `size`.
+fn strip_size(size: StripSize) -> egui_extras::Size {
+    let (mut s, min, max) = match size {
+        StripSize::Exact { points } => (egui_extras::Size::exact(points), None, None),
+        StripSize::Initial { points, min, max } => (egui_extras::Size::initial(points), min, max),
+        StripSize::Relative { fraction, min, max } => {
+            (egui_extras::Size::relative(fraction), min, max)
+        }
+        StripSize::Remainder { min, max } => (egui_extras::Size::remainder(), min, max),
+    };
+    if let Some(min) = min {
+        s = s.at_least(min);
+    }
+    if let Some(max) = max {
+        s = s.at_most(max);
+    }
+    s
+}
+
+/// `add` at the start, in the middle or at the end of a cell, in the middle of its height.
+fn aligned<R>(ui: &mut Ui, align: Option<Align>, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let layout = match align.unwrap_or(Align::Start) {
+        Align::Start => return add(ui),
+        Align::Center => Layout::left_to_right(egui::Align::Center)
+            .with_main_align(egui::Align::Center)
+            .with_main_justify(true),
+        Align::End => Layout::right_to_left(egui::Align::Center),
+    };
+    ui.with_layout(layout, add).inner
+}
+
+/// The room below the cursor for what takes all there is (a table, a strip) in a container that shrinks to its
+/// content (a column, a frame), which leaves it none: down to the bottom of what is seen.
+fn room_below(ui: &Ui) -> f32 {
+    (ui.clip_rect().bottom() - ui.cursor().top()).max(0.0)
+}
+
+/// The rows selected after a click on `row`: alone, with Ctrl (Command) added or taken away, with Shift from the row
+/// clicked before on.
+fn select_rows(
+    selection: TableSelection,
+    selected: &[u64],
+    row: u64,
+    modifiers: egui::Modifiers,
+    anchor: Option<u64>,
+) -> Vec<u64> {
+    match selection {
+        TableSelection::Multiple if modifiers.shift => {
+            let from = anchor.unwrap_or(row);
+            let mut rows: Vec<u64> = (from.min(row)..=from.max(row)).collect();
+            if modifiers.command {
+                rows.extend(
+                    selected
+                        .iter()
+                        .filter(|r| !rows.contains(r))
+                        .copied()
+                        .collect::<Vec<_>>(),
+                );
+                rows.sort_unstable();
+            }
+            rows
+        }
+        TableSelection::Multiple if modifiers.command => {
+            let mut rows: Vec<u64> = selected.iter().copied().filter(|&r| r != row).collect();
+            if !selected.contains(&row) {
+                rows.push(row);
+                rows.sort_unstable();
+            }
+            rows
+        }
+        _ => vec![row],
+    }
+}
+
 fn styled(text: &str, style: TextStyle, color: Option<u32>) -> RichText {
     let rich = RichText::new(text);
     let rich = match style {

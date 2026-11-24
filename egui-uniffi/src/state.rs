@@ -1,4 +1,4 @@
-use crate::{Tree, UiDate, UiError, UiNode};
+use crate::{TableSort, Tree, UiDate, UiError, UiNode};
 use std::collections::HashMap;
 
 /// What the user did in a frame, for Kotlin to take with [crate::EguiOverlay::take_events]: the DSL calls the lambda of
@@ -79,6 +79,28 @@ pub enum UiEvent {
         /// Has it now.
         focused: bool,
     },
+    /// The user selected other rows of a [crate::Widget::Table].
+    RowsSelected {
+        /// The table.
+        id: u64,
+        /// The indices of all selected rows, in order.
+        rows: Vec<u64>,
+    },
+    /// The user double-clicked a row of a [crate::Widget::Table] with a selection: open it.
+    RowActivated {
+        /// The table.
+        id: u64,
+        /// Its index.
+        row: u64,
+    },
+    /// The user clicked the title of a sortable column of a [crate::Widget::Table]: Kotlin sorts the rows so and sends
+    /// the table with this sort (the arrow shows it until then).
+    SortChanged {
+        /// The table.
+        id: u64,
+        /// The column, ascending unless it was sorted ascending by it before.
+        sort: TableSort,
+    },
 }
 
 impl UiEvent {
@@ -94,7 +116,10 @@ impl UiEvent {
             | Self::Closed { id }
             | Self::ColorChanged { id, .. }
             | Self::DateChanged { id, .. }
-            | Self::FocusChanged { id, .. } => *id,
+            | Self::FocusChanged { id, .. }
+            | Self::RowsSelected { id, .. }
+            | Self::RowActivated { id, .. }
+            | Self::SortChanged { id, .. } => *id,
         }
     }
 
@@ -109,6 +134,8 @@ impl UiEvent {
                 | Self::TextChanged { .. }
                 | Self::ColorChanged { .. }
                 | Self::DateChanged { .. }
+                | Self::RowsSelected { .. }
+                | Self::SortChanged { .. }
         )
     }
 }
@@ -125,6 +152,8 @@ pub(crate) enum Local {
     Color(u32),
     Date(UiDate),
     Closed,
+    Rows(Vec<u64>),
+    Sort(TableSort),
 }
 
 /// Who gets the keyboard with the next frame ([crate::EguiOverlay::request_focus]).
@@ -173,6 +202,24 @@ impl From<three_d::egui::Rect> for UiRect {
     }
 }
 
+/// The text of the rows of tables ([crate::EguiOverlay::set_table_data]), row by row.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct TableData {
+    /// Cells per row, at least 1.
+    pub columns: usize,
+    pub cells: Vec<String>,
+}
+
+impl TableData {
+    pub fn rows(&self) -> usize {
+        self.cells.len() / self.columns
+    }
+
+    pub fn cell(&self, row: usize, column: usize) -> &str {
+        &self.cells[row * self.columns + column]
+    }
+}
+
 /// The tree, the values the user gave and the events not taken yet: everything that is no business of the painter's thread.
 #[derive(Debug, Default)]
 pub(crate) struct UiState {
@@ -192,6 +239,8 @@ pub(crate) struct UiState {
     pub focus: Option<Focus>,
     /// The node with [crate::UiModifier::focus_events] that has the keyboard, as reported.
     pub focused: Option<u64>,
+    /// The rows of tables by their key.
+    pub tables: HashMap<String, TableData>,
 }
 
 impl UiState {

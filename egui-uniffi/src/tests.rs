@@ -65,6 +65,8 @@ struct Run {
     egui: egui::Context,
     state: UiState,
     time: f64,
+    /// Held in every frame.
+    modifiers: egui::Modifiers,
 }
 
 impl Run {
@@ -75,6 +77,7 @@ impl Run {
             egui: egui::Context::default(),
             state,
             time: 0.0,
+            modifiers: egui::Modifiers::NONE,
         };
         run.frame(vec![]);
         run.frame(vec![]);
@@ -90,6 +93,7 @@ impl Run {
             )),
             time: Some(self.time),
             events,
+            modifiers: self.modifiers,
             ..Default::default()
         };
         let state = &mut self.state;
@@ -2737,4 +2741,912 @@ fn menus_and_popups_that_cannot_work_are_refused_with_the_reason() {
         item(7, 6, "Neu", None),
     ]))
     .is_ok());
+}
+
+// Phase 4: tables and strips
+
+fn col(title: &str) -> TableColumn {
+    TableColumn {
+        title: title.into(),
+        width: None,
+        min_width: None,
+        max_width: None,
+        resizable: None,
+        clip: false,
+        align: None,
+        sortable: false,
+        style: None,
+    }
+}
+
+fn table(
+    columns: Vec<TableColumn>,
+    data: Option<&str>,
+    selection: Option<TableSelection>,
+) -> Widget {
+    Widget::Table {
+        columns,
+        data: data.map(Into::into),
+        striped: true,
+        resizable: false,
+        selection,
+        selected: vec![],
+        sort: None,
+        row_height: None,
+        max_height: None,
+        stick_to_end: false,
+        scroll_to: None,
+    }
+}
+
+fn table_row(id: u64, parent: u64) -> UiNode {
+    node(
+        id,
+        Some(parent),
+        Widget::TableRow {
+            header: false,
+            height: None,
+        },
+    )
+}
+
+/// `rows` rows of "Zeile i" and "i × 10" for the table data `key`.
+fn rows_of(state: &mut UiState, key: &str, rows: usize) {
+    let cells = (0..rows)
+        .flat_map(|i| [format!("Zeile {i}"), format!("{} Punkte", i * 10)])
+        .collect();
+    state
+        .tables
+        .insert(key.into(), crate::state::TableData { columns: 2, cells });
+}
+
+impl Run {
+    /// Long enough that the next click is no double click.
+    fn pause(&mut self) {
+        for _ in 0..30 {
+            self.frame(vec![]);
+        }
+    }
+
+    fn click_text(&mut self, text: &str) {
+        let output = self.frame(vec![]);
+        self.click_at(text_center(&output, text));
+    }
+
+    fn set(&mut self, f: impl FnOnce(&mut Widget), id: u64) {
+        let mut nodes = self.state.tree.nodes.clone();
+        f(&mut nodes.iter_mut().find(|n| n.id == id).unwrap().widget);
+        self.state.set_tree(nodes).unwrap();
+        self.frame(vec![]);
+        self.frame(vec![]);
+    }
+}
+
+#[test]
+fn a_table_shows_titles_and_rows_of_nodes_in_their_columns() {
+    let columns = vec![
+        TableColumn {
+            width: Some(ColumnWidth::Exact { width: 160.0 }),
+            ..col("Objekt")
+        },
+        TableColumn {
+            width: Some(ColumnWidth::Exact { width: 120.0 }),
+            align: Some(Align::End),
+            ..col("Polygone")
+        },
+        TableColumn {
+            width: Some(ColumnWidth::Remainder),
+            align: Some(Align::Center),
+            ..col("Sichtbar")
+        },
+    ];
+    let mut nodes = vec![central(1), node(10, Some(1), table(columns, None, None))];
+    for (i, (name, polygons)) in [("Säule", "12400"), ("Brunnen", "48900")]
+        .iter()
+        .enumerate()
+    {
+        let row = 20 + 10 * i as u64;
+        nodes.push(table_row(row, 10));
+        nodes.push(text(row + 1, row, name));
+        nodes.push(text(row + 2, row, polygons));
+        nodes.push(node(
+            row + 3,
+            Some(row),
+            Widget::Checkbox {
+                text: String::new(),
+                checked: i == 0,
+                indeterminate: false,
+            },
+        ));
+    }
+    let mut run = Run::new(nodes);
+    let output = run.frame(vec![]);
+    let b = |id: u64| run.state.bounds[&id];
+    for title in ["Objekt", "Polygone", "Sichtbar"] {
+        assert!(
+            texts(&output).contains(&title.to_string()),
+            "{:?}",
+            texts(&output)
+        );
+    }
+    // Rows under the titles, one under the other, the cells side by side in their columns
+    let title = text_center(&output, "Objekt");
+    assert!(
+        b(21).y > title.y && b(31).y > b(21).y,
+        "{:?} {:?}",
+        b(21),
+        b(31)
+    );
+    assert!((b(21).y - b(22).y).abs() < 2.0 && b(22).x > right(b(21)));
+    // Right in the column of 120 points, the box in the middle of the rest
+    let table = b(10);
+    let polygons_end = table.x + 160.0 + 120.0;
+    assert!(
+        (right(b(22)) - polygons_end).abs() < 12.0,
+        "{:?} ends near {polygons_end}",
+        b(22)
+    );
+    let rest = (polygons_end + right(table)) / 2.0;
+    assert!(
+        (run.center(23).x - rest).abs() < 12.0,
+        "{:?} around {rest}",
+        b(23)
+    );
+    // A row knows its room, a widget in a cell works as anywhere
+    assert!(b(20).width > 300.0 && b(20).y <= b(21).y, "{:?}", b(20));
+    run.click(33);
+    assert_eq!(
+        run.state.take_events(),
+        vec![UiEvent::Checked {
+            id: 33,
+            checked: true
+        }]
+    );
+}
+
+#[test]
+fn a_table_draws_only_the_rows_in_sight_of_its_data() {
+    let columns = vec![
+        col("Name"),
+        TableColumn {
+            align: Some(Align::End),
+            ..col("Wert")
+        },
+    ];
+    let mut widget = table(columns, Some("messung"), None);
+    if let Widget::Table { max_height, .. } = &mut widget {
+        *max_height = Some(200.0);
+    }
+    let mut run = Run::new(vec![central(1), node(10, Some(1), widget)]);
+    rows_of(&mut run.state, "messung", 50_000);
+    let started = std::time::Instant::now();
+    run.frame(vec![]);
+    let output = run.frame(vec![]);
+    let frame = started.elapsed() / 2;
+    let shown: Vec<String> = texts(&output)
+        .into_iter()
+        .filter(|t| t.starts_with("Zeile"))
+        .collect();
+    assert!(
+        shown.contains(&"Zeile 0".to_string()) && shown.len() < 20,
+        "{shown:?}"
+    );
+    assert!(
+        run.state.bounds[&10].height <= 230.0,
+        "{:?}",
+        run.state.bounds[&10]
+    );
+    println!("a frame of a table with 50000 rows: {frame:?}");
+    // Kotlin names a row: the table scrolls to it once, then the user scrolls as he likes
+    run.set(
+        |w| {
+            if let Widget::Table { scroll_to, .. } = w {
+                *scroll_to = Some(49_999)
+            }
+        },
+        10,
+    );
+    for _ in 0..30 {
+        run.frame(vec![]);
+    }
+    let output = run.frame(vec![]);
+    assert!(texts(&output).contains(&"Zeile 49999".to_string()));
+    assert!(texts(&output).contains(&"499990 Punkte".to_string()));
+    assert!(!texts(&output).contains(&"Zeile 0".to_string()));
+    // Rows at the end of a table that sticks to it come into sight
+    run.set(
+        |w| {
+            if let Widget::Table { stick_to_end, .. } = w {
+                *stick_to_end = true
+            }
+        },
+        10,
+    );
+    rows_of(&mut run.state, "messung", 50_010);
+    for _ in 0..5 {
+        run.frame(vec![]);
+    }
+    let output = run.frame(vec![]);
+    assert!(
+        texts(&output).contains(&"Zeile 50009".to_string()),
+        "{:?}",
+        texts(&output)
+    );
+    // Without its data it shows its titles alone
+    run.state.tables.clear();
+    let output = run.frame(vec![]);
+    assert!(texts(&output).contains(&"Name".to_string()));
+    assert!(!texts(&output).iter().any(|t| t.starts_with("Zeile")));
+}
+
+#[test]
+fn rows_are_selected_with_a_click_ctrl_and_shift_and_opened_with_a_double_click() {
+    let columns = vec![col(""), col("")];
+    let mut run = Run::new(vec![
+        central(1),
+        node(
+            10,
+            Some(1),
+            table(columns, Some("liste"), Some(TableSelection::Multiple)),
+        ),
+    ]);
+    rows_of(&mut run.state, "liste", 20);
+    run.frame(vec![]);
+    let select = |run: &mut Run, row: usize, modifiers: egui::Modifiers| {
+        run.modifiers = modifiers;
+        run.click_text(&format!("Zeile {row}"));
+        run.modifiers = egui::Modifiers::NONE;
+        run.pause();
+        let events = run.state.take_events();
+        // Kotlin answers with the rows it was told
+        if let Some(UiEvent::RowsSelected { rows, .. }) = events.last() {
+            let rows = rows.clone();
+            run.set(
+                |w| {
+                    if let Widget::Table { selected, .. } = w {
+                        *selected = rows
+                    }
+                },
+                10,
+            );
+        }
+        events
+    };
+    let selected = |rows: Vec<u64>| vec![UiEvent::RowsSelected { id: 10, rows }];
+    assert_eq!(
+        select(&mut run, 2, egui::Modifiers::NONE),
+        selected(vec![2])
+    );
+    assert_eq!(
+        select(&mut run, 4, egui::Modifiers::COMMAND),
+        selected(vec![2, 4])
+    );
+    assert_eq!(
+        select(&mut run, 7, egui::Modifiers::SHIFT),
+        selected(vec![4, 5, 6, 7])
+    );
+    assert_eq!(
+        select(&mut run, 5, egui::Modifiers::COMMAND),
+        selected(vec![4, 6, 7])
+    );
+    assert_eq!(
+        select(&mut run, 9, egui::Modifiers::NONE),
+        selected(vec![9])
+    );
+    // A click on the one selected row changes nothing, a second one at once opens it
+    let at = text_center(&run.frame(vec![]), "Zeile 9");
+    run.click_at(at);
+    assert_eq!(run.state.take_events(), vec![]);
+    run.click_at(at);
+    assert_eq!(
+        run.state.take_events(),
+        vec![UiEvent::RowActivated { id: 10, row: 9 }]
+    );
+    // Also when the pointer rests between the clicks
+    run.pause();
+    let at = text_center(&run.frame(vec![]), "Zeile 12");
+    run.frame(vec![egui::Event::PointerMoved(at)]);
+    for _ in 0..2 {
+        run.frame(vec![press(at, egui::PointerButton::Primary, true)]);
+        run.frame(vec![press(at, egui::PointerButton::Primary, false)]);
+    }
+    assert_eq!(
+        run.state.take_events(),
+        vec![
+            UiEvent::RowsSelected {
+                id: 10,
+                rows: vec![12]
+            },
+            UiEvent::RowActivated { id: 10, row: 12 }
+        ]
+    );
+    run.set(
+        |w| {
+            if let Widget::Table { selected, .. } = w {
+                *selected = vec![12]
+            }
+        },
+        10,
+    );
+    // A double click right after a click elsewhere (egui counts it as a third click), a triple click opens once
+    run.pause();
+    let output = run.frame(vec![]);
+    let (other, at) = (
+        text_center(&output, "Zeile 1"),
+        text_center(&output, "Zeile 12"),
+    );
+    let clicks = |run: &mut Run, at: egui::Pos2, n: usize| {
+        run.frame(vec![egui::Event::PointerMoved(at)]);
+        for _ in 0..n {
+            run.frame(vec![press(at, egui::PointerButton::Primary, true)]);
+            run.frame(vec![press(at, egui::PointerButton::Primary, false)]);
+        }
+    };
+    clicks(&mut run, other, 1);
+    clicks(&mut run, at, 2);
+    assert_eq!(
+        run.state.take_events(),
+        // The selection of the first click is replaced by the newer one: Kotlin did not take it
+        vec![
+            UiEvent::RowsSelected {
+                id: 10,
+                rows: vec![12]
+            },
+            UiEvent::RowActivated { id: 10, row: 12 }
+        ]
+    );
+    run.pause();
+    clicks(&mut run, at, 3);
+    assert_eq!(
+        run.state.take_events(),
+        vec![UiEvent::RowActivated { id: 10, row: 12 }]
+    );
+    // Also when the first click selects the row and Kotlin answers in between
+    run.pause();
+    let at = text_center(&run.frame(vec![]), "Zeile 11");
+    run.click_at(at);
+    assert_eq!(run.state.take_events(), selected(vec![11]));
+    run.set(
+        |w| {
+            if let Widget::Table { selected, .. } = w {
+                *selected = vec![11]
+            }
+        },
+        10,
+    );
+    run.click_at(at);
+    assert_eq!(
+        run.state.take_events(),
+        vec![UiEvent::RowActivated { id: 10, row: 11 }]
+    );
+    // One row at most
+    run.pause();
+    run.set(
+        |w| {
+            if let Widget::Table {
+                selection,
+                selected,
+                ..
+            } = w
+            {
+                *selection = Some(TableSelection::Single);
+                *selected = vec![];
+            }
+        },
+        10,
+    );
+    assert_eq!(
+        select(&mut run, 3, egui::Modifiers::COMMAND),
+        selected(vec![3])
+    );
+    assert_eq!(
+        select(&mut run, 6, egui::Modifiers::SHIFT),
+        selected(vec![6])
+    );
+    // A click on the text of a row of nodes selects the row, not the text
+    let mut nodes = run.state.tree.nodes.clone();
+    nodes[1].widget = table(vec![col("")], None, Some(TableSelection::Single));
+    nodes.push(table_row(20, 10));
+    nodes.push(text(21, 20, "Brunnen"));
+    run.state.set_tree(nodes).unwrap();
+    run.frame(vec![]);
+    run.pause();
+    run.click(21);
+    assert_eq!(run.state.take_events(), selected(vec![0]));
+    let mut nodes = run.state.tree.nodes[..2].to_vec();
+    nodes[1].widget = table(
+        vec![col(""), col("")],
+        Some("liste"),
+        Some(TableSelection::Single),
+    );
+    run.state.set_tree(nodes).unwrap();
+    run.frame(vec![]);
+    // Without a selection the rows do not react
+    run.set(
+        |w| {
+            if let Widget::Table {
+                selection,
+                selected,
+                ..
+            } = w
+            {
+                *selection = None;
+                *selected = vec![];
+            }
+        },
+        10,
+    );
+    assert_eq!(select(&mut run, 1, egui::Modifiers::NONE), vec![]);
+}
+
+#[test]
+fn a_click_on_a_sortable_title_asks_kotlin_to_sort() {
+    let columns = vec![
+        col("Name"),
+        TableColumn {
+            sortable: true,
+            width: Some(ColumnWidth::Exact { width: 140.0 }),
+            ..col("Wert")
+        },
+    ];
+    let mut run = Run::new(vec![
+        central(1),
+        node(10, Some(1), table(columns, Some("t"), None)),
+    ]);
+    rows_of(&mut run.state, "t", 3);
+    run.click_text("Name");
+    assert_eq!(run.state.take_events(), vec![], "Name is not sortable");
+    // Anywhere in the title's cell
+    let output = run.frame(vec![]);
+    let title = text_center(&output, "Wert");
+    run.click_at(egui::pos2(title.x + 50.0, title.y));
+    let ascending = TableSort {
+        column: 1,
+        ascending: true,
+    };
+    assert_eq!(
+        run.state.take_events(),
+        vec![UiEvent::SortChanged {
+            id: 10,
+            sort: ascending
+        }]
+    );
+    // The arrow shows at once; Kotlin sorts and sends the table so
+    assert!(texts(&run.frame(vec![])).contains(&"Wert ⏶".to_string()));
+    run.set(
+        |w| {
+            if let Widget::Table { sort, .. } = w {
+                *sort = Some(ascending)
+            }
+        },
+        10,
+    );
+    run.pause();
+    run.click_text("Wert ⏶");
+    assert_eq!(
+        run.state.take_events(),
+        vec![UiEvent::SortChanged {
+            id: 10,
+            sort: TableSort {
+                column: 1,
+                ascending: false
+            }
+        }]
+    );
+    assert!(texts(&run.frame(vec![])).contains(&"Wert ⏷".to_string()));
+}
+
+#[test]
+fn a_header_row_takes_widgets_and_strips_divide_their_room() {
+    // A header of nodes instead of titles
+    let mut nodes = vec![
+        central(1),
+        node(
+            10,
+            Some(1),
+            table(vec![col("unused"), col("")], Some("t"), None),
+        ),
+        node(
+            11,
+            Some(10),
+            Widget::TableRow {
+                header: true,
+                height: Some(30.0),
+            },
+        ),
+        checkbox(12, false),
+        text(13, 11, "Alle"),
+    ];
+    nodes[3].parent = Some(11);
+    // A sidebar of 200 points, a quarter of the whole and the rest; the rest one above the other in halves
+    let fill = |n: UiNode| {
+        with(
+            n,
+            UiModifier {
+                fill_width: true,
+                fill_height: true,
+                ..Default::default()
+            },
+        )
+    };
+    nodes.push(node(
+        20,
+        Some(1),
+        Widget::Strip {
+            sizes: vec![
+                StripSize::Exact { points: 200.0 },
+                StripSize::Relative {
+                    fraction: 0.25,
+                    min: None,
+                    max: None,
+                },
+                StripSize::Remainder {
+                    min: None,
+                    max: None,
+                },
+            ],
+            vertical: false,
+            clip: false,
+        },
+    ));
+    nodes.push(fill(button(21, 20, "Seite")));
+    nodes.push(fill(button(22, 20, "Viertel")));
+    nodes.push(node(
+        23,
+        Some(20),
+        Widget::Strip {
+            sizes: vec![
+                StripSize::Relative {
+                    fraction: 0.5,
+                    min: None,
+                    max: None,
+                },
+                StripSize::Remainder {
+                    min: None,
+                    max: None,
+                },
+            ],
+            vertical: true,
+            clip: false,
+        },
+    ));
+    nodes.push(fill(button(24, 23, "Oben")));
+    nodes.push(fill(button(25, 23, "Unten")));
+    let mut run = Run::new(nodes);
+    rows_of(&mut run.state, "t", 2);
+    let output = run.frame(vec![]);
+    let b = |id: u64| run.state.bounds[&id];
+    assert!(
+        !texts(&output).contains(&"unused".to_string()),
+        "the header row replaces the titles"
+    );
+    assert!(
+        run.drawn(12) && run.drawn(13) && (b(11).height - 30.0).abs() < 1.0,
+        "{:?}",
+        b(11)
+    );
+    assert!(text_center(&output, "Zeile 0").y > bottom(b(11)));
+    let (side, quarter, top, below) = (b(21), b(22), b(24), b(25));
+    assert!((side.width - 200.0).abs() < 1.0, "{side:?}");
+    let whole = b(20).width;
+    assert!(
+        (quarter.width - whole / 4.0).abs() < 12.0,
+        "{quarter:?} of {whole}"
+    );
+    assert!(top.x > right(quarter) && (top.x - below.x).abs() < 1.0 && below.y > bottom(top));
+    assert!((top.height - below.height).abs() < 6.0, "{top:?} {below:?}");
+    assert!(right(top) > right(b(20)) - 12.0);
+    run.click(12);
+    assert_eq!(
+        run.state.take_events(),
+        vec![UiEvent::Checked {
+            id: 12,
+            checked: true
+        }]
+    );
+}
+
+#[test]
+fn tables_and_strips_in_a_column_take_the_room_below() {
+    // A column shrinks to its content and leaves the nodes in it no room: a table and a strip take what is seen
+    let mut nodes = vec![
+        central(1),
+        node(2, Some(1), column()),
+        text(3, 2, "Materialien"),
+        node(10, Some(2), table(vec![col("Name"), col("An")], None, None)),
+    ];
+    for (i, name) in ["Sandstein", "Marmor", "Bronze"].iter().enumerate() {
+        let row = 20 + 10 * i as u64;
+        nodes.push(table_row(row, 10));
+        nodes.push(text(row + 1, row, name));
+        nodes.push(checkbox(row + 2, true));
+        nodes.last_mut().unwrap().parent = Some(row);
+    }
+    let fill = |n: UiNode| {
+        with(
+            n,
+            UiModifier {
+                fill_width: true,
+                fill_height: true,
+                ..Default::default()
+            },
+        )
+    };
+    nodes.push(node(4, Some(1), column()));
+    nodes.push(node(
+        50,
+        Some(4),
+        Widget::Strip {
+            sizes: vec![
+                StripSize::Exact { points: 60.0 },
+                StripSize::Remainder {
+                    min: None,
+                    max: None,
+                },
+            ],
+            vertical: true,
+            clip: true,
+        },
+    ));
+    nodes.push(fill(button(51, 50, "Oben")));
+    nodes.push(fill(button(52, 50, "Unten")));
+    let mut run = Run::new(nodes);
+    let output = run.frame(vec![]);
+    let b = |id: u64| run.state.bounds[&id];
+    for name in ["Sandstein", "Marmor", "Bronze"] {
+        assert!(
+            texts(&output).contains(&name.to_string()),
+            "{name} is drawn: {:?}",
+            texts(&output)
+        );
+    }
+    let title = text_center(&output, "Name");
+    assert!(b(21).y > title.y && b(41).y > b(31).y, "{:?}", b(41));
+    // The rows take what they need, not the whole room
+    assert!(bottom(b(10)) < b(21).y + 4.0 * 30.0, "{:?}", b(10));
+    // The strip divides the room below it down to the bottom
+    let (top, rest) = (b(51), b(52));
+    assert!((top.height - 60.0).abs() < 6.0, "{top:?}");
+    assert!(rest.y > bottom(top) && rest.height > 100.0, "{rest:?}");
+    run.click(42);
+    assert_eq!(
+        run.state.take_events(),
+        vec![UiEvent::Checked {
+            id: 42,
+            checked: false
+        }]
+    );
+}
+
+#[test]
+fn tables_and_strips_that_cannot_work_are_refused_with_the_reason() {
+    let with_nodes = |more: Vec<UiNode>| {
+        let mut nodes = vec![
+            central(1),
+            node(10, Some(1), table(vec![col("A"), col("B")], None, None)),
+        ];
+        nodes.extend(more);
+        nodes
+    };
+    let why = invalid(vec![central(1), table_row(2, 1)]);
+    assert!(
+        why.contains("TableRow 2 is inside CentralPanel: rows belong to a Table"),
+        "{why}"
+    );
+    let why = invalid(with_nodes(vec![text(11, 10, "loose")]));
+    assert!(
+        why.contains("Text 11 is inside Table 10, which holds TableRows"),
+        "{why}"
+    );
+    let header = |id| {
+        node(
+            id,
+            Some(10),
+            Widget::TableRow {
+                header: true,
+                height: None,
+            },
+        )
+    };
+    let why = invalid(with_nodes(vec![table_row(11, 10), header(12)]));
+    assert!(
+        why.contains("TableRow 12 is a header, but not the first row"),
+        "{why}"
+    );
+    let why = invalid(with_nodes(vec![
+        table_row(11, 10),
+        text(12, 11, "a"),
+        text(13, 11, "b"),
+        text(14, 11, "c"),
+    ]));
+    assert!(
+        why.contains("TableRow 11 has 3 cells, Table 10 has 2 columns"),
+        "{why}"
+    );
+    let mut nodes = with_nodes(vec![header(11), table_row(12, 10)]);
+    nodes[1].widget = table(vec![col("A")], Some("t"), None);
+    assert!(
+        invalid(nodes).contains("TableRow 12 is a row of Table 10, which has its rows from data")
+    );
+    let lone = |widget| invalid(vec![central(1), node(10, Some(1), widget)]);
+    assert!(lone(table(vec![], None, None)).contains("at least one column"));
+    let mut selected = table(vec![col("A")], None, None);
+    if let Widget::Table { selected: s, .. } = &mut selected {
+        *s = vec![1];
+    }
+    assert!(lone(selected.clone()).contains("1 rows are selected, but the table has no selection"));
+    if let Widget::Table {
+        selected: s,
+        selection,
+        sort,
+        ..
+    } = &mut selected
+    {
+        *s = vec![1, 2];
+        *selection = Some(TableSelection::Single);
+        *sort = Some(TableSort {
+            column: 3,
+            ascending: true,
+        });
+    }
+    assert!(lone(selected.clone()).contains("2 rows are selected, but the table selects one"));
+    if let Widget::Table { selection, .. } = &mut selected {
+        *selection = Some(TableSelection::Multiple);
+    }
+    assert!(lone(selected).contains("sorted by column 3, it has 1"));
+    let why = lone(table(
+        vec![TableColumn {
+            width: Some(ColumnWidth::Exact { width: 0.0 }),
+            ..col("A")
+        }],
+        None,
+        None,
+    ));
+    assert!(why.contains("column 0: the width is 0"), "{why}");
+    let why = lone(table(
+        vec![TableColumn {
+            min_width: Some(90.0),
+            max_width: Some(40.0),
+            ..col("A")
+        }],
+        None,
+        None,
+    ));
+    assert!(why.contains("column 0: min 90 > max 40"), "{why}");
+    let strip = |sizes| Widget::Strip {
+        sizes,
+        vertical: false,
+        clip: false,
+    };
+    assert!(lone(strip(vec![])).contains("at least one size"));
+    let why = lone(strip(vec![StripSize::Relative {
+        fraction: 1.5,
+        min: None,
+        max: None,
+    }]));
+    assert!(why.contains("size 0: the fraction is 1.5"), "{why}");
+    let why = invalid(vec![
+        central(1),
+        node(10, Some(1), strip(vec![StripSize::Exact { points: 10.0 }])),
+        text(11, 10, "a"),
+        text(12, 10, "b"),
+    ]);
+    assert!(why.contains("Strip 10 holds 2 nodes in 1 sizes"), "{why}");
+    // The rows of data
+    let overlay = EguiOverlay::new();
+    let data_why = |r: Result<(), UiError>| match r {
+        Err(UiError::InvalidData { why }) => why,
+        other => panic!("expected invalid data, got {other:?}"),
+    };
+    assert!(data_why(overlay.set_table_data("t".into(), 0, vec![])).contains("at least one cell"));
+    assert!(
+        data_why(overlay.set_table_data("t".into(), 2, vec!["a".into()]))
+            .contains("1 cells of 't' do not fill rows of 2")
+    );
+    assert!(data_why(overlay.append_table_rows("t".into(), vec![])).contains("'t' has no rows yet"));
+    overlay
+        .set_table_data("t".into(), 2, vec!["a".into(), "b".into()])
+        .unwrap();
+    overlay
+        .append_table_rows("t".into(), vec!["c".into(), "d".into()])
+        .unwrap();
+    assert!(
+        data_why(overlay.append_table_rows("t".into(), vec!["e".into()]))
+            .contains("1 cells do not fill rows of 2")
+    );
+}
+
+#[test]
+fn a_resizable_table_in_a_new_window_takes_its_widths_after_the_first_frame() {
+    let window = node(
+        1,
+        None,
+        Widget::Window {
+            title: "Messungen".into(),
+            x: -12.0,
+            y: 12.0,
+            width: Some(600.0),
+            closable: false,
+            collapsible: false,
+            resizable: false,
+            height: Some(330.0),
+            anchor: Some(Anchor::TopRight),
+            movable: true,
+            title_bar: true,
+            fixed_size: true,
+            scroll: false,
+            open: true,
+        },
+    );
+    let mut t = table(
+        vec![
+            col("Lauf"),
+            TableColumn {
+                width: Some(ColumnWidth::Initial { width: 110.0 }),
+                ..col("Szene")
+            },
+            TableColumn {
+                width: Some(ColumnWidth::Initial { width: 76.0 }),
+                ..col("Backend")
+            },
+            TableColumn {
+                width: Some(ColumnWidth::Remainder),
+                ..col("ms")
+            },
+        ],
+        Some("t"),
+        None,
+    );
+    if let Widget::Table { resizable, .. } = &mut t {
+        *resizable = true;
+    }
+    let nodes = vec![
+        window,
+        node(
+            20,
+            Some(1),
+            Widget::Strip {
+                sizes: vec![
+                    StripSize::Exact { points: 200.0 },
+                    StripSize::Remainder {
+                        min: None,
+                        max: None,
+                    },
+                ],
+                vertical: false,
+                clip: false,
+            },
+        ),
+        text(21, 20, "links"),
+        node(10, Some(20), t),
+    ];
+    let mut run = Run::new(nodes);
+    let cells = (0..100)
+        .flat_map(|i| {
+            [
+                format!("{i}"),
+                "Garten".into(),
+                "WebGPU".into(),
+                "8.00".into(),
+            ]
+        })
+        .collect();
+    run.state
+        .tables
+        .insert("t".into(), crate::state::TableData { columns: 4, cells });
+    for _ in 0..5 {
+        run.frame(vec![]);
+    }
+    // egui's first frame of a window makes each column as wide as its content: the table fills its cell all the same
+    let output = run.frame(vec![]);
+    let (cell, table) = (run.state.bounds[&20], run.state.bounds[&10]);
+    assert!(
+        (right(table) - right(cell)).abs() < 12.0,
+        "{table:?} in {cell:?}"
+    );
+    let (scene, backend) = (
+        text_center(&output, "Szene"),
+        text_center(&output, "Backend"),
+    );
+    assert!(backend.x - scene.x > 90.0, "{scene:?} {backend:?}");
 }

@@ -1208,3 +1208,191 @@ fn an_open_menu_and_a_modal_lie_over_the_picture() {
         release(context);
     }
 }
+
+#[test]
+fn tables_with_a_sorted_column_and_a_selected_row_in_a_strip() {
+    let col =
+        |title: &str, width: Option<ColumnWidth>, align: Option<Align>, sortable| TableColumn {
+            title: title.into(),
+            width,
+            min_width: None,
+            max_width: None,
+            resizable: None,
+            clip: false,
+            align,
+            sortable,
+            style: None,
+        };
+    let table = |columns, data: Option<&str>, selection, selected| Widget::Table {
+        columns,
+        data: data.map(Into::into),
+        striped: true,
+        resizable: false,
+        selection,
+        selected,
+        sort: data.map(|_| TableSort {
+            column: 1,
+            ascending: true,
+        }),
+        row_height: None,
+        max_height: None,
+        stick_to_end: false,
+        scroll_to: None,
+    };
+    let text = |id, parent, s: &str| {
+        node(
+            id,
+            Some(parent),
+            Widget::Text {
+                text: s.into(),
+                style: TextStyle::Body,
+                color: None,
+                spans: vec![],
+                wrap: None,
+                selectable: false,
+            },
+        )
+    };
+    let remainder = Some(ColumnWidth::Remainder);
+    let narrow = Some(ColumnWidth::Exact { width: 80.0 });
+    let mut nodes = vec![
+        node(1, None, Widget::CentralPanel { frame: true }),
+        node(
+            2,
+            Some(1),
+            Widget::Strip {
+                sizes: vec![
+                    StripSize::Exact { points: 130.0 },
+                    StripSize::Remainder {
+                        min: None,
+                        max: None,
+                    },
+                ],
+                vertical: true,
+                clip: true,
+            },
+        ),
+        node(
+            3,
+            Some(2),
+            table(
+                vec![
+                    col("Szene", remainder, None, false),
+                    col("ms", narrow, Some(Align::End), true),
+                ],
+                Some("zeiten"),
+                None,
+                vec![],
+            ),
+        ),
+        node(
+            10,
+            Some(2),
+            table(
+                vec![
+                    col("Objekt", remainder, None, false),
+                    col("Polygone", narrow, Some(Align::End), false),
+                ],
+                None,
+                Some(TableSelection::Single),
+                vec![1],
+            ),
+        ),
+    ];
+    for (i, (name, polygons)) in [("Säule", "12400"), ("Brunnen", "48900"), ("Dach", "3200")]
+        .iter()
+        .enumerate()
+    {
+        let row = 20 + 10 * i as u64;
+        nodes.push(node(
+            row,
+            Some(10),
+            Widget::TableRow {
+                header: false,
+                height: None,
+            },
+        ));
+        nodes.push(text(row + 1, row, name));
+        nodes.push(text(row + 2, row, polygons));
+    }
+    let cells: Vec<String> = (0..1000)
+        .flat_map(|i| [format!("Szene {i}"), format!("{}.5", 10 + i % 7)])
+        .collect();
+    let save = |name: &str, picture: &[[u8; 4]]| {
+        if let Some(dir) = std::env::var_os("THREE_D_EGUI_PICTURE") {
+            let bytes: Vec<u8> = picture.iter().flatten().copied().collect();
+            std::fs::write(std::path::Path::new(&dir).join(name), bytes).unwrap();
+        }
+    };
+    for (name, context) in contexts() {
+        let overlay = EguiOverlay::new();
+        overlay.set_tree(nodes.clone()).unwrap();
+        overlay
+            .set_table_data("zeiten".into(), 2, cells.clone())
+            .unwrap();
+        frame(&context, &overlay);
+        let picture = frame(&context, &overlay);
+        save(&format!("table-{name}.rgba"), &picture);
+        // The data table in its cell of 130 points, the other table under it
+        let top = overlay.bounds(3).expect("the table of data is drawn");
+        assert!(top.height <= 131.0, "{name}: {top:?}");
+        let selected = overlay.bounds(30).expect("row 1 is drawn");
+        assert!(
+            selected.y >= top.y + top.height,
+            "{name}: {selected:?} under {top:?}"
+        );
+        // The selected row in the selection color beside its text, the others not
+        let at = |row: UiRect| ((row.x + 150.0) as u32, (row.y + row.height / 2.0) as u32);
+        let (x, y) = at(selected);
+        let p = pixel(&picture, x, y);
+        assert!(
+            near(p, [0, 92, 128], 30),
+            "{name}: the selected row at {x}, {y} is {p:?}"
+        );
+        let (x, y) = at(overlay.bounds(20).unwrap());
+        let p = pixel(&picture, x, y);
+        assert!(
+            !near(p, [0, 92, 128], 30) && !near(p, [255, 0, 0], 60),
+            "{name}: the row at {x}, {y} is {p:?}"
+        );
+        click(&context, &overlay, center(&overlay, 40));
+        assert_eq!(
+            overlay.take_events(),
+            vec![UiEvent::RowsSelected {
+                id: 10,
+                rows: vec![2]
+            }]
+        );
+        // A second click at once opens the row
+        click(&context, &overlay, center(&overlay, 40));
+        assert_eq!(
+            overlay.take_events(),
+            vec![UiEvent::RowActivated { id: 10, row: 2 }],
+            "{name}"
+        );
+        // Also without a move between the clicks, as a hand that rests
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let (x, y) = center(&overlay, 20);
+        overlay.input(UiInput::Move { x, y });
+        frame(&context, &overlay);
+        for _ in 0..2 {
+            overlay.input(UiInput::Press { x, y, button: 0 });
+            frame(&context, &overlay);
+            overlay.input(UiInput::Release { x, y, button: 0 });
+            frame(&context, &overlay);
+        }
+        assert_eq!(
+            overlay.take_events(),
+            vec![
+                UiEvent::RowsSelected {
+                    id: 10,
+                    rows: vec![0]
+                },
+                UiEvent::RowActivated { id: 10, row: 0 }
+            ],
+            "{name}"
+        );
+        drop(overlay);
+        release(context);
+    }
+}

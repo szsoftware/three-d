@@ -35,7 +35,8 @@ pub use overlay::*;
 pub use state::{UiEvent, UiRect};
 pub(crate) use tree::Tree;
 pub use tree::{
-    Align, Anchor, Arrangement, NoticeLevel, PlotSeries, PopupClose, PopupSide, ScrollDirection,
-    SeriesKind, Side, SliderClamping, SliderHandle, TextSpan, TextStyle, TextWrap, UiDate,
-    UiInsets, UiModifier, UiNode, UiShadow, UiStroke, Widget,
+    Align, Anchor, Arrangement, ColumnWidth, NoticeLevel, PlotSeries, PopupClose, PopupSide,
+    ScrollDirection, SeriesKind, Side, SliderClamping, SliderHandle, StripSize, TableColumn,
+    TableSelection, TableSort, TextSpan, TextStyle, TextWrap, UiDate, UiInsets, UiModifier, UiNode,
+    UiShadow, UiStroke, Widget,
 };
