@@ -1,6 +1,9 @@
 use crate::input::{Held, Wanted};
 use crate::state::{Focus, UiState};
-use crate::{UiError, UiEvent, UiFont, UiInput, UiNode, UiOutput, UiRect, UiTheme};
+use crate::{
+    AccessAction, UiAccessTree, UiError, UiEvent, UiFont, UiInput, UiNode, UiOutput, UiRect,
+    UiTheme,
+};
 use cargo_uniffi_support::ThreadBound;
 use std::sync::{Arc, Mutex, MutexGuard};
 use three_d::egui;
@@ -52,6 +55,15 @@ struct Shared {
     early: Held,
     /// egui's memory from [EguiOverlay::restore_state] before there was an egui.
     memory: Option<egui::Memory>,
+    /// The accessibility tree of the last frame egui ran in, while [UiState::access].
+    access_tree: Option<UiAccessTree>,
+    /// [Shared::access_tree] changed since Kotlin took it.
+    access_new: bool,
+    /// What assistive technology asked for since the last frame.
+    access_requests: Vec<egui::Event>,
+    /// The tree on the accessibility bus of a Linux desktop ([EguiOverlay::enable_atspi]).
+    #[cfg(all(target_os = "linux", feature = "atspi"))]
+    atspi: Option<crate::atspi::Bridge>,
 }
 
 /// egui with its painter, which belongs to the thread and the three-d context it was made on.
@@ -101,6 +113,11 @@ impl Default for EguiOverlay {
                 zoom_keys: true,
                 early: Held::default(),
                 memory: None,
+                access_tree: None,
+                access_new: false,
+                access_requests: Vec::new(),
+                #[cfg(all(target_os = "linux", feature = "atspi"))]
+                atspi: None,
             }),
             painting: Mutex::new(None),
         }
@@ -283,7 +300,8 @@ impl EguiOverlay {
     /// opening section). An application that only draws when something changes asks this.
     pub fn needs_repaint(&self) -> bool {
         let shared = lock(&self.shared);
-        shared.ui.dirty
+        shared.atspi_pending()
+            || shared.ui.dirty
             || shared
                 .egui
                 .as_ref()
@@ -443,6 +461,122 @@ impl EguiOverlay {
                 height: r.height * s,
             })
     }
+
+    /// Has egui describe its frames for assistive technology, or stops it (the default is off: it costs a little time
+    /// every frame). Kotlin takes the description with [EguiOverlay::take_accessibility] when it has a screen reader
+    /// to serve: Compose's semantics, an ARIA mirror in the browser.
+    pub fn set_accessibility(&self, enabled: bool) {
+        let mut shared = lock(&self.shared);
+        if shared.ui.access == enabled {
+            return;
+        }
+        shared.ui.access = enabled;
+        if let Some(egui) = &shared.egui {
+            if enabled {
+                egui.enable_accesskit();
+            } else {
+                egui.disable_accesskit();
+            }
+        }
+        if !enabled {
+            #[cfg(all(target_os = "linux", feature = "atspi"))]
+            {
+                shared.atspi = None;
+            }
+            shared.access_tree = None;
+            shared.access_new = false;
+            shared.access_requests.clear();
+        }
+        shared.ui.dirty = true;
+    }
+
+    /// The accessibility tree of the last frame if it changed since the last call, else `None`. Take it after each
+    /// frame, as the events.
+    pub fn take_accessibility(&self) -> Option<UiAccessTree> {
+        let mut shared = lock(&self.shared);
+        if !std::mem::take(&mut shared.access_new) {
+            return None;
+        }
+        shared.access_tree.clone()
+    }
+
+    /// Does `action` on the node `id` of the accessibility tree with the next frame, as a screen reader would: the
+    /// node reports what it would for the pointer or the keyboard ([UiEvent::Clicked], a new value). Nothing happens
+    /// for a node that is gone or does not do the action.
+    pub fn access_action(&self, id: u64, action: AccessAction) {
+        self.access_request(crate::access::request(id, action, None));
+    }
+
+    /// Sets the number of the slider or the drag value `id` of the accessibility tree.
+    pub fn access_set_value(&self, id: u64, value: f64) {
+        self.access_request(crate::access::request(
+            id,
+            AccessAction::SetValue,
+            Some(egui::accesskit::ActionData::NumericValue(value)),
+        ));
+    }
+
+    ///
+    /// Hands the accessibility tree to the screen readers of a Linux desktop as the application `name` (AT-SPI: Orca
+    /// reads it, Accerciser shows it), where Compose has no accessibility of its own, and turns
+    /// [EguiOverlay::set_accessibility] on. What a reader does comes back as for [EguiOverlay::access_action]: an
+    /// application that draws on demand asks [EguiOverlay::needs_repaint]. `false` where there is no such bridge: other
+    /// systems, or a library built without the feature `atspi`.
+    ///
+    pub fn enable_atspi(&self, name: String) -> bool {
+        #[cfg(all(target_os = "linux", feature = "atspi"))]
+        {
+            self.set_accessibility(true);
+            let mut shared = lock(&self.shared);
+            if shared.atspi.is_none() {
+                shared.atspi = Some(crate::atspi::Bridge::new(name));
+            }
+            shared.ui.dirty = true;
+            true
+        }
+        #[cfg(not(all(target_os = "linux", feature = "atspi")))]
+        {
+            let _ = name;
+            false
+        }
+    }
+
+    /// Where the overlay's picture is on the screen, in pixels, and whether its window has the keyboard, for
+    /// [EguiOverlay::enable_atspi]: a screen reader shows what it reads there (X11 tells the place of a window, Wayland
+    /// does not).
+    pub fn set_atspi_window(&self, bounds: UiRect, focused: bool) {
+        #[cfg(all(target_os = "linux", feature = "atspi"))]
+        if let Some(bridge) = &mut lock(&self.shared).atspi {
+            bridge.window(
+                bounds.x as f64,
+                bounds.y as f64,
+                bounds.width as f64,
+                bounds.height as f64,
+                focused,
+            );
+        }
+        #[cfg(not(all(target_os = "linux", feature = "atspi")))]
+        let _ = (bounds, focused);
+    }
+
+    /// Replaces the text of the text field `id` of the accessibility tree: [UiEvent::TextChanged] follows.
+    pub fn access_set_text(&self, id: u64, text: String) {
+        self.access_request(crate::access::request(
+            id,
+            AccessAction::SetValue,
+            Some(egui::accesskit::ActionData::Value(text.into())),
+        ));
+    }
+}
+
+impl EguiOverlay {
+    fn access_request(&self, request: egui::Event) {
+        let mut shared = lock(&self.shared);
+        if shared.ui.access {
+            shared.access_requests.push(request);
+            shared.ui.dirty = true;
+        }
+    }
 }
 
 /// Where the overlay keeps its zoom in egui's memory.
@@ -465,6 +599,15 @@ fn own_zoom(egui: &egui::Context) {
 }
 
 impl Shared {
+    /// A screen reader on the accessibility bus asked for something.
+    fn atspi_pending(&self) -> bool {
+        #[cfg(all(target_os = "linux", feature = "atspi"))]
+        if let Some(bridge) = &self.atspi {
+            return bridge.pending();
+        }
+        false
+    }
+
     /// Pixels per point of egui: the density and the user's zoom.
     fn scale(&self) -> f32 {
         self.pixels_per_point * self.zoom
@@ -646,6 +789,9 @@ impl EguiOverlay {
             own_zoom(gui.context());
             {
                 let mut shared = lock(&self.shared);
+                if shared.ui.access {
+                    gui.context().enable_accesskit();
+                }
                 if let Some(memory) = shared.memory.take() {
                     gui.context().memory_mut(|m| *m = memory);
                     own_zoom(gui.context());
@@ -669,6 +815,7 @@ impl EguiOverlay {
             // Nothing changed since the last frame (no tree, no input, no animation of egui, the same size): its
             // meshes are painted again without running egui
             let unchanged = !shared.ui.dirty
+                && !shared.atspi_pending()
                 && shared.input.is_empty()
                 && events.is_empty()
                 && p.viewport == Some(viewport)
@@ -691,6 +838,11 @@ impl EguiOverlay {
                 let scale = shared.scale();
                 own.extend(shared.held.events(input, scale, &mut wanted));
             }
+            own.append(&mut shared.access_requests);
+            #[cfg(all(target_os = "linux", feature = "atspi"))]
+            if let Some(bridge) = &shared.atspi {
+                own.extend(bridge.take());
+            }
             let scale = shared.scale();
             shared.output.paste |= wanted.paste;
             shared.ui.dirty = false;
@@ -705,7 +857,24 @@ impl EguiOverlay {
                 scale,
                 |root| crate::draw::draw(root, ui),
             );
-            shared.output.add(p.gui.take_platform_output(), scale);
+            let mut platform = p.gui.take_platform_output();
+            if let Some(update) = platform.accesskit_update.take() {
+                if shared.ui.access {
+                    let (tree, _fixes) = crate::access::tree_and_fixes(&update, scale, &shared.ui);
+                    // The screen readers of a Linux desktop get egui's tree without the repeats Kotlin's has not
+                    #[cfg(all(target_os = "linux", feature = "atspi"))]
+                    if let Some(bridge) = &mut shared.atspi {
+                        let mut update = update;
+                        crate::access::fix(&mut update, &_fixes);
+                        bridge.update(update);
+                    }
+                    if shared.access_tree.as_ref() != Some(&tree) {
+                        shared.access_tree = Some(tree);
+                        shared.access_new = true;
+                    }
+                }
+            }
+            shared.output.add(platform, scale);
             write(&|| p.gui.render())?;
             p.viewport = Some(viewport);
             Ok(())

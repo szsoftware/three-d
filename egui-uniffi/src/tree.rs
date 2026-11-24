@@ -198,6 +198,10 @@ pub struct UiModifier {
     /// around it. Windows, menus and popups that open from inside take the look of the whole overlay.
     #[uniffi(default)]
     pub theme: Option<crate::UiTheme>,
+    /// What it tells assistive technology beyond its widget (Compose's `Modifier.semantics`): a name, a role, a state,
+    /// to be read as one or left out.
+    #[uniffi(default)]
+    pub semantics: Option<crate::UiSemantics>,
 }
 
 /// What a node reacts to besides its own widget, as Compose's `clickable`, `combinedClickable`, `hoverable`,

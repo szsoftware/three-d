@@ -18,6 +18,9 @@
 
 uniffi::setup_scaffolding!();
 
+mod access;
+#[cfg(all(target_os = "linux", feature = "atspi"))]
+mod atspi;
 mod draw;
 mod error;
 mod input;
@@ -31,6 +34,9 @@ mod tests;
 mod theme;
 mod tree;
 
+pub use access::{
+    AccessAction, AccessLive, AccessRole, AccessToggle, UiAccessNode, UiAccessTree, UiSemantics,
+};
 pub use error::*;
 pub use input::{UiInput, UiTouchPhase};
 pub use output::{UiCursor, UiLink, UiOutput, UiTextInput};

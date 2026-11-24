@@ -2031,3 +2031,73 @@ fn the_theme_fonts_zoom_and_saved_state_from_kotlin_change_the_picture() {
         release(context);
     }
 }
+
+#[test]
+fn the_accessibility_tree_reaches_kotlin_and_a_screen_reader_clicks_through_it() {
+    for (name, context) in contexts() {
+        let overlay = EguiOverlay::new();
+        overlay.set_tree(look_tree()).unwrap();
+        overlay.set_scale(1.5);
+        frames(&context, &overlay);
+        assert_eq!(overlay.take_accessibility(), None, "{name}: off by default");
+        overlay.set_accessibility(true);
+        frames(&context, &overlay);
+        let tree = overlay
+            .take_accessibility()
+            .unwrap_or_else(|| panic!("{name}: no tree"));
+        let find = |tree: &UiAccessTree, label: &str| {
+            tree.nodes
+                .iter()
+                .find(|n| n.label.as_deref() == Some(label))
+                .unwrap_or_else(|| panic!("{name}: no '{label}' in {:#?}", tree.nodes))
+                .clone()
+        };
+        let window = find(&tree, "Werkzeuge");
+        assert_eq!(window.role, AccessRole::Window, "{name}");
+        assert_eq!(find(&tree, "Gitter").parent, Some(window.id), "{name}");
+        let photo = find(&tree, "Photo");
+        assert_eq!((photo.role, photo.node), (AccessRole::Button, Some(3)));
+        // In pixels, as bounds
+        let drawn = overlay.bounds(3).unwrap();
+        assert!(
+            (photo.bounds.x - drawn.x).abs() < 1.0
+                && (photo.bounds.width - drawn.width).abs() < 1.0,
+            "{name}: {:?} {drawn:?}",
+            photo.bounds
+        );
+        // The same tree again is not handed over again
+        frames(&context, &overlay);
+        assert_eq!(overlay.take_accessibility(), None, "{name}");
+        // A screen reader clicks the button and ticks the box: the usual events, and the box's new state
+        overlay.take_events();
+        overlay.access_action(photo.id, AccessAction::Click);
+        assert!(overlay.needs_repaint(), "{name}");
+        frames(&context, &overlay);
+        overlay.access_action(find(&tree, "Shadows").id, AccessAction::Click);
+        frames(&context, &overlay);
+        assert_eq!(
+            overlay.take_events(),
+            vec![
+                UiEvent::Clicked { id: 3 },
+                UiEvent::Checked {
+                    id: 2,
+                    checked: true
+                }
+            ],
+            "{name}"
+        );
+        let tree = overlay.take_accessibility().expect("the box changed");
+        assert_eq!(
+            find(&tree, "Shadows").toggled,
+            Some(AccessToggle::On),
+            "{name}"
+        );
+        // Off again: no tree, no actions
+        overlay.set_accessibility(false);
+        overlay.access_action(photo.id, AccessAction::Click);
+        frames(&context, &overlay);
+        assert_eq!(overlay.take_accessibility(), None, "{name}");
+        assert_eq!(overlay.take_events(), vec![], "{name}");
+        release(context);
+    }
+}

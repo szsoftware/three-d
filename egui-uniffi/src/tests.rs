@@ -534,8 +534,8 @@ fn text_fields_report_typing_and_enter() {
     );
 }
 
-#[test]
-fn every_widget_draws() {
+/// A node of every kind, in panels, bars and a window.
+fn every_widget() -> Vec<UiNode> {
     let s = String::new;
     let mut nodes = vec![
         panel(),
@@ -723,6 +723,12 @@ fn every_widget_draws() {
             ));
         }
     }
+    nodes
+}
+
+#[test]
+fn every_widget_draws() {
+    let nodes = every_widget();
     let ids: Vec<u64> = nodes.iter().map(|n| n.id).collect();
     let run = Run::new(nodes);
     for id in ids {
@@ -4817,4 +4823,356 @@ fn a_node_of_its_own_theme_has_its_text_sizes_and_egui_s_panels_are_nodes() {
     assert!(crate::theme::check_fonts(&[font("Kaputt", vec![0; 64])])
         .unwrap_err()
         .starts_with("'Kaputt' is no TTF or OTF file"));
+}
+
+/// The accessibility tree of the next frame, with egui's AccessKit on.
+fn access_tree(run: &mut Run, events: Vec<egui::Event>) -> UiAccessTree {
+    run.state.access = true;
+    run.egui.enable_accesskit();
+    let output = run.frame(events);
+    let update = output
+        .platform_output
+        .accesskit_update
+        .expect("AccessKit is on");
+    crate::access::tree(&update, 2.0, &run.state)
+}
+
+fn access_nodes() -> Vec<UiNode> {
+    let semantics = |s: UiSemantics| {
+        Some(UiModifier {
+            semantics: Some(s),
+            ..Default::default()
+        })
+    };
+    let heading = |id, s: &str| {
+        node(
+            id,
+            Some(1),
+            Widget::Text {
+                text: s.into(),
+                style: TextStyle::Heading,
+                color: None,
+                spans: vec![],
+                wrap: None,
+                selectable: true,
+            },
+        )
+    };
+    vec![
+        panel(),
+        heading(2, "Licht"),
+        checkbox(3, true),
+        node(
+            4,
+            Some(1),
+            Widget::SliderFloat {
+                label: "Stärke".into(),
+                value: 0.5,
+                min: 0.0,
+                max: 1.0,
+                logarithmic: false,
+                decimals: Some(1),
+                suffix: String::new(),
+                prefix: String::new(),
+                step: Some(0.1),
+                vertical: false,
+                clamping: None,
+                show_value: true,
+                trailing_fill: None,
+                handle: None,
+            },
+        ),
+        node(
+            5,
+            Some(1),
+            Widget::TextField {
+                label: "Name".into(),
+                value: "Laterne".into(),
+                hint: "Wie sie heißt".into(),
+                password: false,
+                lines: None,
+                code: false,
+                language: None,
+                char_limit: None,
+                align: None,
+                read_only: false,
+            },
+        ),
+        node(
+            6,
+            Some(1),
+            Widget::Switch {
+                text: "Sonne".into(),
+                checked: true,
+            },
+        ),
+        UiNode {
+            modifier: semantics(UiSemantics {
+                label: Some("Fenster schließen".into()),
+                ..Default::default()
+            }),
+            ..node(
+                7,
+                Some(1),
+                Widget::Button {
+                    text: "✖".into(),
+                    small: false,
+                    frame: true,
+                    selected: false,
+                    shortcut: None,
+                    fill: None,
+                    image: None,
+                    image_size: None,
+                },
+            )
+        },
+        UiNode {
+            modifier: semantics(UiSemantics {
+                merge: true,
+                ..Default::default()
+            }),
+            ..node(8, Some(1), column())
+        },
+        text(9, 8, "Laternen"),
+        text(10, 8, "12 Objekte"),
+        UiNode {
+            modifier: semantics(UiSemantics {
+                hidden: true,
+                ..Default::default()
+            }),
+            ..text(11, 1, "Deko")
+        },
+        UiNode {
+            modifier: semantics(UiSemantics {
+                role: Some(AccessRole::Tab),
+                selected: Some(true),
+                state: Some("offen".into()),
+                live: Some(AccessLive::Polite),
+                description: Some("Reiter der Ansicht".into()),
+                ..Default::default()
+            }),
+            ..node(
+                12,
+                Some(1),
+                Widget::SelectableLabel {
+                    text: "Ansicht".into(),
+                    selected: true,
+                },
+            )
+        },
+    ]
+}
+
+#[test]
+fn the_accessibility_tree_has_names_roles_values_and_the_nodes_of_kotlin() {
+    let mut run = Run::new(access_nodes());
+    let tree = access_tree(&mut run, vec![]);
+    let find = |label: &str| {
+        tree.nodes
+            .iter()
+            .find(|n| n.label.as_deref() == Some(label))
+            .unwrap_or_else(|| panic!("no node '{label}' in {:#?}", tree.nodes))
+    };
+    // The layout's containers are left out: the panel holds the widgets directly
+    let panel = tree
+        .nodes
+        .iter()
+        .find(|n| n.role == AccessRole::Pane)
+        .unwrap_or_else(|| panic!("no panel in {:#?}", tree.nodes));
+    let heading = find("Licht");
+    assert_eq!(
+        (heading.role, heading.node, heading.parent),
+        (AccessRole::Heading, Some(2), Some(panel.id))
+    );
+    // In pixels: twice the points
+    let points = run.state.bounds[&2];
+    assert!(
+        (heading.bounds.width - 2.0 * points.width).abs() < 1.0,
+        "{heading:?} {points:?}"
+    );
+    let shadows = find("Shadows");
+    assert_eq!(
+        (shadows.role, shadows.toggled, shadows.node),
+        (AccessRole::CheckBox, Some(AccessToggle::On), Some(3))
+    );
+    assert!(shadows.actions.contains(&AccessAction::Click));
+    let slider = tree.nodes.iter().find(|n| n.node == Some(4)).unwrap();
+    assert_eq!(
+        (slider.role, slider.numeric, slider.min, slider.max),
+        (AccessRole::Slider, Some(0.5), Some(0.0), Some(1.0))
+    );
+    assert!(
+        [
+            AccessAction::Increment,
+            AccessAction::Decrement,
+            AccessAction::SetValue
+        ]
+        .iter()
+        .all(|a| slider.actions.contains(a)),
+        "{slider:?}"
+    );
+    // The label of a field is its name, not a text of its own
+    let name = find("Name");
+    assert_eq!(
+        (
+            name.role,
+            name.value.as_deref(),
+            name.placeholder.as_deref(),
+            name.node
+        ),
+        (
+            AccessRole::TextInput,
+            Some("Laterne"),
+            Some("Wie sie heißt"),
+            Some(5)
+        )
+    );
+    assert!(name.actions.contains(&AccessAction::SetValue));
+    assert_eq!(
+        tree.nodes
+            .iter()
+            .filter(|n| n.label.as_deref() == Some("Name"))
+            .count(),
+        1
+    );
+    let sun = find("Sonne");
+    assert_eq!(
+        (sun.role, sun.toggled),
+        (AccessRole::Switch, Some(AccessToggle::On))
+    );
+    // Semantics from Kotlin: a name instead of the text, one node for a card, nothing for decoration
+    assert_eq!(find("Fenster schließen").role, AccessRole::Button);
+    let card = find("Laternen, 12 Objekte");
+    assert_eq!((card.role, card.node), (AccessRole::Group, Some(8)));
+    // A container of egui's layout has no place of its own: the card is where its texts are
+    let (texts, at) = (run.state.bounds[&10], card.bounds);
+    assert!(
+        at.height > 0.0 && at.y + at.height >= 2.0 * (texts.y + texts.height) - 1.0,
+        "{at:?} {texts:?}"
+    );
+    assert!(tree
+        .nodes
+        .iter()
+        .all(|n| n.label.as_deref() != Some("Laternen")
+            && n.label.as_deref() != Some("Deko")
+            && n.parent != Some(card.id)));
+    let tab = find("Ansicht");
+    assert_eq!(
+        (
+            tab.role,
+            tab.selected,
+            tab.state.as_deref(),
+            tab.live,
+            tab.description.as_deref()
+        ),
+        (
+            AccessRole::Tab,
+            Some(true),
+            Some("offen"),
+            Some(AccessLive::Polite),
+            Some("Reiter der Ansicht")
+        )
+    );
+    // Each node after the one it is in
+    for (i, n) in tree.nodes.iter().enumerate() {
+        if let Some(parent) = n.parent {
+            assert!(tree.nodes[..i].iter().any(|p| p.id == parent), "{n:?}");
+        }
+    }
+    assert_eq!(tree.focus, None);
+}
+
+#[test]
+fn a_screen_reader_clicks_sets_values_types_and_focuses_through_access_actions() {
+    let mut run = Run::new(access_nodes());
+    let tree = access_tree(&mut run, vec![]);
+    let id = |node: u64| tree.nodes.iter().find(|n| n.node == Some(node)).unwrap().id;
+    let request = |node, action, data| crate::access::request(id(node), action, data);
+    access_tree(&mut run, vec![request(3, AccessAction::Click, None)]);
+    access_tree(
+        &mut run,
+        vec![request(
+            4,
+            AccessAction::SetValue,
+            Some(egui::accesskit::ActionData::NumericValue(0.8)),
+        )],
+    );
+    access_tree(
+        &mut run,
+        vec![request(
+            5,
+            AccessAction::SetValue,
+            Some(egui::accesskit::ActionData::Value("Fackel".into())),
+        )],
+    );
+    access_tree(&mut run, vec![request(6, AccessAction::Click, None)]);
+    let events = run.state.take_events();
+    assert_eq!(
+        events,
+        vec![
+            UiEvent::Checked {
+                id: 3,
+                checked: false
+            },
+            UiEvent::FloatChanged { id: 4, value: 0.8 },
+            UiEvent::TextChanged {
+                id: 5,
+                value: "Fackel".into()
+            },
+            UiEvent::Checked {
+                id: 6,
+                checked: false
+            },
+        ]
+    );
+    // A step of the slider, and the keyboard to the field
+    access_tree(&mut run, vec![request(4, AccessAction::Increment, None)]);
+    let after = access_tree(&mut run, vec![request(5, AccessAction::Focus, None)]);
+    let after = access_tree(&mut run, vec![])
+        .nodes
+        .into_iter()
+        .chain(after.nodes)
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        run.state.take_events().as_slice(),
+        [UiEvent::FloatChanged { id: 4, value }] if (*value - 0.9).abs() < 1e-9
+    ));
+    let field = after.iter().find(|n| n.node == Some(5)).unwrap();
+    assert!(field.focused, "{field:?}");
+    assert_eq!(field.value.as_deref(), Some("Fackel"));
+}
+
+#[test]
+fn every_widget_is_described_with_a_role_and_egui_s_layout_is_left_out() {
+    let mut run = Run::new(every_widget());
+    let tree = access_tree(&mut run, vec![]);
+    let of = |node: u64| {
+        tree.nodes
+            .iter()
+            .find(|n| n.node == Some(node))
+            .unwrap_or_else(|| panic!("no access node for {node} in {:#?}", tree.nodes))
+    };
+    let described = |node: u64| (of(node).role, of(node).label.as_deref());
+    assert_eq!(described(105), (AccessRole::SpinButton, Some("Angle")));
+    assert_eq!(described(106), (AccessRole::ComboBox, Some("Scene")));
+    assert_eq!(of(106).value.as_deref(), Some("garden"));
+    assert_eq!(
+        described(109),
+        (AccessRole::Status, Some("Takes effect after a restart"))
+    );
+    assert_eq!(of(109).live, Some(AccessLive::Polite));
+    assert_eq!(described(110), (AccessRole::Alert, Some("Failed")));
+    assert_eq!(of(117).role, AccessRole::Canvas);
+    assert_eq!(of(107).numeric, Some(40.0));
+    // Texts are read, not clicked; no node of egui's layout is left
+    for n in &tree.nodes {
+        assert_ne!(n.role, AccessRole::Unknown, "{n:?}");
+        if n.role == AccessRole::Label {
+            assert!(n.actions.is_empty(), "{n:?}");
+        }
+    }
+    // The bars and the panel are panes at the top
+    assert!([1, 10, 20]
+        .iter()
+        .all(|&p| of(p).role == AccessRole::Pane && of(p).parent.is_none()));
 }

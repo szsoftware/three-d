@@ -287,7 +287,7 @@ struct LocalValue {
 }
 
 /// A rectangle in egui's points, from the top left.
-#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, uniffi::Record)]
 pub struct UiRect {
     /// Left edge.
     pub x: f32,
@@ -450,6 +450,12 @@ pub(crate) struct UiState {
     pub dragging: std::collections::HashSet<u64>,
     /// The families of the fonts from Kotlin, for the themes of nodes.
     pub font_families: std::collections::HashSet<String>,
+    /// Whether egui describes its frames for assistive technology ([crate::EguiOverlay::set_accessibility]).
+    pub access: bool,
+    /// The nodes of the frame by the ids of their AccessKit nodes, while [UiState::access].
+    pub access_nodes: HashMap<u64, u64>,
+    /// The AccessKit nodes with [crate::UiSemantics::merge].
+    pub access_merged: std::collections::HashSet<u64>,
 }
 
 impl UiState {
