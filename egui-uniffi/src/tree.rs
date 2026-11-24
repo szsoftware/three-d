@@ -967,12 +967,13 @@ pub enum Widget {
         #[uniffi(default)]
         height: Option<f32>,
         /// Pins it to a corner, an edge or the center, with [Widget::Window::x] and [Widget::Window::y] as the distance
-        /// from there; it cannot be moved then.
+        /// from there; it cannot be moved then. With [Widget::Window::movable] `Some(true)` it only starts there (its
+        /// corner of that side at that place, also while egui still measures it) and the user moves it from there.
         #[uniffi(default)]
         anchor: Option<Anchor>,
-        /// The user may drag it by its title bar.
-        #[uniffi(default = true)]
-        movable: bool,
+        /// The user may drag it by its title bar; `None`: yes, unless it has an [Widget::Window::anchor].
+        #[uniffi(default)]
+        movable: Option<bool>,
         /// With a title bar; without, it has no close button and does not fold.
         #[uniffi(default = true)]
         title_bar: bool,
