@@ -2185,7 +2185,8 @@ fn the_clipboard_copies_cuts_and_pastes() {
             value: "cloister".into()
         }]
     );
-    // The keys of the overlay: Control with C and X copy and cut, with V the overlay asks for the clipboard
+    // The keys of the overlay: Control (Command on a Mac) with C and X copy and cut, with V the overlay asks for the
+    // clipboard
     let mut held = crate::input::Held::default();
     let mut wanted = crate::input::Wanted::default();
     let mut press = |held: &mut crate::input::Held, key: &str, down| {
@@ -2198,7 +2199,12 @@ fn the_clipboard_copies_cuts_and_pastes() {
             &mut wanted,
         )
     };
-    press(&mut held, "Control", true);
+    let command = if cfg!(target_os = "macos") {
+        "Meta"
+    } else {
+        "Control"
+    };
+    press(&mut held, command, true);
     assert_eq!(press(&mut held, "C", true), vec![egui::Event::Copy]);
     assert_eq!(press(&mut held, "X", true), vec![egui::Event::Cut]);
     assert_eq!(press(&mut held, "V", true), vec![]);
