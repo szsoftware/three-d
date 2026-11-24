@@ -1,4 +1,4 @@
-use crate::{Tree, UiError, UiNode};
+use crate::{Tree, UiDate, UiError, UiNode};
 use std::collections::HashMap;
 
 /// What the user did in a frame, for Kotlin to take with [crate::EguiOverlay::take_events]: the DSL calls the lambda of
@@ -58,6 +58,27 @@ pub enum UiEvent {
         /// The node.
         id: u64,
     },
+    /// Another color was chosen in a [crate::Widget::ColorPicker].
+    ColorChanged {
+        /// The node.
+        id: u64,
+        /// ARGB.
+        color: u32,
+    },
+    /// Another day was chosen in a [crate::Widget::DatePicker].
+    DateChanged {
+        /// The node.
+        id: u64,
+        /// The day.
+        date: UiDate,
+    },
+    /// A node with [crate::UiModifier::focus_events] got or lost the keyboard.
+    FocusChanged {
+        /// The node.
+        id: u64,
+        /// Has it now.
+        focused: bool,
+    },
 }
 
 impl UiEvent {
@@ -70,7 +91,10 @@ impl UiEvent {
             | Self::FloatChanged { id, .. }
             | Self::TextChanged { id, .. }
             | Self::Submitted { id, .. }
-            | Self::Closed { id } => *id,
+            | Self::Closed { id }
+            | Self::ColorChanged { id, .. }
+            | Self::DateChanged { id, .. }
+            | Self::FocusChanged { id, .. } => *id,
         }
     }
 
@@ -83,6 +107,8 @@ impl UiEvent {
                 | Self::IntChanged { .. }
                 | Self::FloatChanged { .. }
                 | Self::TextChanged { .. }
+                | Self::ColorChanged { .. }
+                | Self::DateChanged { .. }
         )
     }
 }
@@ -96,7 +122,18 @@ pub(crate) enum Local {
     Int(i64),
     Float(f64),
     Text(String),
+    Color(u32),
+    Date(UiDate),
     Closed,
+}
+
+/// Who gets the keyboard with the next frame ([crate::EguiOverlay::request_focus]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Focus {
+    /// This node.
+    Node(u64),
+    /// Nobody.
+    Clear,
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +188,10 @@ pub(crate) struct UiState {
     pub panels: Vec<UiRect>,
     /// Something changed that the picture does not show yet.
     pub dirty: bool,
+    /// Who gets the keyboard when it is drawn next.
+    pub focus: Option<Focus>,
+    /// The node with [crate::UiModifier::focus_events] that has the keyboard, as reported.
+    pub focused: Option<u64>,
 }
 
 impl UiState {
@@ -168,6 +209,9 @@ impl UiState {
         let before = self.local.len();
         self.local
             .retain(|id, local| !local.taken && tree.ids.contains(id));
+        if matches!(self.focus, Some(Focus::Node(id)) if !tree.ids.contains(&id)) {
+            self.focus = None;
+        }
         if tree != self.tree || self.local.len() != before {
             self.dirty = true;
         }

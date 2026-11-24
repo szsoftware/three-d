@@ -1,6 +1,6 @@
 //! The tree, the values and the events with egui alone, without a graphics card: egui is run with made-up pointer events.
 
-use crate::state::UiState;
+use crate::state::{Focus, UiState};
 use crate::*;
 use three_d::egui;
 
@@ -55,6 +55,7 @@ fn checkbox(id: u64, checked: bool) -> UiNode {
         Widget::Checkbox {
             text: "Shadows".into(),
             checked,
+            indeterminate: false,
         },
     )
 }
@@ -194,7 +195,14 @@ fn trees_that_cannot_be_drawn_are_refused_with_the_reason() {
                 max: 1.0,
                 logarithmic: false,
                 decimals: None,
-                suffix: String::new()
+                suffix: String::new(),
+                prefix: String::new(),
+                step: None,
+                vertical: false,
+                clamping: None,
+                show_value: true,
+                trailing_fill: None,
+                handle: None,
             }
         )
     ])
@@ -310,6 +318,11 @@ fn buttons_options_and_sliders_report_their_ids() {
             Some(1),
             Widget::Button {
                 text: "Photo".into(),
+                small: false,
+                frame: true,
+                selected: false,
+                shortcut: None,
+                fill: None,
             },
         ),
         node(
@@ -332,6 +345,13 @@ fn buttons_options_and_sliders_report_their_ids() {
                 logarithmic: false,
                 decimals: None,
                 suffix: String::new(),
+                prefix: String::new(),
+                step: None,
+                vertical: false,
+                clamping: None,
+                show_value: true,
+                trailing_fill: None,
+                handle: None,
             },
         ),
         node(5, Some(1), row()),
@@ -340,6 +360,11 @@ fn buttons_options_and_sliders_report_their_ids() {
             Some(5),
             Widget::Button {
                 text: "Cancel".into(),
+                small: false,
+                frame: true,
+                selected: false,
+                shortcut: None,
+                fill: None,
             },
         ),
         node(
@@ -347,6 +372,11 @@ fn buttons_options_and_sliders_report_their_ids() {
             Some(5),
             Widget::Button {
                 text: "Cancel".into(),
+                small: false,
+                frame: true,
+                selected: false,
+                shortcut: None,
+                fill: None,
             },
         ),
     ]);
@@ -381,7 +411,18 @@ fn buttons_options_and_sliders_report_their_ids() {
 
 #[test]
 fn disabled_widgets_do_not_react() {
-    let mut button = node(2, Some(1), Widget::Button { text: "GPU".into() });
+    let mut button = node(
+        2,
+        Some(1),
+        Widget::Button {
+            text: "GPU".into(),
+            small: false,
+            frame: true,
+            selected: false,
+            shortcut: None,
+            fill: None,
+        },
+    );
     button.enabled = false;
     button.tooltip = Some("no compute shaders".into());
     let mut run = Run::new(vec![panel(), button]);
@@ -444,6 +485,12 @@ fn text_fields_report_typing_and_enter() {
                 value: "Garden".into(),
                 hint: String::new(),
                 password: false,
+                lines: None,
+                code: false,
+                language: None,
+                char_limit: None,
+                align: None,
+                read_only: false,
             },
         ),
     ]);
@@ -486,6 +533,11 @@ fn every_widget_draws() {
             Some(10),
             Widget::Button {
                 text: "File".into(),
+                small: false,
+                frame: true,
+                selected: false,
+                shortcut: None,
+                fill: None,
             },
         ),
         node(20, None, Widget::BottomBar { expanded: true }),
@@ -529,6 +581,15 @@ fn every_widget_draws() {
             value: 4,
             min: 1,
             max: 64,
+            logarithmic: false,
+            suffix: String::new(),
+            prefix: String::new(),
+            step: None,
+            vertical: false,
+            clamping: None,
+            show_value: true,
+            trailing_fill: None,
+            handle: None,
         },
         Widget::SliderFloat {
             label: "Haze".into(),
@@ -538,6 +599,13 @@ fn every_widget_draws() {
             logarithmic: true,
             decimals: Some(3),
             suffix: " /m".into(),
+            prefix: String::new(),
+            step: None,
+            vertical: false,
+            clamping: None,
+            show_value: true,
+            trailing_fill: None,
+            handle: None,
         },
         Widget::DragValue {
             label: "Angle".into(),
@@ -547,6 +615,9 @@ fn every_widget_draws() {
             max: Some(90.0),
             decimals: Some(1),
             suffix: " °".into(),
+            prefix: String::new(),
+            hexadecimal: false,
+            angle: false,
         },
         Widget::ComboBox {
             label: "Scene".into(),
@@ -575,6 +646,12 @@ fn every_widget_draws() {
             value: s(),
             hint: "Search".into(),
             password: true,
+            lines: None,
+            code: false,
+            language: None,
+            char_limit: None,
+            align: None,
+            read_only: false,
         },
         Widget::Group,
         Widget::Collapsible {
@@ -968,7 +1045,18 @@ fn text(id: u64, parent: u64, s: &str) -> UiNode {
 }
 
 fn button(id: u64, parent: u64, s: &str) -> UiNode {
-    node(id, Some(parent), Widget::Button { text: s.into() })
+    node(
+        id,
+        Some(parent),
+        Widget::Button {
+            text: s.into(),
+            small: false,
+            frame: true,
+            selected: false,
+            shortcut: None,
+            fill: None,
+        },
+    )
 }
 
 fn with(mut node: UiNode, modifier: UiModifier) -> UiNode {
@@ -1595,4 +1683,740 @@ fn grids_keep_the_room_between_cells() {
     assert!(b(&spaced, 4).x - b(&spaced, 3).x >= 90.0 - 0.5);
     let pitch = |run: &Run| b(run, 5).y - b(run, 3).y;
     assert!((pitch(&spaced) - pitch(&tight) - 12.0).abs() < 0.5);
+}
+
+// Phase 2: every input of egui
+
+fn plain_button(text: &str) -> Widget {
+    Widget::Button {
+        text: text.into(),
+        small: false,
+        frame: true,
+        selected: false,
+        shortcut: None,
+        fill: None,
+    }
+}
+
+fn field(value: &str) -> Widget {
+    Widget::TextField {
+        label: String::new(),
+        value: value.into(),
+        hint: String::new(),
+        password: false,
+        lines: None,
+        code: false,
+        language: None,
+        char_limit: None,
+        align: None,
+        read_only: false,
+    }
+}
+
+fn slider(value: f64, min: f64, max: f64) -> Widget {
+    Widget::SliderFloat {
+        label: String::new(),
+        value,
+        min,
+        max,
+        logarithmic: false,
+        decimals: None,
+        suffix: String::new(),
+        prefix: String::new(),
+        step: None,
+        vertical: false,
+        clamping: None,
+        show_value: true,
+        trailing_fill: None,
+        handle: None,
+    }
+}
+
+fn drag_value(value: f64) -> Widget {
+    Widget::DragValue {
+        label: String::new(),
+        value,
+        speed: 1.0,
+        min: None,
+        max: None,
+        decimals: None,
+        suffix: String::new(),
+        prefix: String::new(),
+        hexadecimal: false,
+        angle: false,
+    }
+}
+
+/// The middle of the text `text` as egui drew it.
+fn text_center(output: &egui::FullOutput, text: &str) -> egui::Pos2 {
+    fn find(shape: &egui::Shape, text: &str) -> Option<egui::Pos2> {
+        match shape {
+            egui::Shape::Text(t) if t.galley.text() == text => {
+                Some(t.pos + t.galley.rect.center().to_vec2())
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| find(s, text)),
+            _ => None,
+        }
+    }
+    output
+        .shapes
+        .iter()
+        .find_map(|c| find(&c.shape, text))
+        .unwrap_or_else(|| panic!("no text '{text}' among {:?}", texts(output)))
+}
+
+fn key(key: egui::Key, modifiers: egui::Modifiers) -> Vec<egui::Event> {
+    let event = |pressed| egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed,
+        repeat: false,
+        modifiers,
+    };
+    vec![event(true), event(false)]
+}
+
+impl Run {
+    /// A click at `pos`, with the output of each frame.
+    fn click_output(&mut self, pos: egui::Pos2) -> Vec<egui::FullOutput> {
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        vec![
+            self.frame(vec![egui::Event::PointerMoved(pos)]),
+            self.frame(vec![button(true)]),
+            self.frame(vec![button(false)]),
+            self.frame(vec![]),
+        ]
+    }
+
+    fn focus(&mut self, id: u64) {
+        self.state.focus = Some(Focus::Node(id));
+        self.frame(vec![]);
+    }
+}
+
+#[test]
+fn buttons_come_small_without_a_frame_chosen_and_with_their_key() {
+    let mut small = plain_button("Small");
+    if let Widget::Button { small: s, .. } = &mut small {
+        *s = true;
+    }
+    let mut flat = plain_button("Flat");
+    if let Widget::Button { frame, .. } = &mut flat {
+        *frame = false;
+    }
+    let mut save = plain_button("Save");
+    if let Widget::Button {
+        shortcut, selected, ..
+    } = &mut save
+    {
+        *shortcut = Some("Ctrl+S".into());
+        *selected = true;
+    }
+    let mut run = Run::new(vec![
+        central(1),
+        node(2, Some(1), plain_button("Normal")),
+        node(3, Some(1), small),
+        node(4, Some(1), flat),
+        node(5, Some(1), save),
+    ]);
+    let b = |run: &Run, id: u64| run.state.bounds[&id];
+    assert!(b(&run, 3).height < b(&run, 2).height, "{:?}", b(&run, 3));
+    // The key stands on the right of the text, in the same button
+    let output = run.frame(vec![]);
+    let (save_text, key_text) = (text_center(&output, "Save"), text_center(&output, "Ctrl+S"));
+    assert!(key_text.x > save_text.x && b(&run, 5).contains(key_text.x, key_text.y));
+    for id in [3, 4, 5] {
+        run.click(id);
+    }
+    assert_eq!(
+        run.state.take_events(),
+        vec![
+            UiEvent::Clicked { id: 3 },
+            UiEvent::Clicked { id: 4 },
+            UiEvent::Clicked { id: 5 }
+        ]
+    );
+}
+
+#[test]
+fn labels_toggles_radio_buttons_and_switches_report_what_the_user_chose() {
+    let mut run = Run::new(vec![
+        central(1),
+        node(
+            2,
+            Some(1),
+            Widget::SelectableLabel {
+                text: "Tab".into(),
+                selected: false,
+            },
+        ),
+        node(
+            3,
+            Some(1),
+            Widget::ToggleButton {
+                text: "Grid".into(),
+                checked: false,
+            },
+        ),
+        node(
+            4,
+            Some(1),
+            Widget::RadioButton {
+                text: "Low".into(),
+                selected: true,
+            },
+        ),
+        node(
+            5,
+            Some(1),
+            Widget::Switch {
+                text: "Shadows".into(),
+                checked: false,
+            },
+        ),
+        node(
+            6,
+            Some(1),
+            Widget::Checkbox {
+                text: "All".into(),
+                checked: false,
+                indeterminate: true,
+            },
+        ),
+    ]);
+    for id in [2, 3, 4, 6] {
+        run.click(id);
+    }
+    // A switch is clicked on its track and on its text
+    let switch = run.state.bounds[&5];
+    run.click_at(egui::pos2(switch.x + 8.0, switch.y + switch.height / 2.0));
+    assert_eq!(
+        run.state.take_events(),
+        vec![
+            UiEvent::Clicked { id: 2 },
+            UiEvent::Checked {
+                id: 3,
+                checked: true
+            },
+            UiEvent::Clicked { id: 4 },
+            UiEvent::Checked {
+                id: 6,
+                checked: true
+            },
+            UiEvent::Checked {
+                id: 5,
+                checked: true
+            },
+        ]
+    );
+    let output = run.frame(vec![]);
+    let label = text_center(&output, "Shadows");
+    run.click_at(label);
+    assert_eq!(
+        run.state.take_events(),
+        vec![UiEvent::Checked {
+            id: 5,
+            checked: false
+        }]
+    );
+    // The switch is twice as wide as high, its text beside it
+    assert!(switch.width > 2.0 * switch.height, "{switch:?}");
+}
+
+#[test]
+fn sliders_stand_upright_go_in_steps_and_hide_their_value() {
+    let mut upright = slider(5.0, 0.0, 10.0);
+    let mut stepped = slider(5.0, 0.0, 10.0);
+    let mut bare = slider(5.0, 0.0, 10.0);
+    if let Widget::SliderFloat {
+        vertical, prefix, ..
+    } = &mut upright
+    {
+        *vertical = true;
+        *prefix = "x ".into();
+    }
+    if let Widget::SliderFloat { step, handle, .. } = &mut stepped {
+        *step = Some(2.5);
+        *handle = Some(SliderHandle::Rect { aspect_ratio: 0.5 });
+    }
+    if let Widget::SliderFloat {
+        show_value,
+        clamping,
+        ..
+    } = &mut bare
+    {
+        *show_value = false;
+        *clamping = Some(SliderClamping::Never);
+    }
+    // Kotlin's value outside the range stays without clamping
+    if let Widget::SliderFloat { value, .. } = &mut bare {
+        *value = 12.0;
+    }
+    let mut run = Run::new(vec![
+        central(1),
+        node(2, Some(1), upright),
+        node(3, Some(1), stepped),
+        node(4, Some(1), bare),
+    ]);
+    let upright = run.state.bounds[&2];
+    assert!(upright.height > upright.width, "{upright:?}");
+    let output = run.frame(vec![]);
+    let shown = texts(&output);
+    assert!(shown.iter().any(|t| t == "x "), "{shown:?}");
+    // Two sliders show 5, the third nothing (not its 12 outside the range)
+    assert_eq!(shown.iter().filter(|t| *t == "5.0").count(), 2, "{shown:?}");
+    assert!(!shown.iter().any(|t| t.contains("12")), "{shown:?}");
+    // Dragging goes in steps of 2.5
+    let s = run.state.bounds[&3];
+    let from = egui::pos2(s.x + s.width * 0.3, s.y + s.height / 2.0);
+    run.drag(
+        from,
+        &[
+            egui::pos2(s.x + s.width * 0.31, from.y),
+            egui::pos2(s.x + 85.0, from.y),
+        ],
+    );
+    let events = run.state.take_events();
+    let Some(UiEvent::FloatChanged { value, .. }) = events.last() else {
+        panic!("{events:?}")
+    };
+    assert_eq!(value % 2.5, 0.0, "{events:?}");
+}
+
+#[test]
+fn drag_values_count_in_hexadecimal_and_in_degrees() {
+    let mut hex = drag_value(255.0);
+    if let Widget::DragValue {
+        hexadecimal,
+        prefix,
+        ..
+    } = &mut hex
+    {
+        *hexadecimal = true;
+        *prefix = "#".into();
+    }
+    let mut angle = drag_value(std::f64::consts::FRAC_PI_2);
+    if let Widget::DragValue { angle: a, .. } = &mut angle {
+        *a = true;
+    }
+    let mut run = Run::new(vec![
+        central(1),
+        node(2, Some(1), hex),
+        node(3, Some(1), angle),
+    ]);
+    let output = run.frame(vec![]);
+    let shown = texts(&output);
+    for part in ["#", "FF", "90", "°"] {
+        assert!(shown.iter().any(|t| t == part), "{part}: {shown:?}");
+    }
+    // Dragging turns it in degrees (a degree per point, after a few points to start), reported in radians
+    let a = run.state.bounds[&3];
+    let from = egui::pos2(a.x + a.width / 2.0, a.y + a.height / 2.0);
+    run.drag(
+        from,
+        &[
+            egui::pos2(from.x + 5.0, from.y),
+            egui::pos2(from.x + 10.0, from.y),
+        ],
+    );
+    let events = run.state.take_events();
+    let Some(UiEvent::FloatChanged { id: 3, value }) = events.last() else {
+        panic!("{events:?}")
+    };
+    let degrees = value.to_degrees();
+    assert!(degrees > 92.0 && degrees < 100.5, "{degrees}");
+}
+
+#[test]
+fn text_fields_take_lines_code_and_limits() {
+    let mut notes = field("");
+    if let Widget::TextField { lines, .. } = &mut notes {
+        *lines = Some(4);
+    }
+    let mut short = field("");
+    if let Widget::TextField { char_limit, .. } = &mut short {
+        *char_limit = Some(3);
+    }
+    let mut fixed = field("read me");
+    if let Widget::TextField { read_only, .. } = &mut fixed {
+        *read_only = true;
+    }
+    let mut rust = field("fn main() { let x = 1; }");
+    if let Widget::TextField {
+        code,
+        language,
+        lines,
+        ..
+    } = &mut rust
+    {
+        *code = true;
+        *language = Some("rs".into());
+        *lines = Some(2);
+    }
+    let mut run = Run::new(vec![
+        central(1),
+        node(2, Some(1), notes),
+        node(3, Some(1), short),
+        node(4, Some(1), fixed),
+        node(5, Some(1), rust),
+    ]);
+    // Several lines: Enter makes a new one, Ctrl+Enter is done
+    run.focus(2);
+    run.frame(vec![egui::Event::Text("a".into())]);
+    run.frame(key(egui::Key::Enter, egui::Modifiers::NONE));
+    run.frame(vec![egui::Event::Text("b".into())]);
+    run.frame(key(egui::Key::Enter, egui::Modifiers::COMMAND));
+    let events = run.state.take_events();
+    assert_eq!(
+        events.last(),
+        Some(&UiEvent::Submitted {
+            id: 2,
+            value: "a\nb".into()
+        }),
+        "{events:?}"
+    );
+    assert!(run.state.bounds[&2].height > 3.0 * run.state.bounds[&3].height);
+    // At most three characters
+    run.focus(3);
+    run.frame(vec![egui::Event::Text("abcdef".into())]);
+    assert_eq!(
+        run.state.take_events(),
+        vec![UiEvent::TextChanged {
+            id: 3,
+            value: "abc".into()
+        }]
+    );
+    // Read only: typing changes nothing
+    run.focus(4);
+    run.frame(vec![egui::Event::Text("x".into())]);
+    assert_eq!(run.state.take_events(), vec![]);
+    // The code in colors: several parts in other colors
+    let output = run.frame(vec![]);
+    let code = galley(&output, "fn main() { let x = 1; }");
+    let colors: std::collections::HashSet<_> =
+        code.job.sections.iter().map(|s| s.format.color).collect();
+    assert!(colors.len() >= 3, "{:?}", code.job.sections);
+}
+
+#[test]
+fn colors_and_days_are_chosen_in_their_pickers() {
+    let mut run = Run::new(vec![
+        central(1),
+        node(
+            2,
+            Some(1),
+            Widget::ColorPicker {
+                label: "Light".into(),
+                color: 0xFF336699,
+                alpha: false,
+                inline: true,
+            },
+        ),
+        node(
+            3,
+            Some(1),
+            Widget::DatePicker {
+                label: "Day".into(),
+                date: UiDate {
+                    year: 2026,
+                    month: 6,
+                    day: 21,
+                },
+                format: Some("%d.%m.%Y".into()),
+                calendar_week: true,
+                highlight_weekends: true,
+                first_year: None,
+                last_year: None,
+            },
+        ),
+    ]);
+    // A click into the field of saturation and value of the inline picker
+    let picker = run.state.bounds[&2];
+    run.click_at(egui::pos2(picker.x + 20.0, picker.y + 80.0));
+    let events = run.state.take_events();
+    let Some(UiEvent::ColorChanged { id: 2, color }) = events.last() else {
+        panic!("{events:?}")
+    };
+    assert_ne!(*color, 0xFF336699);
+    assert_eq!(color >> 24, 0xFF, "opaque");
+    // The button shows the day as asked; its calendar takes a click on the 15th and Save
+    let output = run.frame(vec![]);
+    let button = text_center(&output, "21.06.2026 📆");
+    let outputs = run.click_output(button);
+    let calendar = outputs.last().unwrap();
+    let day = text_center(calendar, "15");
+    run.click_at(day);
+    let output = run.frame(vec![]);
+    run.click_at(text_center(&output, "Save"));
+    assert_eq!(
+        run.state.take_events(),
+        vec![UiEvent::DateChanged {
+            id: 3,
+            date: UiDate {
+                year: 2026,
+                month: 6,
+                day: 15
+            }
+        }]
+    );
+}
+
+#[test]
+fn the_clipboard_copies_cuts_and_pastes() {
+    let mut run = Run::new(vec![central(1), node(2, Some(1), field("garden"))]);
+    run.focus(2);
+    run.frame(key(egui::Key::A, egui::Modifiers::COMMAND));
+    let output = run.frame(vec![egui::Event::Copy]);
+    let mut out = UiOutput::default();
+    out.add(output.platform_output, 2.0);
+    assert_eq!(out.take().copy, Some("garden".into()));
+    // Cut leaves the field empty, Paste fills it
+    run.frame(vec![egui::Event::Cut]);
+    run.frame(vec![egui::Event::Paste("cloister".into())]);
+    assert_eq!(
+        run.state.take_events(),
+        vec![UiEvent::TextChanged {
+            id: 2,
+            value: "cloister".into()
+        }]
+    );
+    // The keys of the overlay: Control (Command on a Mac) with C and X copy and cut, with V the overlay asks for the
+    // clipboard
+    let mut held = crate::input::Held::default();
+    let mut wanted = crate::input::Wanted::default();
+    let mut press = |held: &mut crate::input::Held, key: &str, down| {
+        held.events(
+            UiInput::Key {
+                key: key.into(),
+                down,
+            },
+            1.0,
+            &mut wanted,
+        )
+    };
+    let command = if cfg!(target_os = "macos") {
+        "Meta"
+    } else {
+        "Control"
+    };
+    press(&mut held, command, true);
+    assert_eq!(press(&mut held, "C", true), vec![egui::Event::Copy]);
+    assert_eq!(press(&mut held, "X", true), vec![egui::Event::Cut]);
+    assert_eq!(press(&mut held, "V", true), vec![]);
+    assert!(wanted.paste);
+}
+
+#[test]
+fn an_input_method_composes_and_commits() {
+    let mut run = Run::new(vec![central(1), node(2, Some(1), field(""))]);
+    run.focus(2);
+    let output = run.frame(vec![
+        egui::Event::Ime(egui::ImeEvent::Enabled),
+        egui::Event::Ime(egui::ImeEvent::Preedit("ni".into())),
+    ]);
+    // While it composes, the field tells where its cursor is, for the box of the input method
+    let mut out = UiOutput::default();
+    out.add(output.platform_output, 1.0);
+    let input = out.text_input.expect("a text field has the keyboard");
+    let f = run.state.bounds[&2];
+    assert!(
+        f.contains(input.cursor.x, input.cursor.y),
+        "{input:?} {f:?}"
+    );
+    run.frame(vec![
+        egui::Event::Ime(egui::ImeEvent::Commit("你".into())),
+        egui::Event::Ime(egui::ImeEvent::Disabled),
+    ]);
+    let events = run.state.take_events();
+    assert_eq!(
+        events.last(),
+        Some(&UiEvent::TextChanged {
+            id: 2,
+            value: "你".into()
+        }),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn links_open_their_address_and_shortcuts_work_while_drawn() {
+    let shortcut = |id, parent, key: &str, ctrl| {
+        node(
+            id,
+            parent,
+            Widget::Shortcut {
+                key: key.into(),
+                ctrl,
+                shift: false,
+                alt: false,
+            },
+        )
+    };
+    let mut run = Run::new(vec![
+        central(1),
+        node(
+            2,
+            Some(1),
+            Widget::Link {
+                text: "egui".into(),
+                url: Some("https://www.egui.rs".into()),
+                new_tab: true,
+            },
+        ),
+        node(
+            3,
+            Some(1),
+            Widget::Link {
+                text: "Details".into(),
+                url: None,
+                new_tab: false,
+            },
+        ),
+        node(4, Some(1), field("")),
+        shortcut(10, None, "S", true),
+        shortcut(11, None, "Delete", false),
+        shortcut(12, Some(1), "F5", false),
+    ]);
+    let outputs = run.click_output(run.center(2));
+    let mut out = UiOutput::default();
+    for output in outputs {
+        out.add(output.platform_output, 1.0);
+    }
+    assert_eq!(
+        out.take().open,
+        vec![crate::UiLink {
+            url: "https://www.egui.rs".into(),
+            new_tab: true
+        }]
+    );
+    run.click(3);
+    assert_eq!(
+        run.state.take_events(),
+        vec![UiEvent::Clicked { id: 2 }, UiEvent::Clicked { id: 3 }]
+    );
+    run.frame(key(egui::Key::S, egui::Modifiers::COMMAND));
+    run.frame(key(egui::Key::F5, egui::Modifiers::NONE));
+    run.frame(key(egui::Key::Delete, egui::Modifiers::NONE));
+    assert_eq!(
+        run.state.take_events(),
+        vec![
+            UiEvent::Clicked { id: 10 },
+            UiEvent::Clicked { id: 12 },
+            UiEvent::Clicked { id: 11 }
+        ]
+    );
+    // While a text field has the keyboard, Delete is the field's, Ctrl+S still the shortcut's
+    run.focus(4);
+    run.frame(key(egui::Key::Delete, egui::Modifiers::NONE));
+    run.frame(key(egui::Key::S, egui::Modifiers::COMMAND));
+    assert_eq!(run.state.take_events(), vec![UiEvent::Clicked { id: 10 }]);
+    // The pointer turns into a hand over a link and into a text cursor over a field
+    let cursor = |run: &mut Run, id: u64| {
+        let output = run.frame(vec![egui::Event::PointerMoved(run.center(id))]);
+        let mut out = UiOutput::default();
+        out.add(output.platform_output, 1.0);
+        out.cursor
+    };
+    assert_eq!(cursor(&mut run, 2), crate::UiCursor::PointingHand);
+    assert_eq!(cursor(&mut run, 4), crate::UiCursor::Text);
+    // Also in the frames of a click: egui's label under the link would show the text cursor
+    let at = run.center(2);
+    let button = |pressed| egui::Event::PointerButton {
+        pos: at,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: Default::default(),
+    };
+    for event in [button(true), button(false)] {
+        let mut out = UiOutput::default();
+        out.add(run.frame(vec![event]).platform_output, 1.0);
+        assert_eq!(out.cursor, crate::UiCursor::PointingHand);
+    }
+}
+
+#[test]
+fn kotlin_gives_the_keyboard_and_hears_who_has_it() {
+    let watched = UiModifier {
+        focus_events: true,
+        ..Default::default()
+    };
+    let mut run = Run::new(vec![
+        central(1),
+        with(node(2, Some(1), field("")), watched.clone()),
+        with(node(3, Some(1), field("")), watched),
+    ]);
+    run.focus(2);
+    run.frame(vec![egui::Event::Text("a".into())]);
+    run.focus(3);
+    run.state.focus = Some(Focus::Clear);
+    run.frame(vec![]);
+    run.frame(vec![]);
+    assert_eq!(
+        run.state.take_events(),
+        vec![
+            UiEvent::FocusChanged {
+                id: 2,
+                focused: true
+            },
+            UiEvent::TextChanged {
+                id: 2,
+                value: "a".into()
+            },
+            UiEvent::FocusChanged {
+                id: 2,
+                focused: false
+            },
+            UiEvent::FocusChanged {
+                id: 3,
+                focused: true
+            },
+            UiEvent::FocusChanged {
+                id: 3,
+                focused: false
+            },
+        ]
+    );
+}
+
+#[test]
+fn inputs_that_cannot_work_are_refused_with_the_reason() {
+    let tree = |widget| vec![central(1), node(2, Some(1), widget)];
+    let mut stepped = slider(1.0, 0.0, 2.0);
+    if let Widget::SliderFloat { step, .. } = &mut stepped {
+        *step = Some(0.0);
+    }
+    assert!(invalid(tree(stepped)).contains("the step is 0"));
+    let mut lines = field("");
+    if let Widget::TextField { lines: l, .. } = &mut lines {
+        *l = Some(0);
+    }
+    assert!(invalid(tree(lines)).contains("at least one line"));
+    let date = |month, day, first_year, last_year| Widget::DatePicker {
+        label: String::new(),
+        date: UiDate {
+            year: 2026,
+            month,
+            day,
+        },
+        format: None,
+        calendar_week: true,
+        highlight_weekends: true,
+        first_year,
+        last_year,
+    };
+    assert!(invalid(tree(date(2, 30, None, None))).contains("2026-02-30 is no day"));
+    assert!(invalid(tree(date(2, 3, Some(2030), Some(2020))))
+        .contains("first_year 2030 > last_year 2020"));
+    assert!(invalid(tree(Widget::Shortcut {
+        key: "Hyper".into(),
+        ctrl: true,
+        shift: false,
+        alt: false
+    }))
+    .contains("the key 'Hyper' is none egui knows"));
 }

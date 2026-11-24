@@ -188,6 +188,9 @@ pub struct UiModifier {
     /// Keeps its room but is neither drawn nor reacts (Compose's `alpha(0f)` without the clicks).
     #[uniffi(default)]
     pub invisible: bool,
+    /// Reports when it gets and loses the keyboard: [crate::UiEvent::FocusChanged] (Compose's `onFocusChanged`).
+    #[uniffi(default)]
+    pub focus_events: bool,
 }
 
 impl UiModifier {
@@ -390,6 +393,40 @@ pub struct PlotSeries {
     pub y: Vec<f64>,
     /// As ARGB, `None` the next color of egui_plot.
     pub color: Option<u32>,
+}
+
+/// Where a slider keeps its value while the user types another or Kotlin sends one outside its range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SliderClamping {
+    /// Never: values outside stay as they are.
+    Never,
+    /// What the user types is brought into the range, values from Kotlin stay.
+    Edits,
+    /// Always into the range (egui's default).
+    Always,
+}
+
+/// The handle of a slider.
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Enum)]
+pub enum SliderHandle {
+    /// Round (egui's default).
+    Circle,
+    /// A bar, `aspect_ratio` as wide as high (0.5 is half as wide).
+    Rect {
+        /// Width by height.
+        aspect_ratio: f32,
+    },
+}
+
+/// A day of the calendar, for [Widget::DatePicker].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct UiDate {
+    /// The year, for example 2026.
+    pub year: i32,
+    /// 1 to 12.
+    pub month: u32,
+    /// 1 to 31.
+    pub day: u32,
 }
 
 /// What a node is. The panels, windows and areas stand at the top of the tree (no parent), the containers hold other
@@ -597,6 +634,49 @@ pub enum Widget {
     Button {
         /// Its text.
         text: String,
+        /// Smaller, without room around the text, for toolbars.
+        #[uniffi(default)]
+        small: bool,
+        /// `false` without a background until the pointer is on it, as Compose's `TextButton`.
+        #[uniffi(default = true)]
+        frame: bool,
+        /// Drawn as chosen, as a pressed button of a group.
+        #[uniffi(default)]
+        selected: bool,
+        /// A key on its right, faint, for example "Ctrl+S" (the key itself is a [Widget::Shortcut]).
+        #[uniffi(default)]
+        shortcut: Option<String>,
+        /// Its background as ARGB, `None` egui's.
+        #[uniffi(default)]
+        fill: Option<u32>,
+    },
+    /// A text that is chosen or not, as a tab or an entry of a list: [crate::UiEvent::Clicked].
+    SelectableLabel {
+        /// Its text.
+        text: String,
+        /// Drawn as chosen.
+        selected: bool,
+    },
+    /// A button that stays pressed until it is clicked again (egui's `toggle_value`): [crate::UiEvent::Checked].
+    ToggleButton {
+        /// Its text.
+        text: String,
+        /// Pressed.
+        checked: bool,
+    },
+    /// One round button of a choice, the others are their own nodes (Compose's `RadioButton`): [crate::UiEvent::Clicked].
+    RadioButton {
+        /// Its text.
+        text: String,
+        /// The chosen one.
+        selected: bool,
+    },
+    /// A switch that slides on and off, as Compose's `Switch`: [crate::UiEvent::Checked].
+    Switch {
+        /// Beside it, empty for none.
+        text: String,
+        /// On.
+        checked: bool,
     },
     /// A box to tick: [crate::UiEvent::Checked].
     Checkbox {
@@ -604,6 +684,9 @@ pub enum Widget {
         text: String,
         /// Ticked.
         checked: bool,
+        /// Neither ticked nor not, with a dash: for a box over others of which some are ticked. A click ticks it.
+        #[uniffi(default)]
+        indeterminate: bool,
     },
     /// One of several options with round buttons: [crate::UiEvent::Selected].
     Radio {
@@ -635,6 +718,33 @@ pub enum Widget {
         min: i64,
         /// The largest.
         max: i64,
+        /// Logarithmic, for ranges over several powers of ten.
+        #[uniffi(default)]
+        logarithmic: bool,
+        /// After the number, for example " px".
+        #[uniffi(default)]
+        suffix: String,
+        /// Before the number, for example "x ".
+        #[uniffi(default)]
+        prefix: String,
+        /// The value goes in steps of this size, `None` freely.
+        #[uniffi(default)]
+        step: Option<f64>,
+        /// Upright, the smallest value at the bottom.
+        #[uniffi(default)]
+        vertical: bool,
+        /// Where values outside the range go, `None` [SliderClamping::Always].
+        #[uniffi(default)]
+        clamping: Option<SliderClamping>,
+        /// The number beside the slider, to type into.
+        #[uniffi(default = true)]
+        show_value: bool,
+        /// The track up to the handle in the accent color, `None` as egui's style says.
+        #[uniffi(default)]
+        trailing_fill: Option<bool>,
+        /// The handle, `None` round.
+        #[uniffi(default)]
+        handle: Option<SliderHandle>,
     },
     /// A number on a slider: [crate::UiEvent::FloatChanged].
     SliderFloat {
@@ -652,6 +762,27 @@ pub enum Widget {
         decimals: Option<u32>,
         /// After the number, for example " ms".
         suffix: String,
+        /// Before the number, for example "x ".
+        #[uniffi(default)]
+        prefix: String,
+        /// The value goes in steps of this size, `None` freely.
+        #[uniffi(default)]
+        step: Option<f64>,
+        /// Upright, the smallest value at the bottom.
+        #[uniffi(default)]
+        vertical: bool,
+        /// Where values outside the range go, `None` [SliderClamping::Always].
+        #[uniffi(default)]
+        clamping: Option<SliderClamping>,
+        /// The number beside the slider, to type into.
+        #[uniffi(default = true)]
+        show_value: bool,
+        /// The track up to the handle in the accent color, `None` as egui's style says.
+        #[uniffi(default)]
+        trailing_fill: Option<bool>,
+        /// The handle, `None` round.
+        #[uniffi(default)]
+        handle: Option<SliderHandle>,
     },
     /// A number that changes by dragging it or typing into it: [crate::UiEvent::FloatChanged].
     DragValue {
@@ -669,6 +800,15 @@ pub enum Widget {
         decimals: Option<u32>,
         /// After the number, for example " °".
         suffix: String,
+        /// Before the number.
+        #[uniffi(default)]
+        prefix: String,
+        /// As a whole number in hexadecimal, for colors and bit masks.
+        #[uniffi(default)]
+        hexadecimal: bool,
+        /// An angle: the value in radians, shown and dragged in degrees (egui's `drag_angle`).
+        #[uniffi(default)]
+        angle: bool,
     },
     /// One line to type into: [crate::UiEvent::TextChanged] while typing, [crate::UiEvent::Submitted] on Enter.
     TextField {
@@ -680,6 +820,89 @@ pub enum Widget {
         hint: String,
         /// Shows dots instead of the characters.
         password: bool,
+        /// Several lines, this many high to start with; Enter makes a new line, Ctrl+Enter reports
+        /// [crate::UiEvent::Submitted]. `None` one line.
+        #[uniffi(default)]
+        lines: Option<u32>,
+        /// Code: fixed width, Tab indents.
+        #[uniffi(default)]
+        code: bool,
+        /// Colors the code as this language (egui_extras: "rs", "toml", "py", "c", "cpp"; more with the feature
+        /// `syntect`), `None` plain.
+        #[uniffi(default)]
+        language: Option<String>,
+        /// At most this many characters.
+        #[uniffi(default)]
+        char_limit: Option<u32>,
+        /// The text at the start, in the middle or at the end, `None` at the start.
+        #[uniffi(default)]
+        align: Option<Align>,
+        /// To read and select, not to change.
+        #[uniffi(default)]
+        read_only: bool,
+    },
+    /// A color to choose: a button with the color that opens egui's picker (hue, saturation, value, alpha):
+    /// [crate::UiEvent::ColorChanged].
+    ColorPicker {
+        /// Beside it, empty for none.
+        label: String,
+        /// ARGB.
+        color: u32,
+        /// With alpha, else always opaque.
+        #[uniffi(default)]
+        alpha: bool,
+        /// The picker itself in the panel instead of a button.
+        #[uniffi(default)]
+        inline: bool,
+    },
+    /// A day to choose: a button with the date that opens a calendar (egui_extras): [crate::UiEvent::DateChanged].
+    DatePicker {
+        /// Beside it, empty for none.
+        label: String,
+        /// The day.
+        date: UiDate,
+        /// How the button shows it, as strftime ("%d.%m.%Y"), `None` "%Y-%m-%d".
+        #[uniffi(default)]
+        format: Option<String>,
+        /// Numbers of the weeks in the calendar.
+        #[uniffi(default = true)]
+        calendar_week: bool,
+        /// Saturdays and Sundays in another color.
+        #[uniffi(default = true)]
+        highlight_weekends: bool,
+        /// The first year to choose from, `None` 100 years ago.
+        #[uniffi(default)]
+        first_year: Option<i32>,
+        /// The last year to choose from, `None` in 10 years.
+        #[uniffi(default)]
+        last_year: Option<i32>,
+    },
+    /// A text that works as a link: [crate::UiEvent::Clicked]; with a `url` the application opens it too
+    /// ([crate::UiOutput::open]).
+    Link {
+        /// Its text.
+        text: String,
+        /// The address, `None` a link inside the application.
+        #[uniffi(default)]
+        url: Option<String>,
+        /// In a new tab.
+        #[uniffi(default)]
+        new_tab: bool,
+    },
+    /// A key with modifiers that works while the node is drawn (in an open window, a shown panel, or at the top of
+    /// the tree always): [crate::UiEvent::Clicked]. It draws nothing.
+    Shortcut {
+        /// The key, named as in [crate::UiInput::Key] ("S", "F5", "Delete").
+        key: String,
+        /// Control, Command on macOS.
+        #[uniffi(default)]
+        ctrl: bool,
+        /// Shift.
+        #[uniffi(default)]
+        shift: bool,
+        /// Alt, Option on macOS.
+        #[uniffi(default)]
+        alt: bool,
     },
     /// A bar that fills up.
     ProgressBar {
@@ -745,6 +968,15 @@ impl Widget {
     }
 
     /// May have nodes inside.
+    /// A widget that egui draws in a frame of its own, which starts at the height of a button and grows down: across a
+    /// row it needs its height of the last pass, as a container does.
+    pub(crate) fn grows_down(&self) -> bool {
+        matches!(
+            self,
+            Self::TextField { lines: Some(_), .. } | Self::ColorPicker { inline: true, .. }
+        )
+    }
+
     pub(crate) fn is_container(&self) -> bool {
         self.is_root()
             || matches!(
@@ -784,6 +1016,10 @@ impl Widget {
             Self::Separator => "Separator",
             Self::Spacer { .. } => "Spacer",
             Self::Button { .. } => "Button",
+            Self::SelectableLabel { .. } => "SelectableLabel",
+            Self::ToggleButton { .. } => "ToggleButton",
+            Self::RadioButton { .. } => "RadioButton",
+            Self::Switch { .. } => "Switch",
             Self::Checkbox { .. } => "Checkbox",
             Self::Radio { .. } => "Radio",
             Self::ComboBox { .. } => "ComboBox",
@@ -791,6 +1027,10 @@ impl Widget {
             Self::SliderFloat { .. } => "SliderFloat",
             Self::DragValue { .. } => "DragValue",
             Self::TextField { .. } => "TextField",
+            Self::ColorPicker { .. } => "ColorPicker",
+            Self::DatePicker { .. } => "DatePicker",
+            Self::Link { .. } => "Link",
+            Self::Shortcut { .. } => "Shortcut",
             Self::ProgressBar { .. } => "ProgressBar",
             Self::Spinner => "Spinner",
             Self::Plot { .. } => "Plot",
@@ -854,6 +1094,16 @@ impl Widget {
                 ..
             } => selected(options, *s),
             Self::SliderInt { min, max, .. } if min > max => Some(format!("min {min} > max {max}")),
+            Self::SliderInt {
+                min,
+                logarithmic: true,
+                ..
+            } if *min < 0 => Some(format!("a logarithmic slider needs min >= 0, it has {min}")),
+            Self::SliderInt { step, handle, .. } | Self::SliderFloat { step, handle, .. }
+                if slider_options(*step, *handle).is_some() =>
+            {
+                slider_options(*step, *handle)
+            }
             Self::SliderFloat { min, max, .. } if out_of_order(*min, *max) => {
                 Some(format!("min {min} > max {max}"))
             }
@@ -871,7 +1121,70 @@ impl Widget {
                 Some(format!("a plot needs a height above 0, it has {height}"))
             }
             Self::Plot { series, .. } => series.iter().find_map(PlotSeries::check),
+            Self::TextField { lines: Some(0), .. } => {
+                Some("a text field needs at least one line".into())
+            }
+            Self::DatePicker {
+                date,
+                first_year,
+                last_year,
+                ..
+            } => date.check().or_else(|| match (first_year, last_year) {
+                (Some(first), Some(last)) if first > last => {
+                    Some(format!("first_year {first} > last_year {last}"))
+                }
+                _ => None,
+            }),
+            Self::Shortcut { key, .. } if crate::input::key_named(key).is_none() => Some(format!(
+                "the key '{key}' is none egui knows (\"S\", \"F5\", \"Delete\", \"ArrowUp\")"
+            )),
             _ => None,
+        }
+    }
+}
+
+/// Why the step or the handle of a slider does not fit, if it does not.
+fn slider_options(step: Option<f64>, handle: Option<SliderHandle>) -> Option<String> {
+    if let Some(step) = step.filter(|s| !(s.is_finite() && *s > 0.0)) {
+        return Some(format!("the step is {step}, it needs one above 0"));
+    }
+    match handle {
+        Some(SliderHandle::Rect { aspect_ratio })
+            if !(aspect_ratio.is_finite() && aspect_ratio > 0.0) =>
+        {
+            Some(format!(
+                "the handle's aspect_ratio is {aspect_ratio}, it needs one above 0"
+            ))
+        }
+        _ => None,
+    }
+}
+
+impl UiDate {
+    /// Why it is no day of the calendar, if it is none.
+    fn check(&self) -> Option<String> {
+        self.to_jiff().err().map(|e| {
+            format!(
+                "{}-{:02}-{:02} is no day of the calendar: {e}",
+                self.year, self.month, self.day
+            )
+        })
+    }
+
+    pub(crate) fn to_jiff(self) -> Result<jiff::civil::Date, jiff::Error> {
+        let small = |v: i64| i16::try_from(v).unwrap_or(i16::MAX);
+        jiff::civil::Date::new(
+            small(self.year as i64),
+            i8::try_from(self.month).unwrap_or(i8::MAX),
+            i8::try_from(self.day).unwrap_or(i8::MAX),
+        )
+    }
+
+    pub(crate) fn from_jiff(date: jiff::civil::Date) -> Self {
+        Self {
+            year: date.year() as i32,
+            month: date.month() as u32,
+            day: date.day() as u32,
         }
     }
 }
@@ -943,10 +1256,12 @@ impl Tree {
                 return Err(invalid(format!("{}: {why}", what())));
             }
             match node.parent {
-                None if node.widget.is_root() => roots.push(index),
+                None if node.widget.is_root() || matches!(node.widget, Widget::Shortcut { .. }) => {
+                    roots.push(index)
+                }
                 None => {
                     return Err(invalid(format!(
-                        "{} has no parent: only SidePanel, TopBar, BottomBar, CentralPanel, Window and Area stand at the top",
+                        "{} has no parent: only SidePanel, TopBar, BottomBar, CentralPanel, Window, Area and Shortcut stand at the top",
                         what()
                     )))
                 }

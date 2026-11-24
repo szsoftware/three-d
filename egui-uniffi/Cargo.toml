@@ -15,6 +15,9 @@ crate-type = ["lib", "cdylib"]
 default = ["wgpu"]
 # Draws on contexts of three-d's wgpu backend too (with three-d's core painter); OpenGL/WebGL always works
 wgpu = ["three-d/wgpu"]
+# Colors code of every language syntect knows in Widget::TextField (C#, Java, JavaScript, SQL, …); without it egui_extras
+# colors Rust, TOML, Python, C and C++. It makes the library about 1 MB larger.
+syntect = ["egui_extras/syntect"]
 
 [dependencies]
 uniffi = "0.32"
@@ -24,6 +27,10 @@ three-d = { path = "..", default-features = false, features = ["egui-gui"] }
 web-time = "1"
 # Diagrams (Widget::Plot): lines, points, bars and box plots; 0.35 is the one for egui 0.34 of three-d
 egui_plot = { version = "0.35", default-features = false }
+# The calendar of Widget::DatePicker and the colors of code in Widget::TextField; 0.34 as egui
+egui_extras = { version = "0.34", default-features = false, features = ["datepicker"] }
+# The days of Widget::DatePicker, as egui_extras has them
+jiff = { version = "0.2.23", default-features = false, features = ["std"] }
 
 # OpenGL through EGL without a window for the tests
 [target.'cfg(target_os = "linux")'.dev-dependencies]

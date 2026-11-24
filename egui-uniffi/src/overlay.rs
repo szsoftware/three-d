@@ -1,6 +1,6 @@
-use crate::input::Held;
-use crate::state::UiState;
-use crate::{UiError, UiEvent, UiInput, UiNode, UiRect};
+use crate::input::{Held, Wanted};
+use crate::state::{Focus, UiState};
+use crate::{UiError, UiEvent, UiInput, UiNode, UiOutput, UiRect};
 use cargo_uniffi_support::ThreadBound;
 use std::sync::{Arc, Mutex, MutexGuard};
 use three_d::egui;
@@ -31,6 +31,8 @@ struct Shared {
     /// What came in since the last frame, turned into three-d's events when the height of the picture is known.
     input: Vec<UiInput>,
     held: Held,
+    /// What egui asked of the platform since Kotlin last took it.
+    output: UiOutput,
     pointer: Pointer,
     egui: Option<egui::Context>,
     pixels_per_point: f32,
@@ -71,6 +73,7 @@ impl Default for EguiOverlay {
                 ui: UiState::new(),
                 input: Vec::new(),
                 held: Held::default(),
+                output: UiOutput::default(),
                 pointer: Pointer::Free,
                 egui: None,
                 pixels_per_point: 1.0,
@@ -113,6 +116,20 @@ impl EguiOverlay {
     /// What the user did since the last call, oldest first.
     pub fn take_events(&self) -> Vec<UiEvent> {
         lock(&self.shared).ui.take_events()
+    }
+
+    /// What egui wants of the platform since the last call: text for the clipboard, a wish to paste, links to open, the
+    /// look of the pointer, where text is typed. Take it after each frame, as the events.
+    pub fn take_output(&self) -> UiOutput {
+        lock(&self.shared).output.take()
+    }
+
+    /// Gives node `id` the keyboard with the next frame (a text field, a button for Enter and Space), as Compose's
+    /// `FocusRequester.requestFocus()`; `None` takes it from whoever has it.
+    pub fn request_focus(&self, id: Option<u64>) {
+        let mut shared = lock(&self.shared);
+        shared.ui.focus = Some(id.map_or(Focus::Clear, Focus::Node));
+        shared.ui.dirty = true;
     }
 
     /// Whether the next frame would look different: a new tree, input, an animation of egui (hover, a spinner, an
@@ -203,7 +220,15 @@ impl Shared {
                 self.pointer == Pointer::Captured
                     || (self.pointer == Pointer::Free && self.over(x / s, y / s))
             }
-            UiInput::Key { .. } | UiInput::Text { .. } => self
+            UiInput::Key { .. }
+            | UiInput::Text { .. }
+            | UiInput::Copy
+            | UiInput::Cut
+            | UiInput::Paste { .. }
+            | UiInput::ImeStart
+            | UiInput::ImeCompose { .. }
+            | UiInput::ImeCommit { .. }
+            | UiInput::ImeEnd => self
                 .egui
                 .as_ref()
                 .is_some_and(|egui| egui.egui_wants_keyboard_input()),
@@ -329,24 +354,26 @@ impl EguiOverlay {
                 return Ok(());
             }
             shared.apply_style(p.gui.context());
-            let height = viewport.height as f32;
-            let mut all: Vec<Event> = Vec::new();
+            let scale = shared.pixels_per_point;
+            let mut wanted = Wanted::default();
+            let mut own = Vec::new();
             for input in shared.input.drain(..) {
-                all.extend(shared.held.events(input, height));
+                own.extend(shared.held.events(input, scale, &mut wanted));
             }
-            let own = all.len();
-            all.extend(events.iter().cloned());
+            shared.output.paste |= wanted.paste;
             shared.ui.dirty = false;
             let ms = p.started.elapsed().as_secs_f64() * 1000.0;
             let ui = &mut shared.ui;
-            p.gui
-                .update(&mut all, ms, viewport, shared.pixels_per_point, |root| {
-                    crate::draw::draw(root, ui)
-                });
-            for (given, handled) in events.iter_mut().zip(all.drain(own..)) {
-                *given = handled;
-            }
-            drop(all);
+            p.gui.update_with_egui_events(
+                own,
+                shared.held.modifiers(),
+                events,
+                ms,
+                viewport,
+                scale,
+                |root| crate::draw::draw(root, ui),
+            );
+            shared.output.add(p.gui.take_platform_output(), scale);
             write(&|| p.gui.render())?;
             p.viewport = Some(viewport);
             Ok(())
