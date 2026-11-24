@@ -28,6 +28,7 @@ mod reactions;
 mod state;
 #[cfg(test)]
 mod tests;
+mod theme;
 mod tree;
 
 pub use error::*;
@@ -35,6 +36,7 @@ pub use input::{UiInput, UiTouchPhase};
 pub use output::{UiCursor, UiLink, UiOutput, UiTextInput};
 pub use overlay::*;
 pub use state::{DragPhase, UiEvent, UiPoint, UiRect};
+pub use theme::{EguiTool, UiColors, UiFont, UiSpacing, UiTextSize, UiTheme};
 pub(crate) use tree::Tree;
 pub use tree::{
     Align, Anchor, Arrangement, CanvasShape, CanvasStroke, ColumnWidth, ImageFit, NoticeLevel,

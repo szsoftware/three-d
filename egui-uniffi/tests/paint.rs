@@ -1750,3 +1750,284 @@ fn a_card_dragged_over_the_picture_follows_the_pointer_and_is_dropped_in_the_lis
         release(context);
     }
 }
+
+/// Phase 7: a panel with a text, a node of its own look and a window to move.
+fn look_tree() -> Vec<UiNode> {
+    let text = |id, parent, s: &str| {
+        node(
+            id,
+            Some(parent),
+            Widget::Text {
+                text: s.into(),
+                style: TextStyle::Body,
+                color: None,
+                spans: vec![],
+                wrap: None,
+                selectable: false,
+            },
+        )
+    };
+    let button = |id, parent, s: &str| {
+        node(
+            id,
+            Some(parent),
+            Widget::Button {
+                text: s.into(),
+                small: false,
+                frame: true,
+                selected: false,
+                shortcut: None,
+                fill: None,
+                image: None,
+                image_size: None,
+            },
+        )
+    };
+    let mut nodes = tree(false);
+    nodes.push(text(4, 1, "iiii mmm"));
+    let mut light = node(5, Some(1), column());
+    light.modifier = Some(UiModifier {
+        theme: Some(UiTheme {
+            dark: Some(false),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    nodes.push(light);
+    nodes.push(button(6, 5, "Hell"));
+    nodes.push(node(
+        7,
+        None,
+        Widget::Window {
+            title: "Werkzeuge".into(),
+            x: 200.0,
+            y: 40.0,
+            width: Some(150.0),
+            closable: false,
+            collapsible: false,
+            resizable: false,
+            // egui sizes a new window first at most as high as the screen (400 points without a height), which
+            // pushes it to the top of this small one
+            height: Some(80.0),
+            anchor: None,
+            movable: true,
+            title_bar: true,
+            fixed_size: false,
+            scroll: false,
+            open: true,
+        },
+    ));
+    nodes.push(text(8, 7, "Gitter"));
+    nodes
+}
+
+fn frames(context: &Context, overlay: &EguiOverlay) -> Vec<[u8; 4]> {
+    frame(context, overlay);
+    frame(context, overlay)
+}
+
+/// Drags with the left button from `from` by `by`, a frame after each event.
+fn drag(context: &Context, overlay: &EguiOverlay, (x, y): (f32, f32), (dx, dy): (f32, f32)) {
+    overlay.input(UiInput::Move { x, y });
+    frame(context, overlay);
+    overlay.input(UiInput::Press { x, y, button: 0 });
+    frame(context, overlay);
+    for i in 1..=4 {
+        let t = i as f32 / 4.0;
+        overlay.input(UiInput::Move {
+            x: x + dx * t,
+            y: y + dy * t,
+        });
+        frame(context, overlay);
+    }
+    overlay.input(UiInput::Release {
+        x: x + dx,
+        y: y + dy,
+        button: 0,
+    });
+    frames(context, overlay);
+}
+
+#[test]
+fn the_theme_fonts_zoom_and_saved_state_from_kotlin_change_the_picture() {
+    for (name, context) in contexts() {
+        let overlay = EguiOverlay::new();
+        overlay.set_tree(look_tree()).unwrap();
+        // Following the system, which said nothing yet: egui's dark look
+        overlay.set_theme(UiTheme::default());
+        let picture = frames(&context, &overlay);
+        let bottom = pixel(&picture, 140, 280);
+        assert!(near(bottom, [27, 27, 27], 3), "{name}: {bottom:?}");
+        overlay.set_system_theme(Some(false));
+        let picture = frames(&context, &overlay);
+        let bottom = pixel(&picture, 140, 280);
+        assert!(
+            bottom[0] > 200,
+            "{name}: the system turned light, {bottom:?}"
+        );
+        // A color of the panels; the node with a light theme has a light button in the dark panel
+        overlay.set_system_theme(Some(true));
+        overlay.set_theme(UiTheme {
+            colors: Some(UiColors {
+                background: Some(0xFF2040A0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let picture = frames(&context, &overlay);
+        let bottom = pixel(&picture, 140, 280);
+        assert!(near(bottom, [0x20, 0x40, 0xA0], 2), "{name}: {bottom:?}");
+        let fill = |picture: &[[u8; 4]], id| {
+            let r = overlay.bounds(id).unwrap();
+            pixel(picture, r.x as u32 + 3, (r.y + r.height / 2.0) as u32)
+        };
+        let (light, dark) = (fill(&picture, 6), fill(&picture, 3));
+        assert!(
+            light[0] > 200 && dark[0] < 120,
+            "{name}: button of the light node {light:?}, of the panel {dark:?}"
+        );
+        // Larger text
+        let before = overlay.bounds(4).unwrap();
+        overlay.set_theme(UiTheme {
+            text_sizes: vec![UiTextSize {
+                style: TextStyle::Body,
+                size: 25.0,
+                family: None,
+            }],
+            ..Default::default()
+        });
+        frames(&context, &overlay);
+        let after = overlay.bounds(4).unwrap();
+        assert!(
+            after.height > before.height * 1.6,
+            "{name}: {before:?} -> {after:?}"
+        );
+        // A font from Kotlin as the text font: egui's Hack, where i is as wide as m
+        overlay.set_theme(UiTheme::default());
+        frames(&context, &overlay);
+        let plain = overlay.bounds(4).unwrap().width;
+        let hack = |family: Option<&str>| UiFont {
+            name: "Hack".into(),
+            bytes: epaint_default_fonts::HACK_REGULAR.to_vec(),
+            family: family.map(Into::into),
+            fallback: false,
+            scale: None,
+            y_offset: None,
+        };
+        overlay.set_fonts(vec![hack(None)]).unwrap();
+        frames(&context, &overlay);
+        let mono = overlay.bounds(4).unwrap().width;
+        assert!(mono > plain * 1.15, "{name}: {plain} -> {mono}");
+        // A family of its own for the body text only
+        overlay.set_fonts(vec![hack(Some("Code"))]).unwrap();
+        overlay.set_theme(UiTheme::default());
+        frames(&context, &overlay);
+        assert!(
+            (overlay.bounds(4).unwrap().width - plain).abs() < 1.0,
+            "{name}: a family nobody uses changes nothing"
+        );
+        overlay.set_theme(UiTheme {
+            text_sizes: vec![UiTextSize {
+                style: TextStyle::Body,
+                size: 12.5,
+                family: Some("Code".into()),
+            }],
+            ..Default::default()
+        });
+        frames(&context, &overlay);
+        let coded = overlay.bounds(4).unwrap().width;
+        assert!(coded > plain * 1.15, "{name}: {plain} -> {coded}");
+        let broken = UiFont {
+            bytes: vec![1, 2, 3],
+            ..hack(None)
+        };
+        assert!(
+            matches!(
+                overlay.set_fonts(vec![broken]),
+                Err(UiError::InvalidData { .. })
+            ),
+            "{name}"
+        );
+        overlay.set_fonts(vec![]).unwrap();
+        overlay.set_theme(UiTheme::default());
+        frames(&context, &overlay);
+        // Ctrl (Command on a Mac) and = zoom by a tenth, egui gets nothing of it
+        let small = overlay.bounds(4).unwrap();
+        let key = |key: &str, down| {
+            overlay.input(UiInput::Key {
+                key: key.into(),
+                down,
+            })
+        };
+        let command = if cfg!(target_os = "macos") {
+            "Meta"
+        } else {
+            "Control"
+        };
+        key(command, true);
+        assert!(key("=", true), "{name}: the zoom keys belong to egui");
+        key("=", false);
+        key(command, false);
+        frames(&context, &overlay);
+        assert_eq!(
+            overlay.take_events(),
+            vec![UiEvent::ZoomChanged { factor: 1.1 }],
+            "{name}"
+        );
+        assert_eq!(overlay.zoom(), 1.1, "{name}");
+        let big = overlay.bounds(4).unwrap();
+        assert!(
+            (big.height / small.height - 1.1).abs() < 0.04,
+            "{name}: {small:?} -> {big:?}"
+        );
+        // The window moved by the user, the state saved, moved again and brought back
+        let w = overlay.bounds(7).unwrap();
+        drag(&context, &overlay, (w.x + 30.0, w.y + 8.0), (-40.0, 40.0));
+        let moved = overlay.bounds(7).unwrap();
+        assert!(
+            (moved.x - w.x + 40.0).abs() < 2.0 && (moved.y - w.y - 40.0).abs() < 2.0,
+            "{name}: {w:?} -> {moved:?}"
+        );
+        let saved = overlay.save_state();
+        assert!(!saved.is_empty(), "{name}");
+        drag(
+            &context,
+            &overlay,
+            (moved.x + 30.0, moved.y + 8.0),
+            (-50.0, 20.0),
+        );
+        assert!(
+            (overlay.bounds(7).unwrap().x - moved.x).abs() > 40.0,
+            "{name}"
+        );
+        overlay.set_zoom(1.0);
+        overlay.restore_state(saved.clone()).unwrap();
+        frames(&context, &overlay);
+        let back = overlay.bounds(7).unwrap();
+        assert!(
+            (back.x - moved.x).abs() < 1.0 && (back.y - moved.y).abs() < 1.0,
+            "{name}: {moved:?} -> {back:?}"
+        );
+        assert_eq!(overlay.zoom(), 1.1, "{name}");
+        // In the next run: before its first frame
+        let next = EguiOverlay::new();
+        next.set_tree(look_tree()).unwrap();
+        next.restore_state(saved).unwrap();
+        frames(&context, &next);
+        let there = next.bounds(7).unwrap();
+        assert!(
+            (there.x - moved.x).abs() < 1.0 && (there.y - moved.y).abs() < 1.0,
+            "{name}: {moved:?} -> {there:?}"
+        );
+        assert!(
+            matches!(
+                next.restore_state(b"kein Zustand".to_vec()),
+                Err(UiError::InvalidData { .. })
+            ),
+            "{name}"
+        );
+        drop(overlay);
+        drop(next);
+        release(context);
+    }
+}

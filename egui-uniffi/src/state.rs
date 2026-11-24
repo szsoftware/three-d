@@ -183,6 +183,12 @@ pub enum UiEvent {
         /// are sorted by dragging. `None` for a target without nodes inside.
         index: Option<u32>,
     },
+    /// The user zoomed the overlay with Ctrl and Plus, Minus or 0 (Command on macOS): its new factor, for the
+    /// application to keep. It belongs to no node (`id` 0 among the others).
+    ZoomChanged {
+        /// 1 is egui's size.
+        factor: f32,
+    },
 }
 
 /// Where a drag is, in [UiEvent::Dragged].
@@ -223,6 +229,7 @@ impl UiEvent {
             | Self::Dragged { id, .. }
             | Self::Gesture { id, .. }
             | Self::Dropped { id, .. } => *id,
+            Self::ZoomChanged { .. } => 0,
         }
     }
 
@@ -242,6 +249,7 @@ impl UiEvent {
                 | Self::PointerAt { .. }
                 | Self::ViewChanged { .. }
                 | Self::HoverChanged { .. }
+                | Self::ZoomChanged { .. }
         )
     }
 }
@@ -440,6 +448,8 @@ pub(crate) struct UiState {
     pub long_pressed: std::collections::HashSet<u64>,
     /// The nodes with [crate::UiReactions::drag] that reported [UiEvent::Dragged] with `Started`, until `Stopped`.
     pub dragging: std::collections::HashSet<u64>,
+    /// The families of the fonts from Kotlin, for the themes of nodes.
+    pub font_families: std::collections::HashSet<String>,
 }
 
 impl UiState {
