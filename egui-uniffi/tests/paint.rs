@@ -1649,3 +1649,104 @@ fn images_a_floor_plan_on_a_canvas_and_a_scene_over_the_picture() {
         release(context);
     }
 }
+
+#[test]
+fn a_card_dragged_over_the_picture_follows_the_pointer_and_is_dropped_in_the_list() {
+    let card = |id: u64, color: u32| UiNode {
+        modifier: Some(UiModifier {
+            width: Some(120.0),
+            height: Some(30.0),
+            background: Some(color),
+            reactions: Some(UiReactions {
+                drag_kind: Some("karte".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..node(id, Some(2), column())
+    };
+    let nodes = vec![
+        node(1, None, Widget::CentralPanel { frame: true }),
+        UiNode {
+            modifier: Some(UiModifier {
+                reactions: Some(UiReactions {
+                    drop_kinds: Some(vec![]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..node(2, Some(1), column())
+        },
+        card(3, 0xFF2060E0),
+        card(4, 0xFF20A040),
+        card(5, 0xFFE0C020),
+    ];
+    for (name, context) in contexts() {
+        let overlay = EguiOverlay::new();
+        overlay.set_tree(nodes.clone()).unwrap();
+        frame(&context, &overlay);
+        frame(&context, &overlay);
+        let blue = overlay.bounds(3).expect("drawn");
+        let yellow = overlay.bounds(5).unwrap();
+        let (x, y) = center(&overlay, 3);
+        // Taken in its middle and moved 150 points to the right and down under the yellow card
+        let to = (x + 150.0, yellow.y + yellow.height + 20.0);
+        overlay.input(UiInput::Move { x, y });
+        frame(&context, &overlay);
+        overlay.input(UiInput::Press { x, y, button: 0 });
+        frame(&context, &overlay);
+        let mut picture = Vec::new();
+        for step in 1..=6 {
+            let t = step as f32 / 6.0;
+            let (px, py) = (x + (to.0 - x) * t, y + (to.1 - y) * t);
+            overlay.input(UiInput::Move { x: px, y: py });
+            picture = frame(&context, &overlay);
+        }
+        // The blue card under the pointer, its place in the list empty
+        let p = pixel(&picture, to.0 as u32, to.1 as u32);
+        assert!(near(p, [32, 96, 224], 30), "{name}: at the pointer {p:?}");
+        let p = pixel(&picture, x as u32, y as u32);
+        assert!(!near(p, [32, 96, 224], 30), "{name}: its place {p:?}");
+        assert!(blue.y < yellow.y);
+        overlay.input(UiInput::Release {
+            x: to.0,
+            y: to.1,
+            button: 0,
+        });
+        frame(&context, &overlay);
+        // Dropped beside the list: the pointer was not on it
+        assert_eq!(overlay.take_events(), vec![], "{name}");
+        // Once more, onto the list under the yellow card
+        let list = overlay.bounds(2).unwrap();
+        let to = (x, list.y + list.height - 3.0);
+        overlay.input(UiInput::Move { x, y });
+        frame(&context, &overlay);
+        overlay.input(UiInput::Press { x, y, button: 0 });
+        frame(&context, &overlay);
+        for step in 1..=6 {
+            let t = step as f32 / 6.0;
+            overlay.input(UiInput::Move {
+                x,
+                y: y + (to.1 - y) * t,
+            });
+            frame(&context, &overlay);
+        }
+        overlay.input(UiInput::Release {
+            x: to.0,
+            y: to.1,
+            button: 0,
+        });
+        frame(&context, &overlay);
+        assert_eq!(
+            overlay.take_events(),
+            vec![UiEvent::Dropped {
+                id: 2,
+                source: 3,
+                index: Some(3)
+            }],
+            "{name}"
+        );
+        drop(overlay);
+        release(context);
+    }
+}

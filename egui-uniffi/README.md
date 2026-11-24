@@ -12,7 +12,7 @@ bindings, with Compose as the model.
 | --- | --- |
 | `EguiOverlay()` | an overlay without nodes; it makes its egui when it is painted the first time |
 | `setTree(nodes)` | the tree as a flat list of `UiNode(id, parent, widget, enabled, tooltip)`; only when Kotlin's state changed |
-| `input(event)` | pointer, key, text, clipboard and input method events in pixels from the top left; `true` if egui uses it (the camera leaves it alone) |
+| `input(event)` | pointer, touch, key, text, clipboard and input method events in pixels from the top left; `true` if egui uses it (the camera leaves it alone) |
 | `takeEvents()` | `Clicked`, `Checked`, `Selected`, `IntChanged`, `FloatChanged`, `TextChanged`, `Submitted`, `Closed`, `ColorChanged`, `DateChanged`, `FocusChanged`, with the node's id (`Closed` also for popups and modals) |
 | `takeOutput()` | what egui asks of the platform: text for the clipboard, a wish to paste, links to open, the pointer's look, where text is typed |
 | `requestFocus(id)` | gives a node the keyboard (Compose's `FocusRequester`), `null` takes it away |
@@ -161,6 +161,34 @@ leaves).
 `min_zoom` and `max_zoom`; at first all its nodes are in sight. `view` shows a part of it, given in the points of its
 nodes and applied when it changes; with `report_view` the user moving it reports `ViewChanged` with what is shown.
 `bounds(id)` of a node in a scene is where it is seen on the screen.
+
+## Reactions, drag and drop, touch
+
+`UiModifier.reactions` (`UiReactions`) makes any node react besides its widget, as Compose's `clickable`,
+`combinedClickable`, `hoverable`, `draggable`, `transformable` and drag and drop: a text, an image, a frame with nodes
+inside. The nodes inside come first, so a button in a clickable card still takes its own clicks. Text in a node with
+`drag` or `drag_kind` is not selectable: pressing on it and moving drags the node, as in egui's drag source.
+
+| Field | Reports |
+| --- | --- |
+| `click` | `Clicked` |
+| `double_click` | `DoubleClicked` after the `Clicked` of its first click |
+| `secondary_click` | `SecondaryClicked` with the point in the node, for the right button and a long touch (unless `long_press` took it) |
+| `long_press` | `LongPressed` once the button or a finger rested half a second |
+| `hover` | `HoverChanged` as the pointer comes and goes (only the last value until Kotlin takes it) |
+| `drag` | `Dragged` with `Started`, `Moved` and `Stopped`, the point in the node and the move since the last event |
+| `gestures` | `Gesture` with zoom, rotation and move of two fingers, or the zoom of Ctrl and the wheel |
+| `cursor` | the pointer's look over it (Compose's `pointerHoverIcon`) |
+| `drag_kind` | it can be dragged; it follows the pointer, its place stays empty |
+| `drop_kinds` | nodes of these kinds (empty: any) can be dropped onto it: `Dropped` with the dragged node and `index`, before which of its nodes the pointer was (a line shows where) |
+
+The innermost target under the pointer that takes the kind shows it with a frame and gets it. A list sorted by dragging
+gives its rows a `drag_kind` and itself the same `drop_kinds`; `index` counts the rows as they are, the dragged one
+included.
+
+`UiInput.Touch(id, phase, x, y, force)` brings fingers: the first one also moves egui's pointer (a tap clicks, a long
+touch is a right click), two zoom a `Scene` or a `Plot` and report `Gesture`. three-d-raytrace-uniffi's
+`InputEvent.Touch` hands them to the overlay first; there the first finger moves the camera as the left button does.
 
 ## What the platform does
 

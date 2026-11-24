@@ -24,21 +24,22 @@ mod input;
 mod output;
 mod overlay;
 mod pictures;
+mod reactions;
 mod state;
 #[cfg(test)]
 mod tests;
 mod tree;
 
 pub use error::*;
-pub use input::UiInput;
+pub use input::{UiInput, UiTouchPhase};
 pub use output::{UiCursor, UiLink, UiOutput, UiTextInput};
 pub use overlay::*;
-pub use state::{UiEvent, UiPoint, UiRect};
+pub use state::{DragPhase, UiEvent, UiPoint, UiRect};
 pub(crate) use tree::Tree;
 pub use tree::{
     Align, Anchor, Arrangement, CanvasShape, CanvasStroke, ColumnWidth, ImageFit, NoticeLevel,
     PlotLineStyle, PlotSeries, PointShape, PopupClose, PopupSide, ScrollDirection, SeriesKind,
     Side, SliderClamping, SliderHandle, StripSize, TableColumn, TableSelection, TableSort,
-    TextSpan, TextStyle, TextWrap, UiDate, UiInsets, UiModifier, UiNode, UiShadow, UiStroke,
-    Widget,
+    TextSpan, TextStyle, TextWrap, UiDate, UiInsets, UiModifier, UiNode, UiReactions, UiShadow,
+    UiStroke, Widget,
 };

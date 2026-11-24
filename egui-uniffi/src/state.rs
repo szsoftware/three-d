@@ -122,6 +122,78 @@ pub enum UiEvent {
         /// The part it shows now, in the points of its nodes.
         view: UiRect,
     },
+    /// A node with [crate::UiReactions::double_click] was clicked twice quickly.
+    DoubleClicked {
+        /// The node.
+        id: u64,
+    },
+    /// A node with [crate::UiReactions::secondary_click] was clicked with the right button or touched long.
+    SecondaryClicked {
+        /// The node.
+        id: u64,
+        /// Where, in points from its top left corner.
+        point: UiPoint,
+    },
+    /// The button or a finger rested half a second on a node with [crate::UiReactions::long_press].
+    LongPressed {
+        /// The node.
+        id: u64,
+    },
+    /// The pointer came onto or left a node with [crate::UiReactions::hover].
+    HoverChanged {
+        /// The node.
+        id: u64,
+        /// On it now.
+        hovered: bool,
+    },
+    /// A node with [crate::UiReactions::drag] is dragged: once as it starts, after each move, once as it ends.
+    Dragged {
+        /// The node.
+        id: u64,
+        /// Start, move or end.
+        phase: DragPhase,
+        /// Where the pointer is, in points from the node's top left corner.
+        point: UiPoint,
+        /// How far it moved since the last event, in points.
+        dx: f32,
+        /// How far it moved since the last event, in points.
+        dy: f32,
+    },
+    /// Two fingers or Ctrl and the wheel over a node with [crate::UiReactions::gestures], since the last event.
+    Gesture {
+        /// The node.
+        id: u64,
+        /// Larger above 1, smaller below.
+        zoom: f32,
+        /// Turned clockwise, in radians.
+        rotation: f32,
+        /// Moved along x, in points.
+        dx: f32,
+        /// Moved along y, in points.
+        dy: f32,
+    },
+    /// A node with [crate::UiReactions::drag_kind] was dropped onto one with [crate::UiReactions::drop_kinds] that
+    /// takes it.
+    Dropped {
+        /// The node it was dropped onto.
+        id: u64,
+        /// The node that was dragged.
+        source: u64,
+        /// Before which of the target's nodes it was dropped (so many lie above or left of the pointer): for lists that
+        /// are sorted by dragging. `None` for a target without nodes inside.
+        index: Option<u32>,
+    },
+}
+
+/// Where a drag is, in [UiEvent::Dragged].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum DragPhase {
+    /// The pointer went down on the node and moved.
+    Started,
+    /// It moved on.
+    Moved,
+    /// The button or finger came up.
+    Stopped,
 }
 
 impl UiEvent {
@@ -143,7 +215,14 @@ impl UiEvent {
             | Self::SortChanged { id, .. }
             | Self::PointClicked { id, .. }
             | Self::PointerAt { id, .. }
-            | Self::ViewChanged { id, .. } => *id,
+            | Self::ViewChanged { id, .. }
+            | Self::DoubleClicked { id }
+            | Self::SecondaryClicked { id, .. }
+            | Self::LongPressed { id }
+            | Self::HoverChanged { id, .. }
+            | Self::Dragged { id, .. }
+            | Self::Gesture { id, .. }
+            | Self::Dropped { id, .. } => *id,
         }
     }
 
@@ -162,6 +241,7 @@ impl UiEvent {
                 | Self::SortChanged { .. }
                 | Self::PointerAt { .. }
                 | Self::ViewChanged { .. }
+                | Self::HoverChanged { .. }
         )
     }
 }
@@ -354,6 +434,12 @@ pub(crate) struct UiState {
     pub image_count: u64,
     /// Shapes of canvases by their key.
     pub shapes: HashMap<String, Vec<crate::CanvasShape>>,
+    /// The nodes with [crate::UiReactions::hover] the pointer is on.
+    pub hovered: std::collections::HashSet<u64>,
+    /// The nodes whose press reported [UiEvent::LongPressed], until the button comes up.
+    pub long_pressed: std::collections::HashSet<u64>,
+    /// The nodes with [crate::UiReactions::drag] that reported [UiEvent::Dragged] with `Started`, until `Stopped`.
+    pub dragging: std::collections::HashSet<u64>,
 }
 
 impl UiState {

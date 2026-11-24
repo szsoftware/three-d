@@ -191,6 +191,48 @@ pub struct UiModifier {
     /// Reports when it gets and loses the keyboard: [crate::UiEvent::FocusChanged] (Compose's `onFocusChanged`).
     #[uniffi(default)]
     pub focus_events: bool,
+    /// What it reacts to besides its widget: clicks, the pointer, dragging, gestures, drag and drop.
+    #[uniffi(default)]
+    pub reactions: Option<UiReactions>,
+}
+
+/// What a node reacts to besides its own widget, as Compose's `clickable`, `combinedClickable`, `hoverable`,
+/// `draggable`, `transformable` and drag and drop: any node (a text, an image, a frame with nodes inside), the nodes
+/// inside first (a button in a clickable frame takes its own clicks).
+#[derive(Debug, Clone, Default, PartialEq, uniffi::Record)]
+pub struct UiReactions {
+    /// A click reports [crate::UiEvent::Clicked].
+    #[uniffi(default)]
+    pub click: bool,
+    /// A double click reports [crate::UiEvent::DoubleClicked] (after the [crate::UiEvent::Clicked] of its first click).
+    #[uniffi(default)]
+    pub double_click: bool,
+    /// A click with the right button, or a long touch, reports [crate::UiEvent::SecondaryClicked].
+    #[uniffi(default)]
+    pub secondary_click: bool,
+    /// Holding the button (or a finger) still on it for half a second reports [crate::UiEvent::LongPressed].
+    #[uniffi(default)]
+    pub long_press: bool,
+    /// The pointer coming and going reports [crate::UiEvent::HoverChanged].
+    #[uniffi(default)]
+    pub hover: bool,
+    /// Dragging it reports [crate::UiEvent::Dragged]: its start, each move, its end.
+    #[uniffi(default)]
+    pub drag: bool,
+    /// Two fingers (zoom, turn, move) or Ctrl and the wheel over it report [crate::UiEvent::Gesture].
+    #[uniffi(default)]
+    pub gestures: bool,
+    /// The pointer over it, as Compose's `pointerHoverIcon`.
+    #[uniffi(default)]
+    pub cursor: Option<crate::UiCursor>,
+    /// It can be dragged onto a node with [UiReactions::drop_kinds] that takes this kind: it follows the pointer while
+    /// dragged; `None` not.
+    #[uniffi(default)]
+    pub drag_kind: Option<String>,
+    /// Nodes of these kinds ([UiReactions::drag_kind]) can be dropped onto it (empty: any), which reports
+    /// [crate::UiEvent::Dropped]; it shows that while one is dragged over it. `None` not.
+    #[uniffi(default)]
+    pub drop_kinds: Option<Vec<String>>,
 }
 
 impl UiModifier {
