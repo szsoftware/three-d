@@ -473,6 +473,12 @@ impl PreviewState {
         }
     }
 
+    /// Traces for one frame time without reading anything back; whether the image changed.
+    pub fn advance(&mut self, scene: &Scene, camera: &CameraSpec) -> Result<bool, RtFfiError> {
+        let camera = camera.camera(self.width, self.height);
+        Ok(scene.with_rt(|s| self.preview.update(s, &camera))?)
+    }
+
     /// Traces for one frame time; the frame if the image changed.
     pub fn update(
         &mut self,

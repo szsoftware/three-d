@@ -43,6 +43,14 @@ pixels are read, and hands it the events of `input` first: a click on a panel is
 `overlay.covers(x, y)` before picking), a drag that starts beside the panels turns the camera. Characters for text
 fields go to `overlay.input(UiInput.Text(...))` directly. Hovering over the panel does not restart the raytraced preview.
 
+An application that renders with three-d itself (a window, JOGL, a canvas, a framebuffer of a UI toolkit) can show a
+`SceneView` inside its own frame instead of reading it back: make the renderer with `Renderer::with_context(context)` on
+the application's context (OpenGL or wgpu, no device of its own) on its thread, and draw each frame with
+`SceneView::render_into(&target, viewport)` from Rust or `renderToScreen(screenWidth, screenHeight, x, y, width,
+height)` from Kotlin. Rasterizer, raytraced preview and egui overlay are drawn into that part of the target; the scene,
+camera, input and options go on through the bindings. `Renderer.headless` with `nextFrame()` stays the way for photos,
+tests and views without a host.
+
 ### In the application crate
 
 A dependency on this crate is not enough: the linker drops everything the application's cdylib does not use, and with
