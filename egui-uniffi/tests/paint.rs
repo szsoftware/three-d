@@ -72,6 +72,8 @@ fn tree(checked: bool) -> Vec<UiNode> {
                 selected: false,
                 shortcut: None,
                 fill: None,
+                image: None,
+                image_size: None,
             },
         ),
     ]
@@ -481,6 +483,8 @@ fn an_options_panel_as_in_the_raytrace_window() {
                 selected: false,
                 shortcut: None,
                 fill: None,
+                image: None,
+                image_size: None,
             },
         ),
         node(
@@ -493,6 +497,8 @@ fn an_options_panel_as_in_the_raytrace_window() {
                 selected: false,
                 shortcut: None,
                 fill: None,
+                image: None,
+                image_size: None,
             },
         ),
         node(
@@ -579,6 +585,10 @@ fn plots_of_a_benchmark() {
         x: vec![],
         y,
         color: Some(color),
+        x2: vec![],
+        y2: vec![],
+        labels: vec![],
+        style: None,
     };
     let plot = |series, categories: Vec<String>| Widget::Plot {
         series,
@@ -594,6 +604,8 @@ fn plots_of_a_benchmark() {
         link: None,
         include_x: vec![],
         include_y: vec![0.0],
+        clickable: false,
+        report_pointer: false,
     };
     let bars = |stack: &str| SeriesKind::Bars {
         width: 0.6,
@@ -750,6 +762,8 @@ fn a_settings_window_with_frames_rows_and_text_in_parts() {
                 selected: false,
                 shortcut: None,
                 fill: None,
+                image: None,
+                image_size: None,
             },
         )
     };
@@ -1107,6 +1121,8 @@ fn an_open_menu_and_a_modal_lie_over_the_picture() {
                 selected: false,
                 shortcut: shortcut.map(Into::into),
                 fill: None,
+                image: None,
+                image_size: None,
             },
         )
     };
@@ -1391,6 +1407,243 @@ fn tables_with_a_sorted_column_and_a_selected_row_in_a_strip() {
                 UiEvent::RowActivated { id: 10, row: 0 }
             ],
             "{name}"
+        );
+        drop(overlay);
+        release(context);
+    }
+}
+
+/// The first pixel of row `y` from `x0` to `x1` that is near `color`.
+fn find_in_row(picture: &[[u8; 4]], y: u32, x0: u32, x1: u32, color: [u8; 3]) -> Option<u32> {
+    (x0..x1.min(W)).find(|&x| near(pixel(picture, x, y), color, 40))
+}
+
+#[test]
+fn images_a_floor_plan_on_a_canvas_and_a_scene_over_the_picture() {
+    let image = |id, key: &str| {
+        node(
+            id,
+            Some(2),
+            Widget::Image {
+                image: key.into(),
+                width: Some(40.0),
+                height: Some(40.0),
+                fit: None,
+                tint: None,
+                corner_radius: None,
+                rotation: None,
+                description: None,
+            },
+        )
+    };
+    // An L-shaped room of 20 by 10 m (concave), y upwards as on a plan
+    let room = CanvasShape::Polygon {
+        points: vec![
+            0.0, 0.0, 20.0, 0.0, 20.0, 4.0, 8.0, 4.0, 8.0, 10.0, 0.0, 10.0,
+        ],
+        fill: Some(0xFF00C000),
+        stroke: None,
+    };
+    let nodes = vec![
+        node(1, None, Widget::CentralPanel { frame: true }),
+        node(2, Some(1), row()),
+        image(3, "blau"),
+        image(4, "png"),
+        image(5, "svg"),
+        node(
+            6,
+            Some(2),
+            Widget::Button {
+                text: "Blau".into(),
+                small: false,
+                frame: true,
+                selected: false,
+                shortcut: None,
+                fill: None,
+                image: Some("blau".into()),
+                image_size: None,
+            },
+        ),
+        node(
+            10,
+            Some(1),
+            Widget::Canvas {
+                shapes: vec![],
+                height: 100.0,
+                width: Some(200.0),
+                view: Some(UiRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 20.0,
+                    height: 10.0,
+                }),
+                stretch: false,
+                y_up: true,
+                data: Some("plan".into()),
+                clickable: true,
+                report_pointer: false,
+            },
+        ),
+        node(
+            20,
+            Some(1),
+            Widget::Scene {
+                height: 80.0,
+                width: Some(200.0),
+                min_zoom: None,
+                max_zoom: Some(4.0),
+                view: Some(UiRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 40.0,
+                }),
+                report_view: true,
+            },
+        ),
+        node(
+            21,
+            Some(20),
+            Widget::Button {
+                text: "Tor".into(),
+                small: false,
+                frame: true,
+                selected: false,
+                shortcut: None,
+                fill: None,
+                image: None,
+                image_size: None,
+            },
+        ),
+    ];
+    let blue: Vec<u8> = [0, 0, 255, 255].repeat(4);
+    let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10" fill="#ffd700"/></svg>"##;
+    for (name, context) in contexts() {
+        let overlay = EguiOverlay::new();
+        overlay.set_tree(nodes.clone()).unwrap();
+        overlay
+            .set_image_rgba("blau".into(), 2, 2, blue.clone())
+            .unwrap();
+        overlay.set_image("svg".into(), svg.to_vec()).unwrap();
+        #[cfg(feature = "images")]
+        {
+            let mut png = Vec::new();
+            ::image::RgbaImage::from_pixel(8, 8, ::image::Rgba([0, 200, 200, 255]))
+                .write_to(
+                    &mut std::io::Cursor::new(&mut png),
+                    ::image::ImageFormat::Png,
+                )
+                .unwrap();
+            overlay.set_image("png".into(), png).unwrap();
+        }
+        overlay
+            .set_canvas_shapes("plan".into(), vec![room.clone()])
+            .unwrap();
+        // Files are decoded on threads: frames until they are there
+        let middle = |id| {
+            let (x, y) = center(&overlay, id);
+            (x as u32, y as u32)
+        };
+        let mut picture = frame(&context, &overlay);
+        for _ in 0..200 {
+            picture = frame(&context, &overlay);
+            let (x, y) = middle(5);
+            let decoded = near(pixel(&picture, x, y), [255, 215, 0], 40);
+            #[cfg(feature = "images")]
+            let decoded = decoded && {
+                let (x, y) = middle(4);
+                near(pixel(&picture, x, y), [0, 200, 200], 40)
+            };
+            if decoded {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        for (id, color) in [(3, [0, 0, 255]), (5, [255, 215, 0])] {
+            let (x, y) = middle(id);
+            let p = pixel(&picture, x, y);
+            assert!(
+                near(p, color, 40),
+                "{name}: image {id} at {x}, {y} is {p:?}"
+            );
+        }
+        #[cfg(feature = "images")]
+        {
+            let (x, y) = middle(4);
+            let p = pixel(&picture, x, y);
+            assert!(
+                near(p, [0, 200, 200], 40),
+                "{name}: the PNG at {x}, {y} is {p:?}"
+            );
+        }
+        let b = overlay.bounds(6).expect("the button is drawn");
+        let y = (b.y + b.height / 2.0) as u32;
+        assert!(
+            find_in_row(&picture, y, b.x as u32, (b.x + b.width) as u32, [0, 0, 255]).is_some(),
+            "{name}: no image in the button {b:?}"
+        );
+        // The room filled in its L, the corner beside it not; a metre is 10 points
+        let c = overlay.bounds(10).expect("the canvas is drawn");
+        assert!(
+            (c.width - 200.0).abs() < 1.0 && (c.height - 100.0).abs() < 1.0,
+            "{name}: {c:?}"
+        );
+        let at = |x: f32, y: f32| (c.x + x * 10.0, c.y + (10.0 - y) * 10.0);
+        for (x, y, inside) in [(4.0, 8.0, true), (15.0, 2.0, true), (15.0, 8.0, false)] {
+            let (px, py) = at(x, y);
+            let p = pixel(&picture, px as u32, py as u32);
+            assert_eq!(
+                near(p, [0, 192, 0], 30),
+                inside,
+                "{name}: the plan at {x}, {y} m ({px}, {py}) is {p:?}"
+            );
+        }
+        click(&context, &overlay, at(4.0, 8.0));
+        match overlay.take_events().as_slice() {
+            [UiEvent::PointClicked { id: 10, point }] => assert!(
+                (point.x - 4.0).abs() < 0.1 && (point.y - 8.0).abs() < 0.1,
+                "{name}: {point:?}"
+            ),
+            events => panic!("{name}: {events:?}"),
+        }
+        // The scene shows its button zoomed twice to fit the view of 100 x 40 into 200 x 80
+        let scene = overlay.bounds(20).expect("the scene is drawn");
+        let tor = overlay
+            .bounds(21)
+            .expect("the button in the scene is drawn");
+        let plain = overlay.bounds(6).unwrap().height;
+        assert!(tor.height > 1.6 * plain, "{name}: {tor:?} beside {plain}");
+        assert!(
+            tor.x >= scene.x - 1.0 && tor.y >= scene.y - 1.0,
+            "{name}: {tor:?} in {scene:?}"
+        );
+        // Dragging the empty part moves the view and the button with it
+        let (x, y) = (scene.x + scene.width - 20.0, scene.y + scene.height - 10.0);
+        overlay.input(UiInput::Move { x, y });
+        frame(&context, &overlay);
+        overlay.input(UiInput::Press { x, y, button: 0 });
+        frame(&context, &overlay);
+        for step in 1..=4 {
+            overlay.input(UiInput::Move {
+                x: x - 10.0 * step as f32,
+                y,
+            });
+            frame(&context, &overlay);
+        }
+        overlay.input(UiInput::Release {
+            x: x - 40.0,
+            y,
+            button: 0,
+        });
+        frame(&context, &overlay);
+        let moved = overlay.bounds(21).unwrap();
+        assert!(moved.x < tor.x - 20.0, "{name}: {moved:?} after {tor:?}");
+        let events = overlay.take_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, UiEvent::ViewChanged { id: 20, view } if view.x > 5.0)),
+            "{name}: {events:?}"
         );
         drop(overlay);
         release(context);

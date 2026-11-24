@@ -327,6 +327,8 @@ fn buttons_options_and_sliders_report_their_ids() {
                 selected: false,
                 shortcut: None,
                 fill: None,
+                image: None,
+                image_size: None,
             },
         ),
         node(
@@ -369,6 +371,8 @@ fn buttons_options_and_sliders_report_their_ids() {
                 selected: false,
                 shortcut: None,
                 fill: None,
+                image: None,
+                image_size: None,
             },
         ),
         node(
@@ -381,6 +385,8 @@ fn buttons_options_and_sliders_report_their_ids() {
                 selected: false,
                 shortcut: None,
                 fill: None,
+                image: None,
+                image_size: None,
             },
         ),
     ]);
@@ -425,6 +431,8 @@ fn disabled_widgets_do_not_react() {
             selected: false,
             shortcut: None,
             fill: None,
+            image: None,
+            image_size: None,
         },
     );
     button.enabled = false;
@@ -542,6 +550,8 @@ fn every_widget_draws() {
                 selected: false,
                 shortcut: None,
                 fill: None,
+                image: None,
+                image_size: None,
             },
         ),
         node(20, None, Widget::BottomBar { expanded: true }),
@@ -680,7 +690,11 @@ fn every_widget_draws() {
             series("Frame", line(), vec![], vec![12.0, 14.0, 13.0]),
             series(
                 "Points",
-                SeriesKind::Points { radius: 2.0 },
+                SeriesKind::Points {
+                    radius: 2.0,
+                    shape: None,
+                    filled: true,
+                },
                 vec![0.5, 1.5],
                 vec![1.0, 2.0],
             ),
@@ -774,6 +788,10 @@ fn series(name: &str, kind: SeriesKind, x: Vec<f64>, y: Vec<f64>) -> PlotSeries 
         x,
         y,
         color: None,
+        x2: vec![],
+        y2: vec![],
+        labels: vec![],
+        style: None,
     }
 }
 
@@ -810,6 +828,8 @@ fn plot(series: Vec<PlotSeries>) -> Widget {
         link: None,
         include_x: vec![],
         include_y: vec![0.0],
+        clickable: false,
+        report_pointer: false,
     }
 }
 
@@ -1059,6 +1079,8 @@ fn button(id: u64, parent: u64, s: &str) -> UiNode {
             selected: false,
             shortcut: None,
             fill: None,
+            image: None,
+            image_size: None,
         },
     )
 }
@@ -1699,6 +1721,8 @@ fn plain_button(text: &str) -> Widget {
         selected: false,
         shortcut: None,
         fill: None,
+        image: None,
+        image_size: None,
     }
 }
 
@@ -2471,6 +2495,8 @@ fn item(id: u64, parent: u64, text: &str, shortcut: Option<&str>) -> UiNode {
             selected: false,
             shortcut: shortcut.map(Into::into),
             fill: None,
+            image: None,
+            image_size: None,
         },
     )
 }
@@ -3649,4 +3675,601 @@ fn a_resizable_table_in_a_new_window_takes_its_widths_after_the_first_frame() {
         text_center(&output, "Backend"),
     );
     assert!(backend.x - scene.x > 90.0, "{scene:?} {backend:?}");
+}
+
+// Phase 5: images, the canvas, the scene and the rest of egui_plot
+
+fn image_node(
+    id: u64,
+    key: &str,
+    width: Option<f32>,
+    height: Option<f32>,
+    fit: Option<ImageFit>,
+) -> UiNode {
+    node(
+        id,
+        Some(1),
+        Widget::Image {
+            image: key.into(),
+            width,
+            height,
+            fit,
+            tint: None,
+            corner_radius: None,
+            rotation: None,
+            description: None,
+        },
+    )
+}
+
+/// A PNG file of one color.
+#[cfg(feature = "images")]
+fn png(width: u32, height: u32) -> Vec<u8> {
+    let image = image::RgbaImage::from_pixel(width, height, image::Rgba([200, 30, 30, 255]));
+    let mut bytes = Vec::new();
+    image
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+    bytes
+}
+
+#[cfg(feature = "images")]
+impl Run {
+    /// Frames until `done` (images are decoded on threads of egui_extras), at most a second.
+    fn until(&mut self, done: impl Fn(&UiState) -> bool) {
+        for _ in 0..200 {
+            self.frame(vec![]);
+            if done(&self.state) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}
+
+/// Every shape of the frame of the kind `pick` says.
+fn count_shapes(output: &egui::FullOutput, pick: &dyn Fn(&egui::Shape) -> bool) -> usize {
+    fn count(shape: &egui::Shape, pick: &dyn Fn(&egui::Shape) -> bool) -> usize {
+        match shape {
+            egui::Shape::Vec(shapes) => shapes.iter().map(|s| count(s, pick)).sum(),
+            s => usize::from(pick(s)),
+        }
+    }
+    output.shapes.iter().map(|c| count(&c.shape, pick)).sum()
+}
+
+#[cfg(feature = "images")]
+#[test]
+fn images_come_from_files_and_pixels_in_their_size() {
+    let svg = br##"<?xml version="1.0"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="20" height="10" fill="#2e7d32"/></svg>"##;
+    let mut with_image = button(15, 1, "Speichern");
+    let mut image_only = button(16, 1, "");
+    for b in [&mut with_image, &mut image_only] {
+        if let Widget::Button { image, .. } = &mut b.widget {
+            *image = Some("svg".into());
+        }
+    }
+    let nodes = vec![
+        central(1),
+        image_node(10, "png", None, None, None),
+        image_node(11, "svg", Some(100.0), None, None),
+        image_node(
+            12,
+            "pixels",
+            Some(40.0),
+            Some(40.0),
+            Some(ImageFit::Contain),
+        ),
+        image_node(13, "pixels", Some(40.0), Some(40.0), Some(ImageFit::Cover)),
+        image_node(14, "missing", Some(30.0), Some(30.0), None),
+        with_image,
+        image_only,
+        button(17, 1, "Speichern"),
+    ];
+    let mut run = Run::new(nodes);
+    run.state.set_image("png".into(), png(32, 16)).unwrap();
+    run.state.set_image("svg".into(), svg.to_vec()).unwrap();
+    run.state
+        .set_image_rgba("pixels".into(), 4, 2, vec![255; 32])
+        .unwrap();
+    let size = |s: &UiState, id: u64| (s.bounds[&id].width, s.bounds[&id].height);
+    let near =
+        |(w, h): (f32, f32), (ew, eh): (f32, f32)| (w - ew).abs() < 1.0 && (h - eh).abs() < 1.0;
+    run.until(|s| near(size(s, 10), (32.0, 16.0)) && near(size(s, 11), (100.0, 50.0)));
+    // Its own size, a width that gives the height, whole in a square, the square covered, the room of a missing one
+    assert!(
+        near(size(&run.state, 10), (32.0, 16.0)),
+        "{:?}",
+        size(&run.state, 10)
+    );
+    assert!(
+        near(size(&run.state, 11), (100.0, 50.0)),
+        "{:?}",
+        size(&run.state, 11)
+    );
+    assert!(
+        near(size(&run.state, 12), (40.0, 20.0)),
+        "{:?}",
+        size(&run.state, 12)
+    );
+    assert!(
+        near(size(&run.state, 13), (40.0, 40.0)),
+        "{:?}",
+        size(&run.state, 13)
+    );
+    assert!(
+        near(size(&run.state, 14), (30.0, 30.0)),
+        "{:?}",
+        size(&run.state, 14)
+    );
+    // An image before the text makes the button wider; an image alone makes a button as high as one with text
+    assert!(
+        size(&run.state, 15).0 > size(&run.state, 17).0 + 10.0,
+        "{:?} {:?}",
+        size(&run.state, 15),
+        size(&run.state, 17)
+    );
+    assert!(
+        size(&run.state, 16).0 < size(&run.state, 17).0
+            && (size(&run.state, 16).1 - size(&run.state, 17).1).abs() < 2.0,
+        "{:?} {:?}",
+        size(&run.state, 16),
+        size(&run.state, 17)
+    );
+    run.click(16);
+    assert_eq!(run.state.take_events(), vec![UiEvent::Clicked { id: 16 }]);
+    // Another file under the same key replaces it
+    run.state.set_image("png".into(), png(8, 8)).unwrap();
+    run.until(|s| near(size(s, 10), (8.0, 8.0)));
+    assert!(
+        near(size(&run.state, 10), (8.0, 8.0)),
+        "{:?}",
+        size(&run.state, 10)
+    );
+    assert!(run.state.forget.is_empty());
+    // Bytes that are no image, pixels that do not fill the size
+    let why = |r: Result<(), UiError>| r.unwrap_err().to_string();
+    assert!(why(run.state.set_image("x".into(), vec![1, 2, 3]))
+        .contains("no PNG, JPEG, GIF, WebP or SVG"));
+    assert!(why(run.state.set_image_rgba("x".into(), 2, 2, vec![0; 3])).contains("it needs 16"));
+}
+
+#[test]
+fn a_canvas_draws_in_its_coordinates_and_reports_clicks_and_the_pointer() {
+    let thin = CanvasStroke {
+        width: 1.0,
+        color: 0xFF000000,
+        dash: None,
+    };
+    let canvas = Widget::Canvas {
+        shapes: vec![
+            // An L: concave, cut into triangles
+            CanvasShape::Polygon {
+                points: vec![
+                    0.0, 0.0, 20.0, 0.0, 20.0, 4.0, 8.0, 4.0, 8.0, 10.0, 0.0, 10.0,
+                ],
+                fill: Some(0xFF4C9A2A),
+                stroke: Some(thin),
+            },
+            CanvasShape::Line {
+                points: vec![0.0, 0.0, 20.0, 10.0],
+                stroke: CanvasStroke {
+                    dash: Some(3.0),
+                    ..thin
+                },
+            },
+            CanvasShape::Circle {
+                x: 15.0,
+                y: 7.0,
+                radius: 1.0,
+                fill: Some(0xFFFF0000),
+                stroke: None,
+            },
+            CanvasShape::Ellipse {
+                x: 15.0,
+                y: 7.0,
+                radius_x: 2.0,
+                radius_y: 1.0,
+                fill: None,
+                stroke: Some(thin),
+            },
+            CanvasShape::Rect {
+                x: 12.0,
+                y: 6.0,
+                width: 6.0,
+                height: 3.0,
+                fill: None,
+                stroke: Some(thin),
+                corner_radius: 2.0,
+            },
+            CanvasShape::Curve {
+                points: vec![0.0, 0.0, 5.0, 10.0, 10.0, 0.0],
+                closed: false,
+                fill: None,
+                stroke: Some(thin),
+            },
+            CanvasShape::Arrow {
+                x: 2.0,
+                y: 8.0,
+                to_x: 6.0,
+                to_y: 8.0,
+                stroke: thin,
+            },
+            CanvasShape::Text {
+                x: 10.0,
+                y: 10.0,
+                text: "Nord".into(),
+                size: None,
+                color: None,
+                anchor: Some(Anchor::Top),
+                monospace: false,
+            },
+        ],
+        height: 100.0,
+        width: Some(200.0),
+        view: Some(UiRect {
+            x: 0.0,
+            y: 0.0,
+            width: 20.0,
+            height: 10.0,
+        }),
+        stretch: false,
+        y_up: true,
+        data: Some("plan".into()),
+        clickable: true,
+        report_pointer: true,
+    };
+    let mut run = Run::new(vec![central(1), node(10, Some(1), canvas)]);
+    run.state.shapes.insert(
+        "plan".into(),
+        vec![CanvasShape::Text {
+            x: 1.0,
+            y: 1.0,
+            text: "Plan".into(),
+            size: Some(10.0),
+            color: Some(0xFF808080),
+            anchor: Some(Anchor::BottomLeft),
+            monospace: true,
+        }],
+    );
+    let output = run.frame(vec![]);
+    let r = run.state.bounds[&10];
+    assert!(
+        (r.width - 200.0).abs() < 1.0 && (r.height - 100.0).abs() < 1.0,
+        "{r:?}"
+    );
+    assert!(
+        texts(&output).contains(&"Plan".to_string()),
+        "{:?}",
+        texts(&output)
+    );
+    // y grows upwards: y = 10 is the top, x = 10 the middle of 200 points
+    let north = text_center(&output, "Nord");
+    assert!(
+        (north.x - (r.x + 100.0)).abs() < 1.0 && north.y > r.y && north.y < r.y + 15.0,
+        "{north:?} in {r:?}"
+    );
+    let meshes = count_shapes(&output, &|s| matches!(s, egui::Shape::Mesh(_)));
+    assert!(meshes >= 1, "the L is no mesh");
+    // A click and the pointer in its coordinates
+    run.click_at(egui::pos2(r.x + 50.0, r.y + 80.0));
+    let events = run.state.take_events();
+    assert!(
+        events.contains(&UiEvent::PointClicked {
+            id: 10,
+            point: UiPoint { x: 5.0, y: 2.0 }
+        }),
+        "{events:?}"
+    );
+    run.frame(vec![egui::Event::PointerMoved(egui::pos2(
+        r.x + 150.0,
+        r.y + 50.0,
+    ))]);
+    run.frame(vec![egui::Event::PointerMoved(egui::pos2(
+        r.x + 150.0,
+        r.y + 300.0,
+    ))]);
+    assert_eq!(
+        run.state.take_events(),
+        vec![UiEvent::PointerAt {
+            id: 10,
+            point: None
+        }],
+        "the last word on the pointer is that it left"
+    );
+    run.frame(vec![egui::Event::PointerMoved(egui::pos2(
+        r.x + 150.0,
+        r.y + 50.0,
+    ))]);
+    assert_eq!(
+        run.state.take_events(),
+        vec![UiEvent::PointerAt {
+            id: 10,
+            point: Some(UiPoint { x: 15.0, y: 5.0 })
+        }]
+    );
+}
+
+#[test]
+fn a_scene_shows_its_nodes_moved_and_zoomed() {
+    let scene = Widget::Scene {
+        height: 200.0,
+        width: Some(300.0),
+        min_zoom: Some(0.1),
+        max_zoom: Some(4.0),
+        view: None,
+        report_view: true,
+    };
+    let mut run = Run::new(vec![
+        central(1),
+        node(10, Some(1), scene),
+        button(11, 10, "Brunnen"),
+        button(12, 10, "Säule"),
+    ]);
+    run.frame(vec![]);
+    let seen = |run: &Run, id: u64| run.state.screen_bounds[&id];
+    let area = run.state.bounds[&10];
+    let fountain = seen(&run, 11);
+    assert!(
+        area.contains(fountain.x, fountain.y),
+        "{fountain:?} in {area:?}"
+    );
+    // A click where it is seen reaches it
+    run.click_at(egui::pos2(
+        fountain.x + fountain.width / 2.0,
+        fountain.y + fountain.height / 2.0,
+    ));
+    assert_eq!(run.state.take_events(), vec![UiEvent::Clicked { id: 11 }]);
+    // Kotlin shows a part half as large: everything twice as large
+    let laid = run.state.bounds[&11];
+    let before = seen(&run, 11).width;
+    run.set(
+        |w| {
+            if let Widget::Scene { view, .. } = w {
+                *view = Some(UiRect {
+                    x: laid.x,
+                    y: laid.y,
+                    width: 150.0,
+                    height: 100.0,
+                })
+            }
+        },
+        10,
+    );
+    let after = seen(&run, 11).width;
+    assert!(
+        (after - 2.0 * laid.width).abs() < 2.0,
+        "{before} -> {after} ({laid:?})"
+    );
+    run.state.take_events();
+    // The user drags it: Kotlin hears where it went
+    let from = egui::pos2(area.x + area.width - 10.0, area.y + area.height - 10.0);
+    run.drag(
+        from,
+        &[from + egui::vec2(-20.0, 0.0), from + egui::vec2(-40.0, 0.0)],
+    );
+    let events = run.state.take_events();
+    assert!(
+        matches!(events.as_slice(), [UiEvent::ViewChanged { id: 10, view }] if (view.x - (laid.x + 20.0)).abs() < 1.0),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn plots_draw_every_item_and_report_clicks_and_the_pointer() {
+    let with = |mut s: PlotSeries, f: &dyn Fn(&mut PlotSeries)| {
+        f(&mut s);
+        s
+    };
+    let mut widget = plot(vec![
+        series(
+            "Mittel",
+            line(),
+            vec![0.0, 1.0, 2.0, 3.0],
+            vec![10.0, 12.0, 11.0, 13.0],
+        ),
+        with(
+            series(
+                "Streuung",
+                SeriesKind::Area,
+                vec![0.0, 1.0, 2.0, 3.0],
+                vec![9.0, 10.0, 10.0, 12.0],
+            ),
+            &|s| s.y2 = vec![11.0, 14.0, 12.0, 14.0],
+        ),
+        series(
+            "Zone",
+            SeriesKind::Polygon { width: 1.0 },
+            vec![0.0, 1.0, 1.0],
+            vec![0.0, 0.0, 5.0],
+        ),
+        with(
+            series(
+                "Spitzen",
+                SeriesKind::Text {
+                    anchor: Some(Anchor::Bottom),
+                },
+                vec![3.0],
+                vec![13.0],
+            ),
+            &|s| s.labels = vec!["Spitze".into()],
+        ),
+        with(
+            series(
+                "Wege",
+                SeriesKind::Arrows { tip_length: None },
+                vec![0.0],
+                vec![1.0],
+            ),
+            &|s| {
+                s.x2 = vec![2.0];
+                s.y2 = vec![4.0];
+            },
+        ),
+        series(
+            "60 fps",
+            SeriesKind::Span { vertical: false },
+            vec![],
+            vec![0.0, 16.7],
+        ),
+        series("Wechsel", SeriesKind::VLine, vec![1.5], vec![]),
+        series(
+            "Kacheln",
+            SeriesKind::Heatmap {
+                columns: 2,
+                palette: vec![0xFF0000FF, 0xFFFF0000],
+                min: None,
+                max: None,
+                show_values: true,
+            },
+            vec![4.0],
+            vec![1.0, 2.0, 3.0, 4.0],
+        ),
+        with(
+            series(
+                "Punkte",
+                SeriesKind::Points {
+                    radius: 3.0,
+                    shape: Some(PointShape::Diamond),
+                    filled: false,
+                },
+                vec![1.0],
+                vec![12.0],
+            ),
+            &|s| s.style = Some(PlotLineStyle::Dotted { spacing: 4.0 }),
+        ),
+    ]);
+    if let Widget::Plot {
+        clickable,
+        report_pointer,
+        interactive,
+        ..
+    } = &mut widget
+    {
+        *clickable = true;
+        *report_pointer = true;
+        *interactive = false;
+    }
+    let mut run = Run::new(vec![panel(), node(2, Some(1), widget)]);
+    let output = run.frame(vec![]);
+    assert!(
+        texts(&output).contains(&"Spitze".to_string()),
+        "{:?}",
+        texts(&output)
+    );
+    let r = run.state.bounds[&2];
+    let middle = egui::pos2(r.x + r.width / 2.0, r.y + r.height / 2.0);
+    run.click_at(middle);
+    let events = run.state.take_events();
+    let clicked = events.iter().find_map(|e| match e {
+        UiEvent::PointClicked { id: 2, point } => Some(*point),
+        _ => None,
+    });
+    let pointer = events.iter().find_map(|e| match e {
+        UiEvent::PointerAt { id: 2, point } => Some(*point),
+        _ => None,
+    });
+    let clicked = clicked.unwrap_or_else(|| panic!("no click in {events:?}"));
+    // The middle of the values the plot shows: x from about 0 to 4, y from 0 to about 17
+    assert!(
+        clicked.x > 0.5 && clicked.x < 3.5 && clicked.y > 3.0 && clicked.y < 14.0,
+        "{clicked:?}"
+    );
+    assert_eq!(pointer, Some(Some(clicked)));
+}
+
+#[test]
+fn images_canvases_scenes_and_plot_items_that_cannot_work_are_refused_with_the_reason() {
+    let tree = |widget| vec![panel(), node(2, Some(1), widget)];
+    let canvas = |shapes| Widget::Canvas {
+        shapes,
+        height: 50.0,
+        width: None,
+        view: None,
+        stretch: false,
+        y_up: false,
+        data: None,
+        clickable: false,
+        report_pointer: false,
+    };
+    assert!(invalid(tree(canvas(vec![CanvasShape::Polygon {
+        points: vec![0.0, 0.0, 1.0, 1.0],
+        fill: None,
+        stroke: None,
+    }])))
+    .contains("Canvas 2: shape 0: a polygon has 2 points, it needs 3"));
+    assert!(invalid(tree(canvas(vec![CanvasShape::Line {
+        points: vec![0.0, 0.0, 1.0],
+        stroke: CanvasStroke {
+            width: 1.0,
+            color: 0,
+            dash: None,
+        },
+    }])))
+    .contains("a line has 3 coordinates, it needs x and y for each point"));
+    let mut no_view = canvas(vec![]);
+    if let Widget::Canvas { view, .. } = &mut no_view {
+        *view = Some(UiRect {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 5.0,
+        });
+    }
+    assert!(invalid(tree(no_view)).contains("the view is 0 x 5 at 0, 0: it needs a size above 0"));
+    let mut flat = image_node(2, "x", Some(0.0), None, None);
+    flat.parent = Some(1);
+    assert!(invalid(vec![panel(), flat]).contains("Image 2: the width is 0, it needs one above 0"));
+    let scene = Widget::Scene {
+        height: 100.0,
+        width: None,
+        min_zoom: Some(2.0),
+        max_zoom: Some(1.0),
+        view: None,
+        report_view: false,
+    };
+    assert!(invalid(tree(scene)).contains("Scene 2: min_zoom 2 > max_zoom 1"));
+    let one = |s| plot(vec![s]);
+    assert!(invalid(tree(one(series(
+        "Wege",
+        SeriesKind::Arrows { tip_length: None },
+        vec![0.0],
+        vec![1.0]
+    ))))
+    .contains("the arrows 'Wege' have 1 x and 1 y values, but 0 and 0 for their tips"));
+    assert!(invalid(tree(one(series(
+        "Kacheln",
+        SeriesKind::Heatmap {
+            columns: 3,
+            palette: vec![],
+            min: None,
+            max: None,
+            show_values: false
+        },
+        vec![],
+        vec![1.0; 4]
+    ))))
+    .contains("the heatmap 'Kacheln' has 4 values for rows of 3"));
+    assert!(invalid(tree(one(series(
+        "Zonen",
+        SeriesKind::Span { vertical: true },
+        vec![1.0],
+        vec![]
+    ))))
+    .contains("the bands 'Zonen' need pairs of x values, they have 1"));
+    assert!(invalid(tree(one(series(
+        "Bild",
+        SeriesKind::Image {
+            image: "x".into(),
+            width: 1.0,
+            height: 1.0
+        },
+        vec![],
+        vec![]
+    ))))
+    .contains("the image 'Bild' needs one point, it has 0 x and 0 y values"));
 }

@@ -19,6 +19,8 @@ bindings, with Compose as the model.
 | `needsRepaint()` | whether the next frame looks different (new tree, input, egui's hover and animations) |
 | `setScale(pixelsPerPoint)` | Compose's density times a zoom |
 | `setStyle(UiStyle(dark, accent))` | egui's dark or light look with an accent color (ARGB) |
+| `setImage(key, bytes)`, `setImageRgba(key, width, height, rgba)`, `removeImage(key)` | images for `Image`, buttons, canvases and plots, by key; PNG, JPEG, GIF, WebP and SVG files or pixels |
+| `setCanvasShapes(key, shapes)` | many shapes for a `Canvas` that seldom change (a floor plan), drawn under its own |
 | `covers(x, y)`, `bounds(id)` | whether a pixel is on egui, where a node was drawn (for tests that click on it) |
 | `paint(context, target, viewport)` | Rust only: draws over the application's picture, on the thread of its three-d context |
 | `SceneView.setOverlay(overlay)` | three-d-raytrace-uniffi's view paints it itself and hands it its input first |
@@ -137,6 +139,29 @@ all that is left in every frame.
 `sizes`: `Exact` points, `Initial` points with bounds, `Relative` parts of the whole strip, `Remainder` for what is left.
 One node per cell, a `Strip` in a cell divides that cell.
 
+## Images, canvas and scene
+
+Images are given to the overlay once under a key and named by it in the tree: `setImage(key, bytes)` takes PNG, JPEG,
+GIF, WebP and SVG files (egui_extras' loaders, the feature `images`, on by default), `setImageRgba(key, width, height,
+rgba)` pixels (four bytes each, a frame of a camera or a rendered thumbnail). Files are decoded on a thread of their own
+(in the browser at once) and show a spinner until then; an SVG is drawn sharp at any size, a GIF or WebP moves. `Image`
+shows one with a `width` and `height` (one of them keeps its shape, none its own size), a `fit` as Compose's
+`ContentScale` (`Contain`, `Cover`, `Fill`), a `tint` (a white icon in any color), `corner_radius`, `rotation` in degrees
+and a `description`. A `Button` takes an `image` beside its text (at the height of the text unless `image_size`).
+
+`Canvas` draws in its own coordinates: `view` is the part it shows (a floor plan in metres), kept in shape in the middle
+unless `stretch`, with y upwards if `y_up`. Its `CanvasShape`s are `Line`, `Polygon` (also concave, a room as an L),
+`Rect`, `Circle`, `Ellipse`, `Curve` (Bézier, quadratic or cubic, `closed` and filled), `Arrow`, `Text` (with an `anchor`)
+and `Image`, each with a `fill` and a `stroke` (width in points, color, `dash`). Shapes of `data` (`setCanvasShapes`) lie
+under the ones of the tree: the plan once, the moving camera in every tree. `clickable` reports `PointClicked` with the
+point in the canvas' coordinates, `report_pointer` reports `PointerAt` while the pointer moves over it (`null` once it
+leaves).
+
+`Scene` (egui's `Scene`) shows its nodes on a surface the user drags and zooms (Ctrl and the wheel, a pinch), within
+`min_zoom` and `max_zoom`; at first all its nodes are in sight. `view` shows a part of it, given in the points of its
+nodes and applied when it changes; with `report_view` the user moving it reports `ViewChanged` with what is shown.
+`bounds(id)` of a node in a scene is where it is seen on the screen.
+
 ## What the platform does
 
 egui does not reach the clipboard, the browser or the input method itself: `takeOutput()` after a frame says what it asks
@@ -161,16 +186,26 @@ frame times over time, a bar per scene. Its `series` are drawn in their order:
 | `SeriesKind` | What it draws |
 | --- | --- |
 | `Line(width, fill)` | the points joined by a line, `fill` shades the area down to 0 |
-| `Points(radius)` | a dot per point |
+| `Points(radius, shape, filled)` | a marker per point: a circle, square, diamond, cross, plus, the four triangles or an asterisk |
 | `Bars(width, stack)` | a bar per value; bars with the same `stack` group stand on each other (bar i on bar i) |
 | `Boxes(width)` | a box plot per five values of `y` (lower whisker, Q1, median, Q3, upper whisker) |
 | `HLine` | a dashed line across the plot at each `y`, a budget such as 16.7 ms |
+| `VLine` | a line across the plot at each `x`, a moment such as a hitch |
+| `Polygon(width)` | a closed area through the points, a zone |
+| `Text(anchor)` | `labels` at the points |
+| `Arrows(tip_length)` | an arrow from each point to the point of `x2` and `y2` |
+| `Area` | the band between `y` and `y2`, the spread around a mean |
+| `Span(vertical)` | a band across the plot for each pair of values in `y` (in `x` if `vertical`), 30 to 60 frames per second |
+| `Heatmap(columns, palette, min, max, show_values)` | a grid of colored cells from `y`, row by row |
+| `Image(image, width, height)` | an image given to the overlay, centered at the first point |
 
 `x` empty counts 0, 1, 2 …; with `categories` the x axis names these places ("Cloister", "Garden") instead of numbers.
 The pointer on a series shows its values with `x_unit` and `y_unit`; the legend hides a series on a click. With
 `interactive` dragging moves the plot, Ctrl and the wheel zoom and a double click shows everything again; plots with the
 same `link` show the same part of the x axis and the pointer together. `include_x` and `include_y` are values the axes
-always show (0 for frame times). The axes count in steps of 1, 2 and 5. Plots report no events.
+always show (0 for frame times). The axes count in steps of 1, 2 and 5. A series' `style` draws its line `Solid`,
+`Dashed` or `Dotted`. With `clickable` a click reports `PointClicked` with the values there, with `report_pointer` the
+values under the pointer come as `PointerAt`.
 
 Ids are Kotlin's and stay the same from one tree to the next (the DSL derives them from the position and a key), so that
 egui keeps focus, scroll positions and open sections.

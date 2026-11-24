@@ -384,6 +384,12 @@ pub enum SeriesKind {
     Points {
         /// In points.
         radius: f32,
+        /// Its form, `None` round.
+        #[uniffi(default)]
+        shape: Option<PointShape>,
+        /// Filled, else an outline.
+        #[uniffi(default = true)]
+        filled: bool,
     },
     /// A bar per value, standing on 0.
     Bars {
@@ -402,6 +408,106 @@ pub enum SeriesKind {
     /// A dashed line across the whole plot at each value of [PlotSeries::y], for example the 16.7 ms of 60 frames per
     /// second; [PlotSeries::x] stays empty.
     HLine,
+    /// A dashed line from bottom to top at each value of [PlotSeries::x], for example when the scene changed;
+    /// [PlotSeries::y] stays empty.
+    VLine,
+    /// The points joined to a closed shape, filled lightly in its color.
+    Polygon {
+        /// Of the outline, in points.
+        width: f32,
+    },
+    /// Each of [PlotSeries::labels] at its point, for example the name of a peak.
+    Text {
+        /// Which side of the text lies on the point, `None` its middle.
+        #[uniffi(default)]
+        anchor: Option<crate::Anchor>,
+    },
+    /// An arrow from each point to the point of [PlotSeries::x2] and [PlotSeries::y2] at the same index.
+    Arrows {
+        /// The length of the tips in points, `None` egui_plot's.
+        #[uniffi(default)]
+        tip_length: Option<f32>,
+    },
+    /// The area between [PlotSeries::y] below and [PlotSeries::y2] above, at the values of [PlotSeries::x]: the spread
+    /// of frame times around their mean.
+    Area,
+    /// A band across the whole plot from one value to the next of each pair in [PlotSeries::y] (or [PlotSeries::x] if
+    /// `vertical`), for example the range of 30 to 60 frames per second.
+    Span {
+        /// From bottom to top between values of x, else from left to right between values of y.
+        #[uniffi(default)]
+        vertical: bool,
+    },
+    /// A grid of colored tiles, the values of [PlotSeries::y] row by row from the bottom, its lower left corner at the
+    /// first values of [PlotSeries::x] and [PlotSeries::y2] (else 0), a tile 1 by 1: render times per tile of a picture.
+    Heatmap {
+        /// Tiles per row.
+        columns: u32,
+        /// The colors from the lowest value to the highest, `None` egui_plot's.
+        #[uniffi(default)]
+        palette: Vec<u32>,
+        /// The values at the ends of the palette, `None` the lowest and highest.
+        #[uniffi(default)]
+        min: Option<f64>,
+        /// See [SeriesKind::Heatmap::min].
+        #[uniffi(default)]
+        max: Option<f64>,
+        /// Each value written on its tile.
+        #[uniffi(default)]
+        show_values: bool,
+    },
+    /// An image given to the overlay ([crate::EguiOverlay::set_image]), its middle at the first point, for example
+    /// a picture under its measurements.
+    Image {
+        /// The key of the image.
+        image: String,
+        /// In units of the x axis.
+        width: f64,
+        /// In units of the y axis.
+        height: f64,
+    },
+}
+
+/// The form of the dots of [SeriesKind::Points] (egui_plot's `MarkerShape`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum PointShape {
+    /// Round.
+    Circle,
+    /// A square on its tip.
+    Diamond,
+    /// A square.
+    Square,
+    /// An ×.
+    Cross,
+    /// A +.
+    Plus,
+    /// A triangle pointing up.
+    Up,
+    /// A triangle pointing down.
+    Down,
+    /// A triangle pointing left.
+    Left,
+    /// A triangle pointing right.
+    Right,
+    /// A star of lines.
+    Asterisk,
+}
+
+/// How the line of a [PlotSeries] is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Enum)]
+pub enum PlotLineStyle {
+    /// Without gaps.
+    Solid,
+    /// Dashes of `length` points with gaps as long.
+    Dashed {
+        /// In points.
+        length: f32,
+    },
+    /// Dots `spacing` points apart.
+    Dotted {
+        /// In points.
+        spacing: f32,
+    },
 }
 
 /// One line, set of dots, bars or boxes of a [Widget::Plot].
@@ -417,6 +523,19 @@ pub struct PlotSeries {
     pub y: Vec<f64>,
     /// As ARGB, `None` the next color of egui_plot.
     pub color: Option<u32>,
+    /// The x values of the tips of [SeriesKind::Arrows].
+    #[uniffi(default)]
+    pub x2: Vec<f64>,
+    /// The y values of the tips of [SeriesKind::Arrows], the upper edge of an [SeriesKind::Area], the bottom of a
+    /// [SeriesKind::Heatmap].
+    #[uniffi(default)]
+    pub y2: Vec<f64>,
+    /// The texts of [SeriesKind::Text], one per point.
+    #[uniffi(default)]
+    pub labels: Vec<String>,
+    /// How its line is drawn (lines, polygons, lines across), `None` as egui_plot draws it.
+    #[uniffi(default)]
+    pub style: Option<PlotLineStyle>,
 }
 
 /// Where a slider keeps its value while the user types another or Kotlin sends one outside its range.
@@ -525,6 +644,170 @@ pub struct TableSort {
     pub column: u32,
     /// Smallest first.
     pub ascending: bool,
+}
+
+/// How an [Widget::Image] fills the width and height it is given (Compose's `ContentScale`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ImageFit {
+    /// Whole and as large as fits, keeping its shape (Compose's `Fit`).
+    Contain,
+    /// All of the room, keeping its shape: what is too much is cut off on both sides (Compose's `Crop`).
+    Cover,
+    /// Stretched to the room (Compose's `FillBounds`).
+    Fill,
+}
+
+/// The line of a shape on a [Widget::Canvas].
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct CanvasStroke {
+    /// In points, whatever the view.
+    pub width: f32,
+    /// ARGB.
+    pub color: u32,
+    /// Dashes of this length in points with gaps as long, for lines and polygons; `None` without gaps.
+    #[uniffi(default)]
+    pub dash: Option<f32>,
+}
+
+/// What a [Widget::Canvas] draws, in its coordinates ([Widget::Canvas::view]). Points come as x and y after each other.
+#[derive(Debug, Clone, PartialEq, uniffi::Enum)]
+pub enum CanvasShape {
+    /// A line through the points.
+    Line {
+        /// x and y after each other, at least two points.
+        points: Vec<f32>,
+        /// How it is drawn.
+        stroke: CanvasStroke,
+    },
+    /// A closed shape through the points, also a concave one (a room of a floor plan), as long as its edges do not
+    /// cross.
+    Polygon {
+        /// x and y after each other, at least three points.
+        points: Vec<f32>,
+        /// ARGB, `None` not filled.
+        #[uniffi(default)]
+        fill: Option<u32>,
+        /// Its outline, `None` none.
+        #[uniffi(default)]
+        stroke: Option<CanvasStroke>,
+    },
+    /// A rectangle from (x, y) on.
+    Rect {
+        /// A corner.
+        x: f32,
+        /// A corner.
+        y: f32,
+        /// Along x.
+        width: f32,
+        /// Along y.
+        height: f32,
+        /// ARGB, `None` not filled.
+        #[uniffi(default)]
+        fill: Option<u32>,
+        /// Its outline, `None` none.
+        #[uniffi(default)]
+        stroke: Option<CanvasStroke>,
+        /// Rounded corners, in points.
+        #[uniffi(default)]
+        corner_radius: f32,
+    },
+    /// A circle around (x, y).
+    Circle {
+        /// Its middle.
+        x: f32,
+        /// Its middle.
+        y: f32,
+        /// In the units of the view.
+        radius: f32,
+        /// ARGB, `None` not filled.
+        #[uniffi(default)]
+        fill: Option<u32>,
+        /// Its outline, `None` none.
+        #[uniffi(default)]
+        stroke: Option<CanvasStroke>,
+    },
+    /// An ellipse around (x, y).
+    Ellipse {
+        /// Its middle.
+        x: f32,
+        /// Its middle.
+        y: f32,
+        /// Along x, in the units of the view.
+        radius_x: f32,
+        /// Along y.
+        radius_y: f32,
+        /// ARGB, `None` not filled.
+        #[uniffi(default)]
+        fill: Option<u32>,
+        /// Its outline, `None` none.
+        #[uniffi(default)]
+        stroke: Option<CanvasStroke>,
+    },
+    /// A Bézier curve: three points quadratic (start, control, end), four cubic (start, two controls, end).
+    Curve {
+        /// x and y after each other, three or four points.
+        points: Vec<f32>,
+        /// Back to the start; filled if it has a `fill`.
+        #[uniffi(default)]
+        closed: bool,
+        /// ARGB, `None` not filled.
+        #[uniffi(default)]
+        fill: Option<u32>,
+        /// Its line, `None` none.
+        #[uniffi(default)]
+        stroke: Option<CanvasStroke>,
+    },
+    /// An arrow from (x, y) to (to_x, to_y), its tip a quarter as long.
+    Arrow {
+        /// Where it starts.
+        x: f32,
+        /// Where it starts.
+        y: f32,
+        /// Where its tip is.
+        to_x: f32,
+        /// Where its tip is.
+        to_y: f32,
+        /// How it is drawn.
+        stroke: CanvasStroke,
+    },
+    /// A text at (x, y).
+    Text {
+        /// Where it is.
+        x: f32,
+        /// Where it is.
+        y: f32,
+        /// What it says.
+        text: String,
+        /// In points, `None` egui's size of text.
+        #[uniffi(default)]
+        size: Option<f32>,
+        /// ARGB, `None` egui's color of text.
+        #[uniffi(default)]
+        color: Option<u32>,
+        /// Which side of the text lies on the point, `None` its top left corner.
+        #[uniffi(default)]
+        anchor: Option<crate::Anchor>,
+        /// In egui's monospace font.
+        #[uniffi(default)]
+        monospace: bool,
+    },
+    /// An image given to the overlay ([crate::EguiOverlay::set_image]) in the rectangle from (x, y) on: a symbol on a
+    /// map.
+    Image {
+        /// The key of the image.
+        image: String,
+        /// A corner.
+        x: f32,
+        /// A corner.
+        y: f32,
+        /// Along x.
+        width: f32,
+        /// Along y.
+        height: f32,
+        /// Multiplied with its colors as ARGB.
+        #[uniffi(default)]
+        tint: Option<u32>,
+    },
 }
 
 /// The room of a cell of a [Widget::Strip] along it (egui_extras' `Size`).
@@ -895,6 +1178,12 @@ pub enum Widget {
         /// Its background as ARGB, `None` egui's.
         #[uniffi(default)]
         fill: Option<u32>,
+        /// An image before the text, by its key ([Widget::Image]); with an empty text it is egui's image button.
+        #[uniffi(default)]
+        image: Option<String>,
+        /// The height of the image in points, `None` as high as the text.
+        #[uniffi(default)]
+        image_size: Option<f32>,
     },
     /// A text that is chosen or not, as a tab or an entry of a list: [crate::UiEvent::Clicked].
     SelectableLabel {
@@ -1189,6 +1478,94 @@ pub enum Widget {
         include_x: Vec<f64>,
         /// Values the y axis always shows, for example 0 so that frame times start at the bottom.
         include_y: Vec<f64>,
+        /// A click that does not drag reports [crate::UiEvent::PointClicked] with the values there.
+        #[uniffi(default)]
+        clickable: bool,
+        /// The values under the pointer come as [crate::UiEvent::PointerAt] while it moves over the plot.
+        #[uniffi(default)]
+        report_pointer: bool,
+    },
+    /// An image given to the overlay under a key ([crate::EguiOverlay::set_image] for PNG, JPEG, GIF, WebP and SVG,
+    /// [crate::EguiOverlay::set_image_rgba] for pixels), as Compose's `Image`. Without a width and height as large as it
+    /// has pixels (a pixel a point), at most as wide as there is room; an SVG is drawn sharp at any size, a GIF or WebP
+    /// moves. A spinner while it is decoded, nothing for a key without an image.
+    Image {
+        /// The key of the image.
+        image: String,
+        /// In points, `None` from the height and the image's shape (or its own size).
+        #[uniffi(default)]
+        width: Option<f32>,
+        /// In points, `None` from the width and the image's shape (or its own size).
+        #[uniffi(default)]
+        height: Option<f32>,
+        /// How it fills width and height when both are given, `None` [ImageFit::Contain].
+        #[uniffi(default)]
+        fit: Option<ImageFit>,
+        /// Multiplied with its colors as ARGB: a white icon in any color.
+        #[uniffi(default)]
+        tint: Option<u32>,
+        /// Rounded corners, in points.
+        #[uniffi(default)]
+        corner_radius: Option<f32>,
+        /// Turned clockwise around its middle, in degrees.
+        #[uniffi(default)]
+        rotation: Option<f32>,
+        /// What it shows, for screen readers.
+        #[uniffi(default)]
+        description: Option<String>,
+    },
+    /// A surface to draw on, as Compose's `Canvas`: lines, rectangles, circles, polygons of any shape, Bézier curves,
+    /// arrows, text and images in its own coordinates (see `view`), cut off at its edges. With `clickable` a click
+    /// reports [crate::UiEvent::PointClicked], with `report_pointer` the pointer over it comes as
+    /// [crate::UiEvent::PointerAt], both in its coordinates.
+    Canvas {
+        /// What it draws, in this order, over the shapes of `data`.
+        shapes: Vec<CanvasShape>,
+        /// In points.
+        height: f32,
+        /// In points, `None` all the width there is.
+        #[uniffi(default)]
+        width: Option<f32>,
+        /// The part of its coordinates it shows, `None` points from its top left corner.
+        #[uniffi(default)]
+        view: Option<crate::UiRect>,
+        /// The view stretched to the canvas; else it keeps its shape, in the middle.
+        #[uniffi(default)]
+        stretch: bool,
+        /// y grows upwards, as on a plan; else downwards, as on the screen.
+        #[uniffi(default)]
+        y_up: bool,
+        /// The key of shapes given with [crate::EguiOverlay::set_canvas_shapes], drawn first: many shapes that seldom
+        /// change, as a floor plan under a moving marker.
+        #[uniffi(default)]
+        data: Option<String>,
+        /// A click reports [crate::UiEvent::PointClicked].
+        #[uniffi(default)]
+        clickable: bool,
+        /// The pointer over it comes as [crate::UiEvent::PointerAt].
+        #[uniffi(default)]
+        report_pointer: bool,
+    },
+    /// Its nodes on a surface that the user moves (dragging, the wheel) and zooms (the wheel with Ctrl, a pinch), as
+    /// egui's `Scene`: a large plan of widgets. It starts with all its nodes in sight.
+    Scene {
+        /// In points.
+        height: f32,
+        /// In points, `None` all the width there is.
+        #[uniffi(default)]
+        width: Option<f32>,
+        /// How far it zooms out, `None` until all nodes fit.
+        #[uniffi(default)]
+        min_zoom: Option<f32>,
+        /// How far it zooms in, `None` to their own size (egui's 1).
+        #[uniffi(default)]
+        max_zoom: Option<f32>,
+        /// The part it shows, in the points of its nodes; applied when it changes, then the user moves it.
+        #[uniffi(default)]
+        view: Option<crate::UiRect>,
+        /// The user moving it reports [crate::UiEvent::ViewChanged].
+        #[uniffi(default)]
+        report_view: bool,
     },
     /// A line in the color of its level: "takes effect after a restart".
     Notice {
@@ -1246,6 +1623,7 @@ impl Widget {
                     | Self::Table { .. }
                     | Self::TableRow { .. }
                     | Self::Strip { .. }
+                    | Self::Scene { .. }
                     | Self::MenuBar
                     | Self::Menu { .. }
             )
@@ -1301,6 +1679,9 @@ impl Widget {
             Self::ProgressBar { .. } => "ProgressBar",
             Self::Spinner => "Spinner",
             Self::Plot { .. } => "Plot",
+            Self::Image { .. } => "Image",
+            Self::Canvas { .. } => "Canvas",
+            Self::Scene { .. } => "Scene",
             Self::Notice { .. } => "Notice",
         }
     }
@@ -1450,6 +1831,54 @@ impl Widget {
                 .iter()
                 .enumerate()
                 .find_map(|(i, size)| size.check().map(|why| format!("size {i}: {why}"))),
+            Self::Button { image_size, .. } => above_zero("image_size", image_size),
+            Self::Image {
+                width,
+                height,
+                corner_radius,
+                rotation,
+                ..
+            } => above_zero("width", width)
+                .or_else(|| above_zero("height", height))
+                .or_else(|| negative("corner_radius", corner_radius))
+                .or_else(|| {
+                    rotation
+                        .filter(|r| !r.is_finite())
+                        .map(|r| format!("the rotation is {r}, it needs a number"))
+                }),
+            Self::Canvas {
+                shapes,
+                height,
+                width,
+                view,
+                ..
+            } => above_zero("height", &Some(*height))
+                .or_else(|| above_zero("width", width))
+                .or_else(|| view.and_then(|v| view_check(&v)))
+                .or_else(|| {
+                    shapes
+                        .iter()
+                        .enumerate()
+                        .find_map(|(i, s)| s.check().map(|why| format!("shape {i}: {why}")))
+                }),
+            Self::Scene {
+                height,
+                width,
+                min_zoom,
+                max_zoom,
+                view,
+                ..
+            } => above_zero("height", &Some(*height))
+                .or_else(|| above_zero("width", width))
+                .or_else(|| above_zero("min_zoom", min_zoom))
+                .or_else(|| above_zero("max_zoom", max_zoom))
+                .or_else(|| match (min_zoom, max_zoom) {
+                    (Some(min), Some(max)) if min > max => {
+                        Some(format!("min_zoom {min} > max_zoom {max}"))
+                    }
+                    _ => None,
+                })
+                .or_else(|| view.and_then(|v| view_check(&v))),
             _ => None,
         }
     }
@@ -1459,6 +1888,132 @@ impl Widget {
 fn above_zero(name: &str, v: &Option<f32>) -> Option<String> {
     v.filter(|v| !(v.is_finite() && *v > 0.0))
         .map(|v| format!("the {name} is {v}, it needs one above 0"))
+}
+
+/// Why a view of a canvas or scene shows nothing, if it does not.
+fn view_check(v: &crate::UiRect) -> Option<String> {
+    let finite = [v.x, v.y, v.width, v.height].iter().all(|c| c.is_finite());
+    (!finite || v.width <= 0.0 || v.height <= 0.0).then(|| {
+        format!(
+            "the view is {} x {} at {}, {}: it needs a size above 0",
+            v.width, v.height, v.x, v.y
+        )
+    })
+}
+
+impl CanvasShape {
+    /// Why its values do not fit together, if they do not.
+    pub(crate) fn check(&self) -> Option<String> {
+        let points = |name: &str, p: &Vec<f32>, least: usize| {
+            if !p.len().is_multiple_of(2) {
+                Some(format!(
+                    "a {name} has {} coordinates, it needs x and y for each point",
+                    p.len()
+                ))
+            } else if p.len() / 2 < least {
+                Some(format!(
+                    "a {name} has {} points, it needs {least}",
+                    p.len() / 2
+                ))
+            } else {
+                p.iter()
+                    .find(|v| !v.is_finite())
+                    .map(|v| format!("a {name} has the coordinate {v}"))
+            }
+        };
+        let stroke = |s: &Option<CanvasStroke>| {
+            s.and_then(|s| {
+                (!(s.width.is_finite() && s.width >= 0.0))
+                    .then(|| format!("the line is {} wide, it needs 0 or more", s.width))
+                    .or_else(|| above_zero("dash", &s.dash))
+            })
+        };
+        let finite = |name: &str, values: &[f32]| {
+            values
+                .iter()
+                .find(|v| !v.is_finite())
+                .map(|v| format!("a {name} has the value {v}"))
+        };
+        match self {
+            Self::Line {
+                points: p,
+                stroke: s,
+            } => points("line", p, 2).or_else(|| stroke(&Some(*s))),
+            Self::Polygon {
+                points: p,
+                stroke: s,
+                ..
+            } => points("polygon", p, 3).or_else(|| stroke(s)),
+            Self::Rect {
+                x,
+                y,
+                width,
+                height,
+                stroke: s,
+                corner_radius,
+                ..
+            } => finite("rectangle", &[*x, *y, *width, *height, *corner_radius])
+                .or_else(|| {
+                    (*corner_radius < 0.0).then(|| {
+                        format!("the corner radius is {corner_radius}, it needs 0 or more")
+                    })
+                })
+                .or_else(|| stroke(s)),
+            Self::Circle {
+                x,
+                y,
+                radius,
+                stroke: s,
+                ..
+            } => finite("circle", &[*x, *y, *radius])
+                .or_else(|| {
+                    (*radius < 0.0).then(|| format!("the radius is {radius}, it needs 0 or more"))
+                })
+                .or_else(|| stroke(s)),
+            Self::Ellipse {
+                x,
+                y,
+                radius_x,
+                radius_y,
+                stroke: s,
+                ..
+            } => finite("ellipse", &[*x, *y, *radius_x, *radius_y])
+                .or_else(|| {
+                    (*radius_x < 0.0 || *radius_y < 0.0).then(|| {
+                        format!("the radii are {radius_x} and {radius_y}, they need 0 or more")
+                    })
+                })
+                .or_else(|| stroke(s)),
+            Self::Curve {
+                points: p,
+                stroke: s,
+                ..
+            } => points("curve", p, 3)
+                .or_else(|| {
+                    (p.len() > 8).then(|| {
+                        format!("a curve has {} points, it needs three or four", p.len() / 2)
+                    })
+                })
+                .or_else(|| stroke(s)),
+            Self::Arrow {
+                x,
+                y,
+                to_x,
+                to_y,
+                stroke: s,
+            } => finite("arrow", &[*x, *y, *to_x, *to_y]).or_else(|| stroke(&Some(*s))),
+            Self::Text { x, y, size, .. } => {
+                finite("text", &[*x, *y]).or_else(|| above_zero("size", size))
+            }
+            Self::Image {
+                x,
+                y,
+                width,
+                height,
+                ..
+            } => finite("image", &[*x, *y, *width, *height]),
+        }
+    }
 }
 
 /// Why `min` and `max` do not fit, if they do not.
@@ -1558,7 +2113,7 @@ impl PlotSeries {
     fn check(&self) -> Option<String> {
         let name = &self.name;
         let (x, y) = (self.x.len(), self.y.len());
-        match self.kind {
+        match &self.kind {
             SeriesKind::Boxes { .. } if y % 5 != 0 => Some(format!(
                 "the boxes '{name}' need five values each, they have {y}"
             )),
@@ -1568,6 +2123,66 @@ impl PlotSeries {
             )),
             SeriesKind::HLine if x != 0 => {
                 Some(format!("the lines across '{name}' take no x values"))
+            }
+            SeriesKind::VLine if y != 0 => Some(format!(
+                "the lines from bottom to top '{name}' take no y values"
+            )),
+            SeriesKind::Polygon { .. } | SeriesKind::Area if x != y => {
+                Some(format!("'{name}' has {x} x values for {y} y values"))
+            }
+            SeriesKind::Area if self.y2.len() != y => Some(format!(
+                "the area '{name}' has {} upper values for {y} lower ones",
+                self.y2.len()
+            )),
+            SeriesKind::Text { .. } if x != y || self.labels.len() != y => Some(format!(
+                "the texts '{name}' have {x} x values, {y} y values and {} labels",
+                self.labels.len()
+            )),
+            SeriesKind::Arrows { .. } if x != y || self.x2.len() != y || self.y2.len() != y => {
+                Some(format!(
+                    "the arrows '{name}' have {x} x and {y} y values, but {} and {} for their tips",
+                    self.x2.len(),
+                    self.y2.len()
+                ))
+            }
+            SeriesKind::Span { vertical, .. } => {
+                let (axis, values) = if *vertical { ("x", x) } else { ("y", y) };
+                (values % 2 != 0).then(|| {
+                    format!("the bands '{name}' need pairs of {axis} values, they have {values}")
+                })
+            }
+            SeriesKind::Heatmap { columns: 0, .. } => {
+                Some(format!("the heatmap '{name}' needs at least one column"))
+            }
+            SeriesKind::Heatmap {
+                columns, min, max, ..
+            } => {
+                let columns = *columns as usize;
+                if y == 0 || y % columns != 0 {
+                    Some(format!(
+                        "the heatmap '{name}' has {y} values for rows of {columns}"
+                    ))
+                } else {
+                    match (min, max) {
+                        (Some(min), Some(max)) if out_of_order(*min, *max) => {
+                            Some(format!("the heatmap '{name}' has min {min} > max {max}"))
+                        }
+                        _ => None,
+                    }
+                }
+            }
+            SeriesKind::Image { width, height, .. } => {
+                if x != 1 || y != 1 {
+                    Some(format!(
+                        "the image '{name}' needs one point, it has {x} x and {y} y values"
+                    ))
+                } else if !(*width > 0.0 && *height > 0.0) {
+                    Some(format!(
+                        "the image '{name}' needs a size above 0, it has {width} x {height}"
+                    ))
+                } else {
+                    None
+                }
             }
             SeriesKind::Line { .. } | SeriesKind::Points { .. } | SeriesKind::Bars { .. }
                 if x != 0 && x != y =>

@@ -15,7 +15,9 @@ use three_d::egui::{self, Color32, Id, Layout, Response, RichText, Ui, UiBuilder
 pub(crate) fn draw(ui: &mut Ui, state: &mut UiState) {
     let tree = std::mem::take(&mut state.tree);
     state.previous = std::mem::take(&mut state.bounds);
+    state.screen_bounds.clear();
     state.panels.clear();
+    crate::pictures::hand_images(ui.ctx(), state);
     if state.focus == Some(Focus::Clear) {
         state.focus = None;
         ui.ctx().memory_mut(|m| {
@@ -28,6 +30,7 @@ pub(crate) fn draw(ui: &mut Ui, state: &mut UiState) {
         tree: &tree,
         state,
         watched: Vec::new(),
+        scenes: 0,
     };
     for &root in &tree.roots {
         let node = &tree.nodes[root];
@@ -68,7 +71,7 @@ fn argb(c: u32) -> Color32 {
     Color32::from_rgba_unmultiplied(r, g, b, a)
 }
 
-fn align2(anchor: Anchor) -> egui::Align2 {
+pub(crate) fn align2(anchor: Anchor) -> egui::Align2 {
     match anchor {
         Anchor::TopLeft => egui::Align2::LEFT_TOP,
         Anchor::Top => egui::Align2::CENTER_TOP,
@@ -115,6 +118,8 @@ struct Frame<'a> {
     state: &'a mut UiState,
     /// The nodes that report focus ([UiModifier::focus_events]) with the ids of their responses.
     watched: Vec<(u64, Id)>,
+    /// How many scenes the node drawn now is in: its rectangle is not where it is seen.
+    scenes: usize,
 }
 
 impl Frame<'_> {
@@ -421,6 +426,14 @@ impl Frame<'_> {
                 .request_discard("a node in a row changed its height");
         }
         self.state.bounds.insert(node.id, rect.into());
+        if self.scenes > 0 {
+            // Where it is seen: through the zoom and the move of the scenes it is in
+            let seen = ui
+                .ctx()
+                .layer_transform_to_global(ui.layer_id())
+                .map_or(rect, |t| t * rect);
+            self.state.screen_bounds.insert(node.id, seen.into());
+        }
         let response = scope.inner.unwrap_or(scope.response);
         if self.state.focus == Some(Focus::Node(node.id)) {
             self.state.focus = None;
@@ -707,6 +720,55 @@ impl Frame<'_> {
         self.state
             .bounds
             .insert(node.id, row.response().rect.into());
+    }
+
+    /// A [Widget::Scene]: its nodes moved and zoomed by the user, from Kotlin's view when that changes.
+    fn scene(&mut self, ui: &mut Ui, node: &UiNode) -> Response {
+        let Widget::Scene {
+            height,
+            width,
+            min_zoom,
+            max_zoom,
+            view,
+            report_view,
+        } = &node.widget
+        else {
+            unreachable!("only for scenes")
+        };
+        let id = node_id(node);
+        let (shown_key, view_key) = (id.with("scene"), id.with("scene_view"));
+        // Nothing yet: egui fits the nodes in
+        let mut shown = ui
+            .data(|d| d.get_temp::<egui::Rect>(shown_key))
+            .unwrap_or(egui::Rect::ZERO);
+        let wanted = view.map(|v| [v.x, v.y, v.width, v.height]);
+        let last = ui.data(|d| d.get_temp::<Option<[f32; 4]>>(view_key));
+        if last != Some(wanted) {
+            ui.data_mut(|d| d.insert_temp(view_key, wanted));
+            if let Some(v) = view {
+                shown =
+                    egui::Rect::from_min_size(egui::pos2(v.x, v.y), egui::vec2(v.width, v.height));
+            }
+        }
+        let before = shown;
+        let zoom = egui::Rangef::new(min_zoom.unwrap_or(f32::EPSILON), max_zoom.unwrap_or(1.0));
+        let size = egui::vec2(width.unwrap_or_else(|| ui.available_width()), *height);
+        self.scenes += 1;
+        // Its place on the screen: the response of egui's Scene is in the points of its nodes
+        let r = ui.allocate_ui(size, |ui| {
+            egui::Scene::new()
+                .zoom_range(zoom)
+                .show(ui, &mut shown, |ui| self.inside(ui, node));
+        });
+        self.scenes -= 1;
+        ui.data_mut(|d| d.insert_temp(shown_key, shown));
+        if *report_view && before != egui::Rect::ZERO && shown != before {
+            self.state.push(UiEvent::ViewChanged {
+                id: node.id,
+                view: shown.into(),
+            });
+        }
+        r.response
     }
 
     /// A [Widget::Strip]: a cell per size, a node in each.
@@ -1132,10 +1194,25 @@ impl Frame<'_> {
                 selected,
                 shortcut,
                 fill,
+                image,
+                image_size,
             } => {
-                let mut button = egui::Button::new(text.as_str())
-                    .frame(*frame)
-                    .selected(*selected);
+                let picture = image
+                    .as_ref()
+                    .and_then(|key| crate::pictures::image_source(state, key))
+                    .map(|source| {
+                        let height = image_size
+                            .unwrap_or_else(|| ui.text_style_height(&egui::TextStyle::Button));
+                        egui::Image::new(source)
+                            .fit_to_exact_size(egui::vec2(f32::INFINITY, height))
+                            .show_loading_spinner(true)
+                    });
+                let button = match picture {
+                    Some(p) if text.is_empty() => egui::Button::image(p),
+                    Some(p) => egui::Button::image_and_text(p, text.as_str()),
+                    None => egui::Button::new(text.as_str()),
+                };
+                let mut button = button.frame(*frame).selected(*selected);
                 if *small {
                     button = button.small();
                 }
@@ -1605,7 +1682,10 @@ impl Frame<'_> {
                 ui.add(bar)
             }
             Widget::Spinner => ui.spinner(),
-            Widget::Plot { .. } => plot(ui, node),
+            Widget::Plot { .. } => plot(ui, state, node),
+            Widget::Image { .. } => crate::pictures::image(ui, state, node),
+            Widget::Canvas { .. } => crate::pictures::canvas(ui, state, node),
+            Widget::Scene { .. } => self.scene(ui, node),
             Widget::Notice { text, level } => {
                 let color = match level {
                     NoticeLevel::Info => ui.visuals().text_color(),
@@ -1902,7 +1982,7 @@ fn sized<R>(ui: &mut Ui, m: &UiModifier, centered: bool, add: impl FnOnce(&mut U
 }
 
 /// The plot of a [Widget::Plot] node, with its series in their order.
-fn plot(ui: &mut Ui, node: &UiNode) -> Response {
+fn plot(ui: &mut Ui, state: &mut UiState, node: &UiNode) -> Response {
     let Widget::Plot {
         series,
         height,
@@ -1917,10 +1997,23 @@ fn plot(ui: &mut Ui, node: &UiNode) -> Response {
         link,
         include_x,
         include_y,
+        clickable,
+        report_pointer,
     } = &node.widget
     else {
         unreachable!("only for plots")
     };
+    // The textures of its images, decoded before the plot draws
+    let textures: HashMap<&str, egui::TextureId> = series
+        .iter()
+        .filter_map(|s| match &s.kind {
+            SeriesKind::Image { image, .. } => {
+                crate::pictures::texture(ui, state, image, egui::vec2(256.0, 256.0))
+                    .map(|t| (image.as_str(), t.id))
+            }
+            _ => None,
+        })
+        .collect();
     let places = Places {
         categories: categories.clone(),
         label: x_label.clone(),
@@ -2005,7 +2098,7 @@ fn plot(ui: &mut Ui, node: &UiNode) -> Response {
     for y in include_y {
         plot = plot.include_y(*y);
     }
-    plot.show(ui, |p| {
+    let shown = plot.show(ui, |p| {
         // Per stack group and bar: how high the positive bars so far reach and how low the negative ones
         let mut stacks: Vec<(&str, Vec<(f64, f64)>)> = Vec::new();
         for s in series {
@@ -2019,17 +2112,27 @@ fn plot(ui: &mut Ui, node: &UiNode) -> Response {
                     if *fill {
                         line = line.fill(0.0_f32);
                     }
+                    if let Some(style) = s.style {
+                        line = line.style(line_style(style));
+                    }
                     if let Some(c) = color {
                         line = line.color(c);
                     }
                     p.line(line);
                 }
-                SeriesKind::Points { radius } => {
+                SeriesKind::Points {
+                    radius,
+                    shape,
+                    filled,
+                } => {
                     let points: Vec<[f64; 2]> =
                         s.y.iter().enumerate().map(|(i, y)| [x(i), *y]).collect();
                     let mut dots = egui_plot::Points::new(s.name.as_str(), points)
                         .radius(*radius)
-                        .filled(true);
+                        .filled(*filled);
+                    if let Some(shape) = shape {
+                        dots = dots.shape(marker(*shape));
+                    }
                     if let Some(c) = color {
                         dots = dots.color(c);
                     }
@@ -2094,18 +2197,186 @@ fn plot(ui: &mut Ui, node: &UiNode) -> Response {
                 }
                 SeriesKind::HLine => {
                     for y in &s.y {
-                        let mut line = egui_plot::HLine::new(s.name.as_str(), *y)
-                            .style(egui_plot::LineStyle::dashed_loose());
+                        let mut line = egui_plot::HLine::new(s.name.as_str(), *y).style(
+                            s.style
+                                .map_or(egui_plot::LineStyle::dashed_loose(), line_style),
+                        );
                         if let Some(c) = color {
                             line = line.color(c);
                         }
                         p.hline(line);
                     }
                 }
+                SeriesKind::VLine => {
+                    for x in &s.x {
+                        let mut line = egui_plot::VLine::new(s.name.as_str(), *x).style(
+                            s.style
+                                .map_or(egui_plot::LineStyle::dashed_loose(), line_style),
+                        );
+                        if let Some(c) = color {
+                            line = line.color(c);
+                        }
+                        p.vline(line);
+                    }
+                }
+                SeriesKind::Polygon { width } => {
+                    let points: Vec<[f64; 2]> =
+                        s.y.iter().enumerate().map(|(i, y)| [x(i), *y]).collect();
+                    let mut polygon =
+                        egui_plot::Polygon::new(s.name.as_str(), points).width(*width);
+                    if let Some(style) = s.style {
+                        polygon = polygon.style(line_style(style));
+                    }
+                    if let Some(c) = color {
+                        polygon = polygon
+                            .stroke(egui::Stroke::new(*width, c))
+                            .fill_color(c.gamma_multiply(0.25));
+                    }
+                    p.polygon(polygon);
+                }
+                SeriesKind::Text { anchor } => {
+                    for (i, (y, label)) in s.y.iter().zip(&s.labels).enumerate() {
+                        let mut text = egui_plot::Text::new(
+                            s.name.as_str(),
+                            egui_plot::PlotPoint::new(x(i), *y),
+                            label.as_str(),
+                        );
+                        if let Some(anchor) = anchor {
+                            text = text.anchor(align2(*anchor));
+                        }
+                        if let Some(c) = color {
+                            text = text.color(c);
+                        }
+                        p.text(text);
+                    }
+                }
+                SeriesKind::Arrows { tip_length } => {
+                    let from: Vec<[f64; 2]> =
+                        s.y.iter().enumerate().map(|(i, y)| [x(i), *y]).collect();
+                    let to: Vec<[f64; 2]> = s.x2.iter().zip(&s.y2).map(|(x, y)| [*x, *y]).collect();
+                    let mut arrows = egui_plot::Arrows::new(s.name.as_str(), from, to);
+                    if let Some(tip) = tip_length {
+                        arrows = arrows.tip_length(*tip);
+                    }
+                    if let Some(c) = color {
+                        arrows = arrows.color(c);
+                    }
+                    p.arrows(arrows);
+                }
+                SeriesKind::Area => {
+                    let xs: Vec<f64> = (0..s.y.len()).map(x).collect();
+                    let mut area = egui_plot::FilledArea::new(s.name.as_str(), &xs, &s.y, &s.y2);
+                    if let Some(c) = color {
+                        area = area
+                            .fill_color(c.gamma_multiply(0.35))
+                            .stroke(egui::Stroke::new(1.0_f32, c));
+                    }
+                    p.add(area);
+                }
+                SeriesKind::Span { vertical } => {
+                    let values = if *vertical { &s.x } else { &s.y };
+                    for pair in values.as_chunks::<2>().0 {
+                        let mut span = egui_plot::Span::new(s.name.as_str(), pair[0]..=pair[1])
+                            .axis(if *vertical {
+                                egui_plot::Axis::X
+                            } else {
+                                egui_plot::Axis::Y
+                            });
+                        if let Some(c) = color {
+                            span = span.fill(c.gamma_multiply(0.25)).border_color(c);
+                        }
+                        p.add(span);
+                    }
+                }
+                SeriesKind::Heatmap {
+                    columns,
+                    palette,
+                    min,
+                    max,
+                    show_values,
+                } => {
+                    let mut heatmap = egui_plot::Heatmap::new(s.y.clone(), *columns as usize)
+                        .name(s.name.as_str())
+                        .show_labels(*show_values)
+                        .at(egui_plot::PlotPoint::new(
+                            s.x.first().copied().unwrap_or(0.0),
+                            s.y2.first().copied().unwrap_or(0.0),
+                        ))
+                        .tile_size(1.0, 1.0);
+                    if !palette.is_empty() {
+                        let colors: Vec<Color32> = palette.iter().map(|c| argb(*c)).collect();
+                        heatmap = heatmap.palette(&colors);
+                    }
+                    let (low, high) =
+                        s.y.iter()
+                            .fold((f64::MAX, f64::MIN), |(l, h), v| (l.min(*v), h.max(*v)));
+                    if min.is_some() || max.is_some() {
+                        heatmap = heatmap.range(min.unwrap_or(low), max.unwrap_or(high));
+                    }
+                    p.add(heatmap);
+                }
+                SeriesKind::Image {
+                    image,
+                    width,
+                    height,
+                } => {
+                    if let Some(texture) = textures.get(image.as_str()) {
+                        let mut picture = egui_plot::PlotImage::new(
+                            s.name.as_str(),
+                            *texture,
+                            egui_plot::PlotPoint::new(x(0), s.y[0]),
+                            egui::vec2(*width as f32, *height as f32),
+                        );
+                        if let Some(c) = color {
+                            picture = picture.tint(c);
+                        }
+                        p.image(picture);
+                    }
+                }
             }
         }
-    })
-    .response
+    });
+    let to_values = |pos: egui::Pos2| {
+        let v = shown.transform.value_from_position(pos);
+        crate::UiPoint { x: v.x, y: v.y }
+    };
+    crate::pictures::pointer(
+        ui,
+        state,
+        node,
+        &shown.response,
+        to_values,
+        *clickable,
+        *report_pointer,
+    );
+    shown.response
+}
+
+/// egui_plot's form of a dot.
+fn marker(shape: crate::PointShape) -> egui_plot::MarkerShape {
+    use crate::PointShape as P;
+    use egui_plot::MarkerShape as M;
+    match shape {
+        P::Circle => M::Circle,
+        P::Diamond => M::Diamond,
+        P::Square => M::Square,
+        P::Cross => M::Cross,
+        P::Plus => M::Plus,
+        P::Up => M::Up,
+        P::Down => M::Down,
+        P::Left => M::Left,
+        P::Right => M::Right,
+        P::Asterisk => M::Asterisk,
+    }
+}
+
+/// egui_plot's style of a line.
+fn line_style(style: crate::PlotLineStyle) -> egui_plot::LineStyle {
+    match style {
+        crate::PlotLineStyle::Solid => egui_plot::LineStyle::Solid,
+        crate::PlotLineStyle::Dashed { length } => egui_plot::LineStyle::Dashed { length },
+        crate::PlotLineStyle::Dotted { spacing } => egui_plot::LineStyle::Dotted { spacing },
+    }
 }
 
 /// A number as the plot shows it: whole numbers without a point, the rest with up to three digits after it.
