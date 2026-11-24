@@ -135,8 +135,6 @@ impl WgpuBackend {
                     } else {
                         w::Features::empty()
                     },
-                // SAFETY: wgpu asks to acknowledge that experimental features may have bugs and change between
-                // versions; only ray queries are experimental here, and they are only asked for on request
                 // The limits of acceleration structures are zero unless asked for
                 required_limits: if ray_queries {
                     w::Limits::default().using_acceleration_structure_values(adapter.limits())
@@ -144,6 +142,8 @@ impl WgpuBackend {
                     w::Limits::default()
                 },
                 experimental_features: if ray_queries {
+                    // SAFETY: wgpu asks to acknowledge that experimental features may have bugs and change between
+                    // versions; only ray queries are experimental here, and they are only asked for on request
                     unsafe { w::ExperimentalFeatures::enabled() }
                 } else {
                     w::ExperimentalFeatures::disabled()
@@ -179,6 +179,7 @@ impl WgpuBackend {
         {
             backend.browser = capture.and_then(|c| c.finish());
         }
+        backend.adapter_features = Some(adapter.features());
         backend.float32_renderable = adapter
             .get_texture_format_features(w::TextureFormat::Rgba32Float)
             .allowed_usages

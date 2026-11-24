@@ -776,6 +776,12 @@ pub struct PreviewOptions {
     /// renderer's `cpu_threads` (one less than the machine has, at least one). Browsers trace in one thread.
     ///
     pub cpu_threads: Option<u32>,
+    ///
+    /// Hardware ray queries on the GPU where `PreviewCapabilities.ray_query` says the device has them (on by
+    /// default); switching makes the GPU's tracer anew in the background, the old one traces until it is ready. Without
+    /// them on the device it changes nothing, `PreviewCapabilities.ray_query_reason` says why.
+    ///
+    pub ray_queries: bool,
 }
 
 impl Default for PreviewOptions {
@@ -792,6 +798,7 @@ impl PreviewOptions {
         cpu_downscale: None,
         denoise: true,
         cpu_threads: None,
+        ray_queries: true,
     };
 
     /// Downscales that are not 1, 2 or 4 on the GPU or not 1 to 16 on the CPU.
@@ -835,6 +842,7 @@ impl PreviewOptions {
             gpu_falls_back_to_cpu: self.tracer != TracerChoice::Gpu,
             cpu_downscale: self.cpu_downscale.unwrap_or(default.cpu_downscale),
             cpu_threads: self.cpu_threads.map_or(threads, |n| n as usize),
+            gpu_ray_queries: self.ray_queries,
             denoiser: if self.denoise {
                 settings.denoiser.or(default.denoiser)
             } else {
@@ -865,8 +873,16 @@ pub struct PreviewCapabilities {
     pub gpu: bool,
     /// Why not, where `gpu` is false: no compute shaders (OpenGL, WebGL2), or a driver known to crash
     pub gpu_reason: Option<String>,
-    /// The GPU traces with hardware ray queries ([TracerKind::RayQuery]), not with hierarchies in storage buffers
+    ///
+    /// The GPU can trace with hardware ray queries ([TracerKind::RayQuery]) instead of hierarchies in storage
+    /// buffers, switched with [PreviewOptions::ray_queries]
+    ///
     pub ray_query: bool,
+    ///
+    /// Why not, where `ray_query` is false: no GPU tracer, a browser, a graphics card or driver without them, or an
+    /// application started without the environment variable `THREE_D_RAY_QUERY=1` on a graphics card that has them
+    ///
+    pub ray_query_reason: Option<String>,
     /// The GPU measures its own time per frame (timestamp queries): `PreviewStatus.gpu_time_ms` and the sharp image
     /// at the full resolution when still. Without, the time between two frames counts.
     pub timestamp_queries: bool,
@@ -897,10 +913,18 @@ impl PreviewCapabilities {
         );
         #[cfg(not(feature = "gpu"))]
         let (ray_query, timestamp_queries) = (false, false);
+        #[cfg(feature = "gpu")]
+        let ray_query_reason = match &gpu_reason {
+            Some(why) => Some(why.clone()),
+            None => three_d_raytrace::ray_query_problem(context),
+        };
+        #[cfg(not(feature = "gpu"))]
+        let ray_query_reason = Some("Built without the GPU tracers.".to_owned());
         Self {
             gpu: gpu_reason.is_none(),
             gpu_reason,
             ray_query,
+            ray_query_reason,
             timestamp_queries,
             gpu_downscales: GPU_DOWNSCALES.to_vec(),
             max_cpu_downscale: MAX_CPU_DOWNSCALE,

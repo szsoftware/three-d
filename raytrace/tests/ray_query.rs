@@ -192,3 +192,39 @@ fn a_moved_instance_moves_with_ray_queries() {
         100.0 * pixels_off(&a, &b)
     );
 }
+
+#[test]
+fn the_preview_switches_ray_queries_on_and_off() {
+    // Skipped where the device has no ray queries; sets THREE_D_RAY_QUERY for the context
+    if tracers().is_none() {
+        return;
+    }
+    let context = common::headless_wgpu().unwrap();
+    assert_eq!(ray_query_problem(&context), None);
+    let demo = scenes::garden::demo();
+    let camera = demo.camera(32, 20);
+    let mut preview = RaytracePreview::new(&context, 32, 20);
+    let settled = |preview: &mut RaytracePreview, kind: TracerKind| {
+        for _ in 0..200 {
+            preview.wait_for_gpu();
+            preview.update(&demo.scene, &camera).unwrap();
+            if preview.kind() == kind && !preview.is_compiling() {
+                return;
+            }
+        }
+        panic!("the preview stayed with {:?}", preview.kind());
+    };
+    settled(&mut preview, TracerKind::RayQuery);
+    preview.set_settings(PreviewSettings {
+        gpu_ray_queries: false,
+        ..*preview.settings()
+    });
+    // The tracer with ray queries traces until the other one is made
+    assert_eq!(preview.kind(), TracerKind::RayQuery);
+    settled(&mut preview, TracerKind::Compute);
+    preview.set_settings(PreviewSettings {
+        gpu_ray_queries: true,
+        ..*preview.settings()
+    });
+    settled(&mut preview, TracerKind::RayQuery);
+}

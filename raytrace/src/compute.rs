@@ -238,6 +238,21 @@ impl ComputeTracer {
         Self::build(gpu, adapter, has_ray_queries(gpu))
     }
 
+    /// As [ComputeTracer::for_adapter], with hardware ray queries only if `ray_queries` and the device has them.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn for_adapter_with(
+        gpu: &GpuDevice,
+        adapter: Option<w::AdapterInfo>,
+        ray_queries: bool,
+    ) -> Self {
+        Self::build(gpu, adapter, ray_queries && has_ray_queries(gpu))
+    }
+
+    /// Whether the device has hardware ray queries, which [ComputeTracer::with_ray_queries] can turn on.
+    pub fn ray_queries_available(&self) -> bool {
+        has_ray_queries(&self.gpu)
+    }
+
     fn build(gpu: &GpuDevice, adapter: Option<w::AdapterInfo>, ray_queries: bool) -> Self {
         let device = &gpu.device;
         let adapter = adapter.unwrap_or_else(|| device.adapter_info());
@@ -1220,7 +1235,11 @@ fn submit(
 
 impl Tracer for ComputeTracer {
     fn kind(&self) -> TracerKind {
-        TracerKind::Compute
+        if self.ray_queries {
+            TracerKind::RayQuery
+        } else {
+            TracerKind::Compute
+        }
     }
 
     fn prepare(&mut self, scene: &RtScene) -> Result<(), RtError> {

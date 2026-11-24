@@ -412,6 +412,21 @@ impl Context {
     }
 
     ///
+    /// The features the wgpu adapter of this context offers, which may be more than its device was created with: for
+    /// example `EXPERIMENTAL_RAY_QUERY`, which the device only gets when the environment variable `THREE_D_RAY_QUERY=1`
+    /// is set as the context is made. `None` with another backend or when the context did not create the device
+    /// itself.
+    ///
+    #[cfg(feature = "wgpu")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "wgpu")))]
+    pub fn wgpu_adapter_features(&self) -> Option<wgpu::Features> {
+        match &*self.backend {
+            backend::Backend::Wgpu(wgpu) => wgpu.adapter_features,
+            _ => None,
+        }
+    }
+
+    ///
     /// The browser's `GPUDevice` behind the wgpu device of this context, for WebGPU calls wgpu does not have, such as
     /// `createComputePipelineAsync`. `None` with another backend or when the context did not create the device itself.
     ///

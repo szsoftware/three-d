@@ -635,6 +635,8 @@ fn preview_options_by_hand() {
     assert!(caps.gpu, "{caps:?}");
     assert_eq!(caps.gpu_reason, None);
     assert_eq!(caps.gpu_downscales, vec![1, 2, 4]);
+    // Ray queries or why not (lavapipe has them, the tests do not ask the device for them)
+    assert_eq!(caps.ray_query, caps.ray_query_reason.is_none(), "{caps:?}");
     assert_eq!(view.preview_options().unwrap(), PreviewOptions::AUTOMATIC);
 
     // Downscales the preview cannot have are errors, the options stay
@@ -707,6 +709,7 @@ fn preview_options_by_hand() {
         cpu_downscale: None,
         denoise: true,
         cpu_threads: None,
+        ray_queries: true,
     })
     .unwrap();
     let mut status = traced(&view);
@@ -733,6 +736,7 @@ fn preview_options_by_hand() {
         cpu_downscale: None,
         denoise: true,
         cpu_threads: None,
+        ray_queries: true,
     })
     .unwrap();
     let status = traced(&view);

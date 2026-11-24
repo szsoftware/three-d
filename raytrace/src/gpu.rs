@@ -15,7 +15,7 @@ pub enum RaytraceSupport {
     Compute,
     /// Ray queries on hardware that traces rays. The device must have been created with
     /// [wgpu::Features::EXPERIMENTAL_RAY_QUERY](three_d::wgpu::Features::EXPERIMENTAL_RAY_QUERY), which three-d's own
-    /// constructors do not ask for yet.
+    /// constructors only ask for with the environment variable `THREE_D_RAY_QUERY=1`, see [ray_query_problem].
     HardwareRayQuery,
 }
 
@@ -52,6 +52,42 @@ impl RaytraceSupport {
             Self::Compute
         }
     }
+}
+
+///
+/// Why the compute tracer can not use hardware ray queries on the context (see
+/// [ComputeTracer::uses_ray_queries](crate::ComputeTracer::uses_ray_queries)), `None` if it can: no GPU tracer at all,
+/// a browser (WebGPU has no ray queries), a graphics card or driver without them, or a device made without them
+/// although the graphics card has them, which three-d asks for only when the environment variable
+/// `THREE_D_RAY_QUERY=1` is set as the context is made. For options that cannot work, shown as disabled with the
+/// reason.
+///
+pub fn ray_query_problem(context: &Context) -> Option<String> {
+    if RaytraceSupport::of(context) == RaytraceSupport::HardwareRayQuery {
+        return None;
+    }
+    if RaytraceSupport::of(context) == RaytraceSupport::Cpu {
+        return Some(
+            "Ray tracing does not run on this GPU, so neither do hardware ray queries.".to_owned(),
+        );
+    }
+    if cfg!(target_arch = "wasm32") {
+        return Some(
+            "Browsers have no hardware ray queries (WebGPU does not offer them).".to_owned(),
+        );
+    }
+    let offered = context
+        .wgpu_adapter_features()
+        .is_some_and(|f| f.contains(three_d::wgpu::Features::EXPERIMENTAL_RAY_QUERY));
+    Some(if offered {
+        "The graphics card has hardware ray queries, but they are experimental and only used when the application \
+         is started with the environment variable THREE_D_RAY_QUERY=1."
+            .to_owned()
+    } else {
+        "The graphics card or its driver has no hardware ray queries (Vulkan, DirectX 12 or Metal on graphics cards \
+         with ray tracing units)."
+            .to_owned()
+    })
 }
 
 ///
