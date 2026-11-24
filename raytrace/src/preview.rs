@@ -1676,6 +1676,15 @@ impl RaytracePreview {
         target.apply_screen_effect(&self.effect(), &viewer, &[], None, None);
     }
 
+    ///
+    /// Draws the image into `viewport` of the target (from the bottom left), for example the part of an application's
+    /// screen that shows the view; see [RaytracePreview::render].
+    ///
+    pub fn render_in(&self, target: &RenderTarget, viewport: three_d::Viewport) {
+        let viewer = three_d::Camera::new_2d(viewport);
+        target.apply_screen_effect(&self.effect(), &viewer, &[], None, None);
+    }
+
     /// Draws the image into a color target, for example a texture, see [RaytracePreview::render].
     pub fn render_to_color(&self, target: &ColorTarget) {
         let viewer = three_d::Camera::new_2d(target.viewport());

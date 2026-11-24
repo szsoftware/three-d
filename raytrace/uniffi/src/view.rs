@@ -410,19 +410,7 @@ impl SceneView {
 
     /// A new size in pixels.
     pub fn resize(&self, width: u32, height: u32) -> Result<(), RtFfiError> {
-        self.state.with(|s| {
-            let (width, height) = (width.max(1), height.max(1));
-            if (width, height) != (s.width, s.height) {
-                (s.width, s.height) = (width, height);
-                s.camera.set_viewport(Viewport::new_at_origo(width, height));
-                s.color = rgba_texture(&s.context, width, height);
-                s.depth = depth_texture(&s.context, width, height);
-                if let Some(r) = &mut s.raytrace {
-                    r.resize(width, height);
-                }
-                s.changed();
-            }
-        })
+        self.state.with(|s| s.resize(width, height))
     }
 
     /// Instances drawn as selected (lighter), e.g. after a click.
@@ -449,6 +437,61 @@ impl SceneView {
     /// Draws a frame: the rasterizer while things move, the raytraced preview after the camera stood still.
     pub fn next_frame(&self) -> Result<Frame, RtFfiError> {
         self.state.with(|s| s.frame(&self.scene))?
+    }
+}
+
+/// Drawing into the target of a host, for an application that renders with three-d itself (Rust, not exported).
+impl SceneView {
+    ///
+    /// Draws the next frame into `viewport` of `target` (from the bottom left, as everywhere in three-d), on the context
+    /// of the host: the renderer was made with [Renderer::with_context] on the host's context, OpenGL or wgpu, and this
+    /// runs on its thread. Nothing is read back, the frame is where the host shows it. The rasterizer while things move,
+    /// the raytraced preview (scaled from its resolution) after the camera stood still, the overlay
+    /// ([SceneView::set_overlay]) over both, the same as [SceneView::next_frame]. The view takes the size of `viewport`
+    /// ([SceneView::resize]); only that part of `target` is cleared and drawn. Returns the samples of the preview
+    /// shown, 0 for the rasterizer.
+    ///
+    /// Only three-d draws, with the host's context, so the OpenGL state is as three-d leaves it after its own draw calls;
+    /// a host that shares the OpenGL context with other code (Skia, JOGL) resets it as for its own drawing
+    /// ([Context::reset_gl_state] before, the toolkit's reset after).
+    ///
+    pub fn render_into(
+        &self,
+        target: &RenderTarget<'_>,
+        viewport: Viewport,
+    ) -> Result<u32, RtFfiError> {
+        self.state
+            .with(|s| s.frame_into(&self.scene, target, viewport))?
+    }
+}
+
+#[uniffi::export]
+impl SceneView {
+    ///
+    /// [SceneView::render_into] the screen of the view's context: the default framebuffer, the canvas in the browser,
+    /// or the framebuffer the host set with `Context::set_screen_framebuffer`. `screen_width` x `screen_height` is the
+    /// size of the screen in pixels, `x`, `y`, `width`, `height` the part the view draws into, from the bottom left.
+    /// Returns the samples of the preview shown, 0 for the rasterizer.
+    ///
+    pub fn render_to_screen(
+        &self,
+        screen_width: u32,
+        screen_height: u32,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    ) -> Result<u32, RtFfiError> {
+        self.state.with(|s| {
+            let screen = RenderTarget::screen(&s.context, screen_width, screen_height);
+            let viewport = Viewport {
+                x,
+                y,
+                width: width.max(1),
+                height: height.max(1),
+            };
+            s.frame_into(&self.scene, &screen, viewport)
+        })?
     }
 }
 
@@ -699,7 +742,9 @@ impl ViewState {
         })
     }
 
-    fn frame(&mut self, scene: &Scene) -> Result<Frame, RtFfiError> {
+    /// Moves the camera, syncs the scene, answers a pick and lets the raytraced preview trace: whether the preview's
+    /// image is what the frame shows, else the rasterizer draws it.
+    fn advance(&mut self, scene: &Scene) -> Result<bool, RtFfiError> {
         let now = Instant::now();
         let seconds = now.duration_since(self.last_frame).as_secs_f32();
         self.last_frame = now;
@@ -719,10 +764,8 @@ impl ViewState {
         }
 
         // A photo traces on the preview's engine: its image stays on screen
-        if self.photo {
-            if let Some(preview) = &mut self.raytrace {
-                return preview.read_with(self.overlay.as_deref());
-            }
+        if self.photo && self.raytrace.is_some() {
+            return Ok(true);
         }
 
         // Still long enough: the raytraced preview takes over and gets sharper
@@ -741,47 +784,33 @@ impl ViewState {
                 let preview = self.raytrace.get_or_insert_with(|| {
                     PreviewState::new(&context, w, h, look, threads, options)
                 });
-                preview.update(scene, &camera)?;
-                if preview.preview.sample_count() > 0 {
-                    return preview.read_with(self.overlay.as_deref());
-                }
-            } else {
+                preview.advance(scene, &camera)?;
+                return Ok(preview.preview.sample_count() > 0);
+            } else if let Some(p) = &mut self.raytrace {
                 // Moving again: the preview starts over when the camera stands still next time
-                if let Some(p) = &mut self.raytrace {
-                    p.preview.restart();
-                }
+                p.preview.restart();
             }
         }
+        Ok(false)
+    }
 
-        let target = RenderTarget::new(
-            self.color.as_color_target(None),
-            self.depth.as_depth_target(),
-        );
-        let b = self.lights.background;
-        target.clear(ClearState::color_and_depth(
-            b.r as f32 / 255.0,
-            b.g as f32 / 255.0,
-            b.b as f32 / 255.0,
-            1.0,
-            1.0,
-        ));
-        let mut lights: Vec<&dyn three_d::Light> = Vec::new();
-        lights.extend(self.lights.ambient.iter().map(|l| l as &dyn three_d::Light));
-        lights.extend(
-            self.lights
-                .directional
-                .iter()
-                .map(|l| l as &dyn three_d::Light),
-        );
-        lights.extend(self.lights.point.iter().map(|l| l as &dyn three_d::Light));
-        lights.extend(self.lights.spot.iter().map(|l| l as &dyn three_d::Light));
-        self.camera.tone_mapping = match self.realtime.look.tone {
-            ToneCurve::Aces => three_d::ToneMapping::Aces,
-            ToneCurve::Reinhard => three_d::ToneMapping::Reinhard,
-            ToneCurve::Clamp => three_d::ToneMapping::None,
-        };
-        target.render(&self.camera, self.groups.iter().map(|g| &g.gm), &lights);
+    fn frame(&mut self, scene: &Scene) -> Result<Frame, RtFfiError> {
+        if self.advance(scene)? {
+            if let Some(preview) = &mut self.raytrace {
+                return preview.read_with(self.overlay.as_deref());
+            }
+        }
         let (w, h) = (self.width, self.height);
+        let color = self.color.as_color_target(None);
+        let target = RenderTarget::new(color, self.depth.as_depth_target());
+        draw_raster(
+            &mut self.camera,
+            &self.lights,
+            &self.groups,
+            self.realtime.look.tone,
+            &target,
+            Viewport::new_at_origo(w, h),
+        );
         if let Some(overlay) = &self.overlay {
             overlay.paint(&self.context, &target, Viewport::new_at_origo(w, h))?;
         }
@@ -793,6 +822,93 @@ impl ViewState {
             samples: 0,
         })
     }
+
+    /// [SceneView::render_into]: the frame drawn into a target of the host, nothing read back.
+    fn frame_into(
+        &mut self,
+        scene: &Scene,
+        target: &RenderTarget<'_>,
+        viewport: Viewport,
+    ) -> Result<u32, RtFfiError> {
+        self.resize(viewport.width, viewport.height);
+        let samples = if self.advance(scene)? {
+            let preview = self.raytrace.as_ref().expect("the preview is shown");
+            preview.preview.render_in(target, viewport);
+            preview.preview.sample_count()
+        } else {
+            draw_raster(
+                &mut self.camera,
+                &self.lights,
+                &self.groups,
+                self.realtime.look.tone,
+                target,
+                viewport,
+            );
+            0
+        };
+        if let Some(overlay) = &self.overlay {
+            overlay.paint(&self.context, target, viewport)?;
+        }
+        Ok(samples)
+    }
+
+    /// The size of the view, see [SceneView::resize].
+    fn resize(&mut self, width: u32, height: u32) {
+        let (width, height) = (width.max(1), height.max(1));
+        if (width, height) != (self.width, self.height) {
+            (self.width, self.height) = (width, height);
+            self.camera
+                .set_viewport(Viewport::new_at_origo(width, height));
+            self.color = rgba_texture(&self.context, width, height);
+            self.depth = depth_texture(&self.context, width, height);
+            if let Some(r) = &mut self.raytrace {
+                r.resize(width, height);
+            }
+            self.changed();
+        }
+    }
+}
+
+/// The rasterizer's image of the scene into `viewport` of `target`, cleared with the background first.
+fn draw_raster(
+    camera: &mut Camera,
+    lights_of: &Lights,
+    groups: &[Group],
+    tone: ToneCurve,
+    target: &RenderTarget<'_>,
+    viewport: Viewport,
+) {
+    let b = lights_of.background;
+    target.clear_partially(
+        ScissorBox::from(viewport),
+        ClearState::color_and_depth(
+            b.r as f32 / 255.0,
+            b.g as f32 / 255.0,
+            b.b as f32 / 255.0,
+            1.0,
+            1.0,
+        ),
+    );
+    let mut lights: Vec<&dyn three_d::Light> = Vec::new();
+    lights.extend(lights_of.ambient.iter().map(|l| l as &dyn three_d::Light));
+    lights.extend(
+        lights_of
+            .directional
+            .iter()
+            .map(|l| l as &dyn three_d::Light),
+    );
+    lights.extend(lights_of.point.iter().map(|l| l as &dyn three_d::Light));
+    lights.extend(lights_of.spot.iter().map(|l| l as &dyn three_d::Light));
+    camera.tone_mapping = match tone {
+        ToneCurve::Aces => three_d::ToneMapping::Aces,
+        ToneCurve::Reinhard => three_d::ToneMapping::Reinhard,
+        ToneCurve::Clamp => three_d::ToneMapping::None,
+    };
+    // The camera draws into the host's viewport, picking and walking keep the view's own
+    let own = camera.viewport();
+    camera.set_viewport(viewport);
+    target.render(&*camera, groups.iter().map(|g| &g.gm), &lights);
+    camera.set_viewport(own);
 }
 
 fn view_camera(spec: &CameraSpec, width: u32, height: u32) -> Camera {
