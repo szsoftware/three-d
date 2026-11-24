@@ -82,6 +82,35 @@ pub enum UiInput {
     },
     /// The input method stopped.
     ImeEnd,
+    /// A finger on a touch screen, as Compose's pointer events of type touch. The first finger also moves egui's pointer
+    /// (a tap clicks, a long touch opens a context menu); two fingers zoom, turn and move ([crate::UiEvent::Gesture],
+    /// a [crate::Widget::Scene], a [crate::Widget::Plot]).
+    Touch {
+        /// The finger, the same from its start to its end.
+        id: u64,
+        /// Down, moved, up or taken away by the system.
+        phase: UiTouchPhase,
+        /// x in pixels from the left.
+        x: f32,
+        /// y in pixels from the top.
+        y: f32,
+        /// How hard, from 0 to 1, if the screen knows.
+        #[uniffi(default)]
+        force: Option<f32>,
+    },
+}
+
+/// Where a finger is in [UiInput::Touch].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum UiTouchPhase {
+    /// It came down.
+    Start,
+    /// It moved.
+    Move,
+    /// It came up.
+    End,
+    /// The system took it away (a gesture of the system).
+    Cancel,
 }
 
 /// What the overlay asks of the platform beyond egui's events: the clipboard's text.
@@ -97,6 +126,8 @@ pub(crate) struct Held {
     control: bool,
     alt: bool,
     meta: bool,
+    /// The finger that moves the pointer, as egui-winit has it: the first one down.
+    finger: Option<u64>,
 }
 
 impl Held {
@@ -203,6 +234,52 @@ impl Held {
             UiInput::ImeCompose { text } => egui::Event::Ime(egui::ImeEvent::Preedit(text)),
             UiInput::ImeCommit { text } => egui::Event::Ime(egui::ImeEvent::Commit(text)),
             UiInput::ImeEnd => egui::Event::Ime(egui::ImeEvent::Disabled),
+            UiInput::Touch {
+                id,
+                phase,
+                x,
+                y,
+                force,
+            } => {
+                let at = pos(x, y);
+                let mut events = vec![egui::Event::Touch {
+                    device_id: egui::TouchDeviceId(0),
+                    id: egui::TouchId(id),
+                    phase: match phase {
+                        UiTouchPhase::Start => egui::TouchPhase::Start,
+                        UiTouchPhase::Move => egui::TouchPhase::Move,
+                        UiTouchPhase::End => egui::TouchPhase::End,
+                        UiTouchPhase::Cancel => egui::TouchPhase::Cancel,
+                    },
+                    pos: at,
+                    force,
+                }];
+                let press = |pressed| egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers,
+                };
+                match phase {
+                    UiTouchPhase::Start if self.finger.is_none() => {
+                        self.finger = Some(id);
+                        events.extend([egui::Event::PointerMoved(at), press(true)]);
+                    }
+                    UiTouchPhase::Move if self.finger == Some(id) => {
+                        events.push(egui::Event::PointerMoved(at));
+                    }
+                    UiTouchPhase::End if self.finger == Some(id) => {
+                        self.finger = None;
+                        events.extend([press(false), egui::Event::PointerGone]);
+                    }
+                    UiTouchPhase::Cancel if self.finger == Some(id) => {
+                        self.finger = None;
+                        events.push(egui::Event::PointerGone);
+                    }
+                    _ => {}
+                }
+                return events;
+            }
         };
         vec![event]
     }

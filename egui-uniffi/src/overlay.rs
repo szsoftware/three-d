@@ -34,6 +34,8 @@ struct Shared {
     /// What egui asked of the platform since Kotlin last took it.
     output: UiOutput,
     pointer: Pointer,
+    /// The fingers down, whether each came down on egui.
+    fingers: std::collections::HashMap<u64, bool>,
     egui: Option<egui::Context>,
     pixels_per_point: f32,
     style: Option<UiStyle>,
@@ -75,6 +77,7 @@ impl Default for EguiOverlay {
                 held: Held::default(),
                 output: UiOutput::default(),
                 pointer: Pointer::Free,
+                fingers: Default::default(),
                 egui: None,
                 pixels_per_point: 1.0,
                 style: None,
@@ -362,6 +365,20 @@ impl Shared {
                 .as_ref()
                 .is_some_and(|egui| egui.egui_wants_keyboard_input()),
             UiInput::Leave => false,
+            // A finger belongs to egui if it came down on it, until it comes up
+            UiInput::Touch {
+                id, phase, x, y, ..
+            } => match phase {
+                crate::UiTouchPhase::Start => {
+                    let over = self.over(x / s, y / s);
+                    self.fingers.insert(id, over);
+                    over
+                }
+                crate::UiTouchPhase::Move => self.fingers.get(&id).copied().unwrap_or(false),
+                crate::UiTouchPhase::End | crate::UiTouchPhase::Cancel => {
+                    self.fingers.remove(&id).unwrap_or(false)
+                }
+            },
         }
     }
 

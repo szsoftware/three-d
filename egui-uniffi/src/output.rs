@@ -122,6 +122,48 @@ impl From<egui::CursorIcon> for UiCursor {
     }
 }
 
+impl From<UiCursor> for egui::CursorIcon {
+    fn from(cursor: UiCursor) -> Self {
+        match cursor {
+            UiCursor::Default => Self::Default,
+            UiCursor::None => Self::None,
+            UiCursor::ContextMenu => Self::ContextMenu,
+            UiCursor::Help => Self::Help,
+            UiCursor::PointingHand => Self::PointingHand,
+            UiCursor::Progress => Self::Progress,
+            UiCursor::Wait => Self::Wait,
+            UiCursor::Cell => Self::Cell,
+            UiCursor::Crosshair => Self::Crosshair,
+            UiCursor::Text => Self::Text,
+            UiCursor::VerticalText => Self::VerticalText,
+            UiCursor::Alias => Self::Alias,
+            UiCursor::Copy => Self::Copy,
+            UiCursor::Move => Self::Move,
+            UiCursor::NoDrop => Self::NoDrop,
+            UiCursor::NotAllowed => Self::NotAllowed,
+            UiCursor::Grab => Self::Grab,
+            UiCursor::Grabbing => Self::Grabbing,
+            UiCursor::AllScroll => Self::AllScroll,
+            UiCursor::ResizeHorizontal => Self::ResizeHorizontal,
+            UiCursor::ResizeNeSw => Self::ResizeNeSw,
+            UiCursor::ResizeNwSe => Self::ResizeNwSe,
+            UiCursor::ResizeVertical => Self::ResizeVertical,
+            UiCursor::ResizeEast => Self::ResizeEast,
+            UiCursor::ResizeSouthEast => Self::ResizeSouthEast,
+            UiCursor::ResizeSouth => Self::ResizeSouth,
+            UiCursor::ResizeSouthWest => Self::ResizeSouthWest,
+            UiCursor::ResizeWest => Self::ResizeWest,
+            UiCursor::ResizeNorthWest => Self::ResizeNorthWest,
+            UiCursor::ResizeNorth => Self::ResizeNorth,
+            UiCursor::ResizeNorthEast => Self::ResizeNorthEast,
+            UiCursor::ResizeColumn => Self::ResizeColumn,
+            UiCursor::ResizeRow => Self::ResizeRow,
+            UiCursor::ZoomIn => Self::ZoomIn,
+            UiCursor::ZoomOut => Self::ZoomOut,
+        }
+    }
+}
+
 /// A link the user clicked, for the application to open.
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct UiLink {

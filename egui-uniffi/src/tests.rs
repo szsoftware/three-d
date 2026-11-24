@@ -4273,3 +4273,484 @@ fn images_canvases_scenes_and_plot_items_that_cannot_work_are_refused_with_the_r
     ))))
     .contains("the image 'Bild' needs one point, it has 0 x and 0 y values"));
 }
+
+/// A text that does not take clicks itself (selectable text does).
+fn plain_text(id: u64, parent: u64, s: &str) -> UiNode {
+    node(
+        id,
+        Some(parent),
+        Widget::Text {
+            text: s.into(),
+            style: TextStyle::Body,
+            color: None,
+            spans: vec![],
+            wrap: None,
+            selectable: false,
+        },
+    )
+}
+
+fn reacting(node: UiNode, reactions: UiReactions) -> UiNode {
+    with(
+        node,
+        UiModifier {
+            reactions: Some(reactions),
+            ..Default::default()
+        },
+    )
+}
+
+#[test]
+fn any_node_reports_clicks_double_clicks_right_clicks_and_long_presses() {
+    let card = with(
+        node(2, Some(1), column()),
+        UiModifier {
+            padding: insets(12.0),
+            reactions: Some(UiReactions {
+                click: true,
+                double_click: true,
+                secondary_click: true,
+                long_press: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+    let mut run = Run::new(vec![
+        central(1),
+        card,
+        plain_text(3, 2, "Säule"),
+        button(4, 2, "Löschen"),
+    ]);
+    // On its text and in its padding the card takes the click, its button its own
+    run.click(3);
+    assert_eq!(run.state.take_events(), vec![UiEvent::Clicked { id: 2 }]);
+    let card = run.state.bounds[&2];
+    run.click_at(egui::pos2(card.x + 4.0, card.y + 4.0));
+    assert_eq!(run.state.take_events(), vec![UiEvent::Clicked { id: 2 }]);
+    run.click(4);
+    assert_eq!(run.state.take_events(), vec![UiEvent::Clicked { id: 4 }]);
+    // Twice quickly: two clicks, the second also a double click
+    run.time += 1.0;
+    let at = run.center(3);
+    run.frame(vec![egui::Event::PointerMoved(at)]);
+    for _ in 0..2 {
+        run.frame(vec![press(at, egui::PointerButton::Primary, true)]);
+        run.frame(vec![press(at, egui::PointerButton::Primary, false)]);
+    }
+    assert_eq!(
+        run.state.take_events(),
+        vec![
+            UiEvent::Clicked { id: 2 },
+            UiEvent::Clicked { id: 2 },
+            UiEvent::DoubleClicked { id: 2 }
+        ]
+    );
+    // The right button, where it was in the card
+    run.time += 1.0;
+    run.frame(vec![press(at, egui::PointerButton::Secondary, true)]);
+    run.frame(vec![press(at, egui::PointerButton::Secondary, false)]);
+    match run.state.take_events().as_slice() {
+        [UiEvent::SecondaryClicked { id: 2, point }] => assert!(
+            (point.x - (at.x - card.x) as f64).abs() < 1.0
+                && (point.y - (at.y - card.y) as f64).abs() < 1.0,
+            "{point:?}"
+        ),
+        events => panic!("{events:?}"),
+    }
+    // Held still for more than half a second: once, and egui asks for the frame when the time is up
+    run.time += 1.0;
+    let out = run.frame(vec![press(at, egui::PointerButton::Primary, true)]);
+    let asked = out.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+    assert!(asked.as_secs_f64() < 0.6, "{asked:?}");
+    for _ in 0..40 {
+        run.frame(vec![]);
+    }
+    run.frame(vec![press(at, egui::PointerButton::Primary, false)]);
+    let events = run.state.take_events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| **e == UiEvent::LongPressed { id: 2 })
+            .count(),
+        1,
+        "{events:?}"
+    );
+}
+
+#[test]
+fn nodes_report_the_pointer_dragging_and_gestures_also_with_fingers() {
+    let pad = reacting(
+        with(
+            node(2, Some(1), column()),
+            UiModifier {
+                width: Some(200.0),
+                height: Some(120.0),
+                ..Default::default()
+            },
+        ),
+        UiReactions {
+            hover: true,
+            drag: true,
+            gestures: true,
+            cursor: Some(crate::UiCursor::Crosshair),
+            ..Default::default()
+        },
+    );
+    let mut run = Run::new(vec![central(1), pad, plain_text(3, 2, "Plan")]);
+    let r = run.state.bounds[&2];
+    let mid = run.center(2);
+    let out = run.frame(vec![egui::Event::PointerMoved(mid)]);
+    assert_eq!(out.platform_output.cursor_icon, egui::CursorIcon::Crosshair);
+    assert_eq!(
+        run.state.take_events(),
+        vec![UiEvent::HoverChanged {
+            id: 2,
+            hovered: true
+        }]
+    );
+    // In and out before Kotlin took it: the newer value replaced the older one
+    run.frame(vec![egui::Event::PointerGone]);
+    run.frame(vec![egui::Event::PointerMoved(mid)]);
+    run.frame(vec![egui::Event::PointerMoved(egui::pos2(700.0, 500.0))]);
+    assert_eq!(
+        run.state.take_events(),
+        vec![UiEvent::HoverChanged {
+            id: 2,
+            hovered: false
+        }]
+    );
+    // A drag: its start, the moves with how far, its end
+    run.drag(
+        mid,
+        &[mid + egui::vec2(10.0, 0.0), mid + egui::vec2(30.0, 5.0)],
+    );
+    let drags: Vec<_> = run
+        .state
+        .take_events()
+        .into_iter()
+        .filter_map(|e| match e {
+            UiEvent::Dragged {
+                phase,
+                dx,
+                dy,
+                point,
+                ..
+            } => Some((phase, dx, dy, point)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        drags.first().map(|d| d.0),
+        Some(DragPhase::Started),
+        "{drags:?}"
+    );
+    assert_eq!(
+        drags.last().map(|d| d.0),
+        Some(DragPhase::Stopped),
+        "{drags:?}"
+    );
+    let (dx, dy) = drags
+        .iter()
+        .fold((0.0, 0.0), |(x, y), d| (x + d.1, y + d.2));
+    assert!(
+        (dx - 30.0).abs() < 0.5 && (dy - 5.0).abs() < 0.5,
+        "{drags:?}"
+    );
+    let end = drags.last().unwrap().3;
+    assert!(
+        (end.x - (mid.x + 30.0 - r.x) as f64).abs() < 1.0,
+        "{end:?} in {r:?}"
+    );
+    // Ctrl and the wheel zoom
+    run.frame(vec![
+        egui::Event::PointerMoved(mid),
+        egui::Event::Zoom(1.25),
+    ]);
+    let events = run.state.take_events();
+    assert!(
+        events.iter().any(
+            |e| matches!(e, UiEvent::Gesture { id: 2, zoom, .. } if (zoom - 1.25).abs() < 1e-4)
+        ),
+        "{events:?}"
+    );
+    // Two fingers move apart from 20 to 40 points: it zooms in (egui counts from the frame after both are down)
+    let mut held = crate::input::Held::default();
+    let mut wanted = crate::input::Wanted::default();
+    let mut touch = |run: &mut Run, fingers: &[(u64, crate::UiTouchPhase, f32)]| {
+        let events = fingers
+            .iter()
+            .flat_map(|&(id, phase, x)| {
+                held.events(
+                    UiInput::Touch {
+                        id,
+                        phase,
+                        x: mid.x + x,
+                        y: mid.y,
+                        force: None,
+                    },
+                    1.0,
+                    &mut wanted,
+                )
+            })
+            .collect();
+        run.frame(events);
+    };
+    use crate::UiTouchPhase::{End, Move, Start};
+    touch(&mut run, &[(1, Start, -10.0), (2, Start, 10.0)]);
+    for step in 1..=5 {
+        let d = 10.0 + 2.0 * step as f32;
+        touch(&mut run, &[(1, Move, -d), (2, Move, d)]);
+    }
+    touch(&mut run, &[(1, End, -20.0), (2, End, 20.0)]);
+    let events = run.state.take_events();
+    let zoom: f32 = events
+        .iter()
+        .filter_map(|e| match e {
+            UiEvent::Gesture { zoom, .. } => Some(*zoom),
+            _ => None,
+        })
+        .product();
+    assert!(zoom > 1.5 && zoom < 2.05, "{zoom}");
+    // Two fingers do not drag it, though egui's pointer follows the first one
+    assert!(
+        !events.iter().any(|e| matches!(e, UiEvent::Dragged { .. })),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn a_node_dragged_onto_a_list_that_takes_its_kind_is_dropped_before_a_place() {
+    let source = |id, s| {
+        reacting(
+            plain_text(id, 2, s),
+            UiReactions {
+                drag_kind: Some("zeile".into()),
+                ..Default::default()
+            },
+        )
+    };
+    let mut run = Run::new(vec![
+        central(1),
+        reacting(
+            node(2, Some(1), column()),
+            UiReactions {
+                drop_kinds: Some(vec!["zeile".into()]),
+                ..Default::default()
+            },
+        ),
+        source(3, "Säule"),
+        source(4, "Brunnen"),
+        source(5, "Dach"),
+        reacting(
+            with(
+                node(6, Some(1), column()),
+                UiModifier {
+                    height: Some(80.0),
+                    width: Some(200.0),
+                    ..Default::default()
+                },
+            ),
+            UiReactions {
+                drop_kinds: Some(vec!["material".into()]),
+                ..Default::default()
+            },
+        ),
+        plain_text(7, 6, "Materialien"),
+    ]);
+    let drag = |run: &mut Run, to: egui::Pos2| {
+        let from = run.center(3);
+        let steps: Vec<_> = (1..=6)
+            .map(|i| from + (to - from) * (i as f32 / 6.0))
+            .collect();
+        run.drag(from, &steps);
+        run.frame(vec![]);
+    };
+    // Below the last row: it goes to the end
+    let last = run.state.bounds[&5];
+    drag(
+        &mut run,
+        egui::pos2(last.x + 10.0, last.y + last.height - 2.0),
+    );
+    assert_eq!(
+        run.state.take_events(),
+        vec![UiEvent::Dropped {
+            id: 2,
+            source: 3,
+            index: Some(3)
+        }]
+    );
+    // Between the second and the third
+    let third = run.state.bounds[&5];
+    drag(&mut run, egui::pos2(third.x + 10.0, third.y + 1.0));
+    assert_eq!(
+        run.state.take_events(),
+        vec![UiEvent::Dropped {
+            id: 2,
+            source: 3,
+            index: Some(2)
+        }]
+    );
+    // A list of another kind does not take it
+    let other = run.center(6);
+    drag(&mut run, other);
+    assert_eq!(run.state.take_events(), vec![]);
+}
+
+#[test]
+fn selectable_text_in_a_dragged_node_drags_the_node_and_its_clicks_stay_with_it() {
+    // Cards of a list as in the outliner: selectable text inside, dragged onto the list, opened with a double click
+    let card = |id| {
+        reacting(
+            node(id, Some(2), row()),
+            UiReactions {
+                double_click: true,
+                drag_kind: Some("objekt".into()),
+                ..Default::default()
+            },
+        )
+    };
+    let pad = reacting(
+        with(
+            node(9, Some(1), column()),
+            UiModifier {
+                width: Some(200.0),
+                height: Some(60.0),
+                ..Default::default()
+            },
+        ),
+        UiReactions {
+            drag: true,
+            ..Default::default()
+        },
+    );
+    let mut run = Run::new(vec![
+        central(1),
+        reacting(
+            node(2, Some(1), column()),
+            UiReactions {
+                drop_kinds: Some(vec!["objekt".into()]),
+                ..Default::default()
+            },
+        ),
+        card(3),
+        text(4, 3, "Brunnen"),
+        card(5),
+        text(6, 5, "Rasen"),
+        pad,
+        text(10, 9, "Drehung 0°"),
+    ]);
+    let from = run.center(4);
+    let last = run.state.bounds[&5];
+    let to = egui::pos2(from.x + 10.0, last.y + last.height - 2.0);
+    let steps: Vec<_> = (1..=6)
+        .map(|i| from + (to - from) * (i as f32 / 6.0))
+        .collect();
+    run.drag(from, &steps);
+    run.frame(vec![]);
+    assert_eq!(
+        run.state.take_events(),
+        vec![UiEvent::Dropped {
+            id: 2,
+            source: 3,
+            index: Some(2)
+        }]
+    );
+    run.time += 1.0;
+    let at = run.center(6);
+    run.frame(vec![egui::Event::PointerMoved(at)]);
+    for _ in 0..2 {
+        run.frame(vec![press(at, egui::PointerButton::Primary, true)]);
+        run.frame(vec![press(at, egui::PointerButton::Primary, false)]);
+    }
+    assert_eq!(
+        run.state.take_events(),
+        vec![UiEvent::DoubleClicked { id: 5 }]
+    );
+    // The pad turns when its text is dragged
+    let from = run.center(10);
+    run.drag(
+        from,
+        &[from + egui::vec2(30.0, 0.0), from + egui::vec2(60.0, 0.0)],
+    );
+    let events = run.state.take_events();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            UiEvent::Dragged {
+                id: 9,
+                phase: DragPhase::Started,
+                ..
+            }
+        )),
+        "{events:?}"
+    );
+    let moved: f32 = events
+        .iter()
+        .filter_map(|e| match e {
+            UiEvent::Dragged { id: 9, dx, .. } => Some(*dx),
+            _ => None,
+        })
+        .sum();
+    assert!((moved - 60.0).abs() < 1.0, "{events:?}");
+}
+
+#[test]
+fn a_finger_held_still_is_one_long_press_or_a_right_click() {
+    let mut run = Run::new(vec![
+        central(1),
+        reacting(
+            with(
+                node(2, Some(1), column()),
+                UiModifier {
+                    width: Some(200.0),
+                    height: Some(60.0),
+                    ..Default::default()
+                },
+            ),
+            UiReactions {
+                long_press: true,
+                secondary_click: true,
+                ..Default::default()
+            },
+        ),
+        plain_text(3, 2, "Vorschau"),
+        reacting(
+            plain_text(4, 1, "Brunnen"),
+            UiReactions {
+                secondary_click: true,
+                ..Default::default()
+            },
+        ),
+    ]);
+    let mut held = crate::input::Held::default();
+    let mut wanted = crate::input::Wanted::default();
+    // A second, past egui's own long touch (0.8 s) that takes the press
+    let mut hold = |run: &mut Run, at: egui::Pos2| {
+        let mut finger = |run: &mut Run, phase| {
+            let input = UiInput::Touch {
+                id: 7,
+                phase,
+                x: at.x,
+                y: at.y,
+                force: None,
+            };
+            let events = held.events(input, 1.0, &mut wanted);
+            run.frame(events)
+        };
+        finger(run, crate::UiTouchPhase::Start);
+        for _ in 0..60 {
+            run.frame(vec![]);
+        }
+        finger(run, crate::UiTouchPhase::End);
+        run.frame(vec![]);
+        run.state.take_events()
+    };
+    let at = run.center(2);
+    assert_eq!(hold(&mut run, at), vec![UiEvent::LongPressed { id: 2 }]);
+    let at = run.center(4);
+    match hold(&mut run, at).as_slice() {
+        [UiEvent::SecondaryClicked { id: 4, .. }] => {}
+        events => panic!("{events:?}"),
+    }
+}

@@ -91,6 +91,31 @@ pub enum InputEvent {
         /// Down or up.
         down: bool,
     },
+    /// A finger on a touch screen. The overlay gets it first (taps, long touches, two fingers that zoom); else the first
+    /// finger moves the camera as the left button does.
+    Touch {
+        /// The finger, the same from its start to its end.
+        id: u64,
+        /// Down, moved, up or taken away by the system.
+        phase: TouchPhase,
+        /// x in pixels from the left.
+        x: f32,
+        /// y in pixels from the top.
+        y: f32,
+    },
+}
+
+/// Where a finger is in [InputEvent::Touch].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum TouchPhase {
+    /// It came down.
+    Start,
+    /// It moved.
+    Move,
+    /// It came up.
+    End,
+    /// The system took it away.
+    Cancel,
 }
 
 impl InputEvent {
@@ -108,6 +133,18 @@ impl InputEvent {
                 dy: delta,
             },
             Self::Key { key, down } => UiInput::Key { key, down },
+            Self::Touch { id, phase, x, y } => UiInput::Touch {
+                id,
+                phase: match phase {
+                    TouchPhase::Start => three_d_egui_uniffi::UiTouchPhase::Start,
+                    TouchPhase::Move => three_d_egui_uniffi::UiTouchPhase::Move,
+                    TouchPhase::End => three_d_egui_uniffi::UiTouchPhase::End,
+                    TouchPhase::Cancel => three_d_egui_uniffi::UiTouchPhase::Cancel,
+                },
+                x,
+                y,
+                force: None,
+            },
         }
     }
 }
@@ -153,6 +190,8 @@ struct ViewState {
     orbit: OrbitControl,
     fly: FlyControl,
     keys: HashSet<String>,
+    /// The finger that moves the camera, where it was last.
+    finger: Option<(u64, f32, f32)>,
     width: u32,
     height: u32,
     color: Texture2D,
@@ -215,6 +254,7 @@ impl Renderer {
                 max_distance: 500.0,
             },
             keys: HashSet::new(),
+            finger: None,
             camera: cam,
             width,
             height,
@@ -596,6 +636,38 @@ impl ViewState {
                 }
                 return matches!(self.navigation, Navigation::Walk { .. }) && !self.keys.is_empty();
             }
+            // The first finger as the left button
+            InputEvent::Touch { id, phase, x, y } => match (phase, self.finger) {
+                (TouchPhase::Start, None) => {
+                    self.finger = Some((id, x, y));
+                    Event::MousePress {
+                        button: MouseButton::Left,
+                        position: point(x, y),
+                        modifiers,
+                        handled: false,
+                    }
+                }
+                (TouchPhase::Move, Some((f, fx, fy))) if f == id => {
+                    self.finger = Some((id, x, y));
+                    Event::MouseMotion {
+                        button: Some(MouseButton::Left),
+                        delta: (x - fx, y - fy),
+                        position: point(x, y),
+                        modifiers,
+                        handled: false,
+                    }
+                }
+                (TouchPhase::End | TouchPhase::Cancel, Some((f, _, _))) if f == id => {
+                    self.finger = None;
+                    Event::MouseRelease {
+                        button: MouseButton::Left,
+                        position: point(x, y),
+                        modifiers,
+                        handled: false,
+                    }
+                }
+                _ => return false,
+            },
         };
         let mut events = [e];
         let moved = match self.navigation {

@@ -31,6 +31,7 @@ pub(crate) fn draw(ui: &mut Ui, state: &mut UiState) {
         state,
         watched: Vec::new(),
         scenes: 0,
+        drop_claimed: false,
     };
     for &root in &tree.roots {
         let node = &tree.nodes[root];
@@ -120,6 +121,8 @@ struct Frame<'a> {
     watched: Vec<(u64, Id)>,
     /// How many scenes the node drawn now is in: its rectangle is not where it is seen.
     scenes: usize,
+    /// A target of drag and drop under the pointer took what is dragged: the targets around it leave it.
+    drop_claimed: bool,
 }
 
 impl Frame<'_> {
@@ -400,6 +403,18 @@ impl Frame<'_> {
                 .layout(ui.layout().with_cross_align(egui::Align::Min));
             align = None;
         }
+        // Reactions: the scope senses them before the nodes inside, which so keep what they sense themselves
+        let reactions = modifier.and_then(|m| m.reactions.as_ref());
+        let mut lifted = None;
+        if let Some(r) = reactions {
+            builder = builder.sense(crate::reactions::sense(r));
+            lifted = crate::reactions::lifted(ui, node, r);
+            if let Some(layer) = lifted {
+                builder = builder.layer_id(layer);
+            }
+        }
+        // Text in what is dragged is not selectable: pressing on it and moving drags the node, as in egui's drag source
+        let dragged = reactions.is_some_and(|r| r.drag || r.drag_kind.is_some());
         let scope = ui.scope_builder(builder, |ui| match modifier {
             // A button wider than its text has it in the middle, as in Compose
             Some(m) => modified(
@@ -412,7 +427,12 @@ impl Frame<'_> {
                         | Widget::ToggleButton { .. }
                 ),
                 align,
-                |ui| self.widget(ui, node),
+                |ui| {
+                    if dragged {
+                        ui.style_mut().interaction.selectable_labels = false;
+                    }
+                    self.widget(ui, node)
+                },
             ),
             None => self.widget(ui, node),
         });
@@ -433,6 +453,18 @@ impl Frame<'_> {
                 .layer_transform_to_global(ui.layer_id())
                 .map_or(rect, |t| t * rect);
             self.state.screen_bounds.insert(node.id, seen.into());
+        }
+        if let Some(r) = reactions {
+            crate::reactions::react(
+                ui,
+                self.state,
+                self.tree,
+                node,
+                &scope.response,
+                r,
+                lifted,
+                &mut self.drop_claimed,
+            );
         }
         let response = scope.inner.unwrap_or(scope.response);
         if self.state.focus == Some(Focus::Node(node.id)) {
