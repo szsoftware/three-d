@@ -464,7 +464,7 @@ fn a_closed_window_reports_it_and_stays_hidden_until_kotlin_answers() {
                 resizable: false,
                 height: None,
                 anchor: None,
-                movable: true,
+                movable: None,
                 title_bar: true,
                 fixed_size: false,
                 scroll: false,
@@ -1520,7 +1520,7 @@ fn windows_are_pinned_sized_without_a_title_and_closed_by_kotlin() {
                 resizable: false,
                 height: Some(100.0),
                 anchor: Some(Anchor::BottomRight),
-                movable: true,
+                movable: None,
                 title_bar,
                 fixed_size: true,
                 scroll: false,
@@ -1555,6 +1555,87 @@ fn windows_are_pinned_sized_without_a_title_and_closed_by_kotlin() {
     settle(&mut run);
     assert!(!run.state.bounds.contains_key(&1));
     assert_eq!(run.state.take_events(), vec![]);
+}
+
+#[test]
+fn an_anchored_window_starts_at_its_corner_and_moves_when_it_may() {
+    let window = |anchor, movable| {
+        node(
+            1,
+            None,
+            Widget::Window {
+                title: "Benchmark".into(),
+                x: 12.0,
+                y: -12.0,
+                width: Some(220.0),
+                closable: false,
+                collapsible: false,
+                resizable: true,
+                height: None,
+                anchor,
+                movable,
+                title_bar: true,
+                fixed_size: false,
+                scroll: false,
+                open: true,
+            },
+        )
+    };
+    let lines = |n: u64| (0..n).map(|i| text(2 + i, 1, &format!("Line {i}")));
+    let settle = |run: &mut Run| {
+        for _ in 0..20 {
+            run.frame(vec![]);
+        }
+    };
+    let drag_title = |run: &mut Run| {
+        let w = run.state.bounds[&1];
+        let from = egui::pos2(w.x + 40.0, w.y + 8.0);
+        let to: Vec<_> = (1..=10)
+            .map(|i| from + egui::vec2(10.0 * i as f32, -5.0 * i as f32))
+            .collect();
+        run.drag(from, &to);
+        settle(run);
+        (w, run.state.bounds[&1])
+    };
+    // Movable as well: it starts with its lower left corner 12 points from the corner of the picture, also while egui
+    // still measures its height, and the user moves it from there
+    let tree = |n| {
+        let mut nodes = vec![window(Some(Anchor::BottomLeft), Some(true))];
+        nodes.extend(lines(n));
+        nodes
+    };
+    let mut run = Run::new(tree(12));
+    settle(&mut run);
+    let w = run.state.bounds[&1];
+    assert!(
+        (w.x - 12.0).abs() < 1.0 && (bottom(w) - 588.0).abs() < 1.0,
+        "{w:?}"
+    );
+    let (before, after) = drag_title(&mut run);
+    assert!(
+        (after.x - before.x - 100.0).abs() < 2.0 && (before.y - after.y - 50.0).abs() < 2.0,
+        "{before:?} {after:?}"
+    );
+    // Kotlin's next tree with more lines does not take it back to the corner
+    run.state.set_tree(tree(14)).unwrap();
+    settle(&mut run);
+    let grown = run.state.bounds[&1];
+    assert!((grown.x - after.x).abs() < 1.0, "{after:?} {grown:?}");
+    // Only anchored it stays in the corner
+    let mut nodes = vec![window(Some(Anchor::BottomLeft), None)];
+    nodes.extend(lines(12));
+    let mut run = Run::new(nodes);
+    settle(&mut run);
+    let (before, after) = drag_title(&mut run);
+    assert_eq!(before, after);
+    assert!((bottom(after) - 588.0).abs() < 1.0, "{after:?}");
+    // Without an anchor movable is the default, and `Some(false)` keeps it where it is
+    let mut nodes = vec![window(None, Some(false))];
+    nodes.extend(lines(3));
+    let mut run = Run::new(nodes);
+    settle(&mut run);
+    let (before, after) = drag_title(&mut run);
+    assert_eq!(before, after);
 }
 
 #[test]
@@ -3603,7 +3684,7 @@ fn a_resizable_table_in_a_new_window_takes_its_widths_after_the_first_frame() {
             resizable: false,
             height: Some(330.0),
             anchor: Some(Anchor::TopRight),
-            movable: true,
+            movable: None,
             title_bar: true,
             fixed_size: true,
             scroll: false,

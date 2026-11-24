@@ -246,14 +246,22 @@ impl Frame<'_> {
                     return;
                 }
                 let mut open = *kotlin_open;
+                let movable = movable.unwrap_or(anchor.is_none());
                 let mut window = egui::Window::new(title.as_str())
                     .id(id)
                     .collapsible(*collapsible)
                     .resizable(*resizable && !*fixed_size)
-                    .movable(*movable)
+                    .movable(movable)
                     .title_bar(*title_bar)
                     .vscroll(*scroll);
                 window = match anchor {
+                    // egui's anchor would pin it: it starts with that corner at the anchor's place and is the user's
+                    // from then on (the corner stays while egui measures it)
+                    Some(anchor) if movable => {
+                        let corner = align2(*anchor);
+                        let at = corner.pos_in_rect(&ui.ctx().content_rect()) + egui::vec2(*x, *y);
+                        window.pivot(corner).default_pos(at)
+                    }
                     Some(anchor) => window.anchor(align2(*anchor), [*x, *y]),
                     None => window.default_pos([*x, *y]),
                 };

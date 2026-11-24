@@ -75,7 +75,8 @@ node at the left and its second at the right edge, `Indent` moves its nodes in, 
 Panels fold away animated with `expanded = false`; side panels have `min_width` and `max_width`. A `CentralPanel` takes
 what the others leave; without its `frame` the picture shows through and only its nodes cover it. Windows may be pinned
 (`anchor`, `x` and `y` as the distance), have a `fixed_size`, no `title_bar`, `scroll`, not be `movable`, and
-`open = false` fades them out without an event. `ScrollArea` scrolls up and down, sideways or both, and with
+`open = false` fades them out without an event. An `anchor` with `movable = true` only gives the place to start: that
+corner of the window sits there (also while egui still measures it), and the user moves it from there. `ScrollArea` scrolls up and down, sideways or both, and with
 `stick_to_end` stays at the end while nodes come in, as a log. `Grid` has `column_spacing`, `row_spacing` and
 `min_column_width`.
 
