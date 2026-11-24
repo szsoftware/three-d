@@ -1,10 +1,11 @@
 //! The tree drawn with egui, in immediate mode, every frame.
 
-use crate::state::{Local, UiState};
+use crate::state::{Local, UiRect, UiState};
 use crate::{
     Anchor, Arrangement, NoticeLevel, PlotSeries, ScrollDirection, SeriesKind, Side, TextSpan,
     TextStyle, Tree, UiEvent, UiInsets, UiModifier, UiNode, Widget,
 };
+use std::collections::HashMap;
 use three_d::egui::{self, Color32, Id, Layout, Response, RichText, Ui, UiBuilder};
 
 /// Draws the whole tree onto the root `ui` of a frame and notes what the user did in `state`.
@@ -252,11 +253,24 @@ impl Frame<'_> {
         if modifier.is_some_and(|m| m.invisible) {
             builder = builder.invisible();
         }
+        let mut align = modifier.and_then(|m| m.align).map(egui::Align::from);
+        let placed = self.across(ui, node);
+        if let Some((rect, _)) = placed {
+            // Placed across already: from the top of its room on
+            builder = builder
+                .max_rect(rect)
+                .layout(ui.layout().with_cross_align(egui::Align::Min));
+            align = None;
+        }
         let scope = ui.scope_builder(builder, |ui| match modifier {
             // A button wider than its text has it in the middle, as in Compose
-            Some(m) => modified(ui, m, matches!(node.widget, Widget::Button { .. }), |ui| {
-                self.widget(ui, node)
-            }),
+            Some(m) => modified(
+                ui,
+                m,
+                matches!(node.widget, Widget::Button { .. }),
+                align,
+                |ui| self.widget(ui, node),
+            ),
             None => self.widget(ui, node),
         });
         // With a modifier the node is all of it, its frame too
@@ -264,8 +278,53 @@ impl Frame<'_> {
             (None, Some(r)) => r.rect,
             _ => scope.response.rect,
         };
+        if placed.is_some_and(|(_, last)| (rect.height() - last).abs() > 0.5) {
+            ui.ctx()
+                .request_discard("a node in a row changed its height");
+        }
         self.state.bounds.insert(node.id, rect.into());
         tooltip(scope.inner.unwrap_or(scope.response), node);
+    }
+
+    /// Where a node goes in a row that has its nodes in the middle or at the bottom, and its height of the last pass.
+    ///
+    /// egui puts a node across before the node has its height, which it knows beforehand only for a single widget: a
+    /// button lands in the middle, but a column, a frame or a button with a size would start at the middle and hang
+    /// down. They go where their height of the last pass puts them (the first pass is redone). `None`: egui places it.
+    fn across(&self, ui: &Ui, node: &UiNode) -> Option<(egui::Rect, f32)> {
+        use egui::emath::GuiRounding;
+        let layout = ui.layout();
+        let m = node.modifier.as_ref();
+        let cross = m
+            .and_then(|m| m.align)
+            .map_or(layout.cross_align, Into::into);
+        // What fills the height takes the row as it is
+        let measured = (node.widget.is_container()
+            || m.is_some_and(|m| m.has_frame() || m.has_size()))
+            && !m.is_some_and(|m| m.fill_height);
+        if !layout.is_horizontal() || layout.cross_justify || cross == egui::Align::Min || !measured
+        {
+            return None;
+        }
+        let Some(last) = self.state.previous.get(&node.id).map(|r| r.height) else {
+            ui.ctx()
+                .request_discard("a node in a row has no height yet");
+            return None;
+        };
+        let row = ui.available_rect_before_wrap();
+        let room = row.height() - last;
+        let top = row.min.y
+            + match cross {
+                egui::Align::Center => room / 2.0,
+                _ => room,
+            }
+            .max(0.0);
+        // Down to the bottom of the row at least, so that it has the room it had
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(row.min.x, top),
+            egui::pos2(row.max.x, row.max.y.max(top + last)),
+        );
+        Some((rect.round_ui(), last))
     }
 
     /// The nodes of a row or a column in their order, gathered at the start, in the middle or at the end.
@@ -297,9 +356,23 @@ impl Frame<'_> {
         }
         .with_main_wrap(wrap);
         // As egui's horizontal and vertical: a row as high as a button to start with, a column as wide as its container;
-        // at the bottom a column needs all the height
+        // at the bottom a column needs all the height. A row that does not wrap is as high as its highest node of the
+        // last pass, so that the nodes before it are in the middle as well
+        let button = ui.spacing().interact_size.y;
+        let tree = self.tree;
+        let tallest = |bounds: &HashMap<u64, UiRect>| {
+            tree.children(node.id)
+                .iter()
+                .filter_map(|&c| bounds.get(&tree.nodes[c].id))
+                .fold(button, |h, r| h.max(r.height))
+        };
+        let high = if horizontal && !wrap {
+            tallest(&self.state.previous)
+        } else {
+            button
+        };
         let initial = match (horizontal, end) {
-            (true, _) => egui::vec2(available.x, ui.spacing().interact_size.y),
+            (true, _) => egui::vec2(available.x, high),
             (false, false) => egui::vec2(available.x, 0.0),
             (false, true) => available,
         };
@@ -310,7 +383,6 @@ impl Frame<'_> {
         } else {
             None
         };
-        let tree = self.tree;
         let r = ui.allocate_ui_with_layout(initial, layout, |ui| {
             if let Some(s) = spacing {
                 if horizontal {
@@ -361,6 +433,9 @@ impl Frame<'_> {
                 rect.max.y - start
             }
         });
+        if horizontal && !wrap && (tallest(&self.state.bounds) - high).abs() > 0.5 {
+            ui.ctx().request_discard("a row changed its height");
+        }
         if arrangement == Arrangement::Center {
             let length = r.inner;
             if before.is_none_or(|b| (b - length).abs() > 0.5) {
@@ -804,14 +879,21 @@ fn span_text(span: &TextSpan, style: TextStyle, color: Option<u32>) -> RichText 
 
 /// A node with its modifier: its opacity, its place across its container, its frame and its size.
 /// `centered`: a fixed size puts the content in the middle (a button's text).
-fn modified<R>(ui: &mut Ui, m: &UiModifier, centered: bool, add: impl FnOnce(&mut Ui) -> R) -> R {
+/// `align`: its place across, unless it was placed already.
+fn modified<R>(
+    ui: &mut Ui,
+    m: &UiModifier,
+    centered: bool,
+    align: Option<egui::Align>,
+    add: impl FnOnce(&mut Ui) -> R,
+) -> R {
     if let Some(opacity) = m.opacity {
         ui.multiply_opacity(opacity);
     }
-    match m.align {
+    match align {
         // The container's direction with another place across it
         Some(align) => {
-            let layout = ui.layout().with_cross_align(align.into());
+            let layout = ui.layout().with_cross_align(align);
             ui.with_layout(layout, |ui| framed(ui, m, centered, add))
                 .inner
         }

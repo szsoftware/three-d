@@ -52,7 +52,10 @@ node's `bounds` include its frame.
 
 `Row` and `Column` take `align` (across), `arrangement` (start, center or end along them, in their order) and `spacing`;
 a row may `wrap` into lines, it decides with the sizes of the frame before. The middle needs the length of the frame
-before as well (egui lays out in one go): the first frame is laid out twice. The middle and the end of a `Column` need a
+before as well (egui lays out in one go): the first frame is laid out twice. Across a row, egui knows the height of a
+single widget before it places it, but not of a column, a frame or a widget with a size: these sit in the middle (or at the
+bottom) by their height of the frame before, and a row that does not wrap is as high as its highest node from the start, so
+that all its nodes line up. The middle and the end of a `Column` need a
 known height (a panel), not a `ScrollArea`. `Columns` puts each node in a column of the same width, `Sides` its first
 node at the left and its second at the right edge, `Indent` moves its nodes in, `Resize` has a corner to drag.
 

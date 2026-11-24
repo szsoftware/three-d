@@ -1183,6 +1183,87 @@ fn rows_gather_their_nodes_at_the_start_in_the_middle_or_at_the_end() {
 }
 
 #[test]
+fn nodes_in_a_row_line_up_in_the_middle_or_at_the_bottom_whatever_they_are() {
+    let bottom_row = Widget::Row {
+        wrap: false,
+        align: Some(Align::End),
+        arrangement: None,
+        spacing: None,
+    };
+    let nodes = vec![
+        central(1),
+        // A button with a size next to one without, at the end (the settings' Reset and Apply)
+        node(10, Some(1), flow_row(Some(Arrangement::End), false, None)),
+        button(11, 10, "Reset"),
+        with(
+            button(12, 10, "Apply"),
+            UiModifier {
+                width: Some(110.0),
+                ..Default::default()
+            },
+        ),
+        // A button before a column of two lines and a framed button
+        node(20, Some(1), row()),
+        button(21, 20, "Short"),
+        node(22, Some(20), column()),
+        text(23, 22, "One"),
+        text(24, 22, "Two"),
+        with(
+            button(25, 20, "Framed"),
+            UiModifier {
+                background: Some(0xFF1F4E79),
+                padding: insets(6.0),
+                ..Default::default()
+            },
+        ),
+        // At the bottom
+        node(30, Some(1), bottom_row),
+        button(31, 30, "Low"),
+        node(32, Some(30), column()),
+        text(33, 32, "One"),
+        text(34, 32, "Two"),
+    ];
+    let run = Run::new(nodes);
+    let b = |id: u64| run.state.bounds[&id];
+    let middle = |id: u64| run.center(id).y;
+    assert!((b(12).width - 110.0).abs() < 0.5, "{:?}", b(12));
+    assert!(
+        (b(11).y - b(12).y).abs() < 0.5 && (b(11).height - b(12).height).abs() < 0.5,
+        "{:?} {:?}",
+        b(11),
+        b(12)
+    );
+    // The column is as high as two lines, the row as high as it: nothing hangs down
+    assert!(b(22).height > 1.5 * b(21).height, "{:?}", b(22));
+    assert!(
+        (b(20).height - b(22).height).abs() < 0.5,
+        "{:?} {:?}",
+        b(20),
+        b(22)
+    );
+    for id in [21, 25] {
+        assert!(
+            (middle(id) - middle(22)).abs() < 1.0,
+            "{id}: {:?} {:?}",
+            b(id),
+            b(22)
+        );
+    }
+    assert!(
+        (bottom(b(31)) - bottom(b(32))).abs() < 1.0,
+        "{:?} {:?}",
+        b(31),
+        b(32)
+    );
+    assert!(
+        (b(30).height - b(32).height).abs() < 0.5,
+        "{:?} {:?}",
+        b(30),
+        b(32)
+    );
+}
+
+#[test]
 fn columns_gather_their_nodes_across_and_along() {
     let column_with = |align, arrangement| Widget::Column {
         align,
