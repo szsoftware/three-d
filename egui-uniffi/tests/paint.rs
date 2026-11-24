@@ -1093,3 +1093,118 @@ fn switches_pickers_and_code_of_the_second_phase() {
         release(context);
     }
 }
+
+#[test]
+fn an_open_menu_and_a_modal_lie_over_the_picture() {
+    let item = |id, parent, text: &str, shortcut: Option<&str>| {
+        node(
+            id,
+            Some(parent),
+            Widget::Button {
+                text: text.into(),
+                small: false,
+                frame: true,
+                selected: false,
+                shortcut: shortcut.map(Into::into),
+                fill: None,
+            },
+        )
+    };
+    let menus = vec![
+        node(1, None, Widget::TopBar { expanded: true }),
+        node(2, Some(1), Widget::MenuBar),
+        node(
+            3,
+            Some(2),
+            Widget::Menu {
+                text: "Datei".into(),
+            },
+        ),
+        item(4, 3, "Speichern", Some("Ctrl+S")),
+        item(5, 3, "Schließen", None),
+        node(
+            6,
+            Some(2),
+            Widget::Menu {
+                text: "Ansicht".into(),
+            },
+        ),
+        item(7, 6, "Oben", None),
+    ];
+    let save = |name: &str, picture: &[[u8; 4]]| {
+        if let Some(dir) = std::env::var_os("THREE_D_EGUI_PICTURE") {
+            let bytes: Vec<u8> = picture.iter().flatten().copied().collect();
+            std::fs::write(std::path::Path::new(&dir).join(name), bytes).unwrap();
+        }
+    };
+    let settle = |context: &Context, overlay: &EguiOverlay| {
+        for _ in 0..100 {
+            frame(context, overlay);
+            if !overlay.needs_repaint() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        frame(context, overlay)
+    };
+    for (name, context) in contexts() {
+        let overlay = EguiOverlay::new();
+        overlay.set_tree(menus.clone()).unwrap();
+        settle(&context, &overlay);
+        assert!(overlay.bounds(4).is_none(), "{name}: closed at the start");
+        click(&context, &overlay, center(&overlay, 3));
+        let picture = settle(&context, &overlay);
+        save(&format!("menu-{name}.rgba"), &picture);
+        // The open menu lies over the red picture, under the bar
+        let entry = overlay.bounds(4).expect("the menu is open");
+        let bar = overlay.bounds(1).unwrap();
+        assert!(
+            entry.y >= bar.y + bar.height - 2.0,
+            "{name}: {entry:?} {bar:?}"
+        );
+        let (x, y) = center(&overlay, 5);
+        let p = pixel(&picture, x as u32, y as u32);
+        assert!(
+            !near(p, [255, 0, 0], 60),
+            "{name}: the menu is not drawn at {x}, {y}: {p:?}"
+        );
+        assert!(overlay.covers(x, y), "{name}: the menu takes the pointer");
+        click(&context, &overlay, center(&overlay, 4));
+        assert_eq!(overlay.take_events(), vec![UiEvent::Clicked { id: 4 }]);
+
+        // A modal dims the whole picture and takes every click
+        let mut dialog = menus.clone();
+        dialog.push(node(10, None, Widget::Modal { dismissible: true }));
+        dialog.push(node(
+            11,
+            Some(10),
+            Widget::Text {
+                text: "Szene verwerfen?".into(),
+                style: TextStyle::Heading,
+                color: None,
+                spans: vec![],
+                wrap: None,
+                selectable: true,
+            },
+        ));
+        overlay.set_tree(dialog).unwrap();
+        let picture = settle(&context, &overlay);
+        save(&format!("modal-{name}.rgba"), &picture);
+        let corner = pixel(&picture, W - 5, H - 5);
+        assert!(
+            (100..220).contains(&corner[0]) && corner[1] < 30 && corner[2] < 30,
+            "{name}: the picture behind is not dimmed: {corner:?}"
+        );
+        let text = overlay.bounds(11).expect("the dialog is shown");
+        assert!(
+            (text.x + text.width / 2.0 - W as f32 / 2.0).abs() < 20.0,
+            "{name}: the dialog is not in the middle: {text:?}"
+        );
+        assert!(
+            overlay.covers(5.0, (H - 5) as f32),
+            "{name}: the modal takes the pointer everywhere"
+        );
+        drop(overlay);
+        release(context);
+    }
+}

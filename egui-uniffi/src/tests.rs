@@ -2420,3 +2420,321 @@ fn inputs_that_cannot_work_are_refused_with_the_reason() {
     }))
     .contains("the key 'Hyper' is none egui knows"));
 }
+
+// Phase 3: menus, popups, dialogs
+
+fn press(pos: egui::Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
+    egui::Event::PointerButton {
+        pos,
+        button,
+        pressed,
+        modifiers: Default::default(),
+    }
+}
+
+impl Run {
+    fn drawn(&self, id: u64) -> bool {
+        self.state.bounds.contains_key(&id)
+    }
+
+    fn right_click(&mut self, id: u64) {
+        let at = self.center(id);
+        self.frame(vec![egui::Event::PointerMoved(at)]);
+        self.frame(vec![press(at, egui::PointerButton::Secondary, true)]);
+        self.frame(vec![press(at, egui::PointerButton::Secondary, false)]);
+        self.frame(vec![]);
+    }
+
+    fn hover(&mut self, id: u64) {
+        let at = self.center(id);
+        self.frame(vec![egui::Event::PointerMoved(at)]);
+        self.frame(vec![]);
+    }
+}
+
+fn menu(id: u64, parent: u64, text: &str) -> UiNode {
+    node(id, Some(parent), Widget::Menu { text: text.into() })
+}
+
+fn item(id: u64, parent: u64, text: &str, shortcut: Option<&str>) -> UiNode {
+    node(
+        id,
+        Some(parent),
+        Widget::Button {
+            text: text.into(),
+            small: false,
+            frame: true,
+            selected: false,
+            shortcut: shortcut.map(Into::into),
+            fill: None,
+        },
+    )
+}
+
+fn popup(id: u64, parent: u64, open: bool, side: Option<PopupSide>) -> UiNode {
+    node(
+        id,
+        Some(parent),
+        Widget::Popup {
+            open,
+            side,
+            align: None,
+            close: None,
+            width: None,
+        },
+    )
+}
+
+#[test]
+fn a_menu_bar_opens_menus_and_submenus_and_an_item_closes_them() {
+    let mut run = Run::new(vec![
+        node(1, None, Widget::TopBar { expanded: true }),
+        node(2, Some(1), Widget::MenuBar),
+        menu(3, 2, "Datei"),
+        item(4, 3, "Speichern", Some("Ctrl+S")),
+        node(5, Some(3), Widget::Separator),
+        menu(6, 3, "Export"),
+        item(7, 6, "PNG", None),
+        node(
+            8,
+            Some(3),
+            Widget::Checkbox {
+                text: "Raster".into(),
+                checked: false,
+                indeterminate: false,
+            },
+        ),
+        menu(9, 2, "Ansicht"),
+        item(10, 9, "Oben", None),
+    ]);
+    assert!(run.drawn(3) && !run.drawn(4), "closed at the start");
+    run.click(3);
+    assert!(
+        run.drawn(4) && run.drawn(6) && run.drawn(8),
+        "the menu is open"
+    );
+    let (menu, item) = (run.state.bounds[&3], run.state.bounds[&4]);
+    assert!(
+        item.y >= menu.y + menu.height - 1.0,
+        "{item:?} under {menu:?}"
+    );
+    // The submenu opens beside its button while the pointer is on it
+    run.hover(6);
+    run.frame(vec![]);
+    assert!(run.drawn(7), "the submenu is open");
+    let (export, png) = (run.state.bounds[&6], run.state.bounds[&7]);
+    assert!(
+        png.x >= export.x + export.width - 1.0,
+        "{png:?} beside {export:?}"
+    );
+    run.click(7);
+    assert_eq!(run.state.take_events(), vec![UiEvent::Clicked { id: 7 }]);
+    run.frame(vec![]);
+    assert!(!run.drawn(4) && !run.drawn(7), "an item closes the menu");
+    // The other menu of the bar
+    run.click(9);
+    assert!(run.drawn(10) && !run.drawn(4));
+    run.click(10);
+    assert_eq!(run.state.take_events(), vec![UiEvent::Clicked { id: 10 }]);
+}
+
+#[test]
+fn a_right_click_opens_the_context_menu_of_any_node() {
+    let mut run = Run::new(vec![
+        central(1),
+        node(2, Some(1), plain_button("Säule")),
+        node(3, Some(2), Widget::ContextMenu),
+        item(4, 3, "Löschen", Some("Delete")),
+        item(5, 3, "Kopieren", None),
+        text(6, 1, "Boden"),
+        node(7, Some(6), Widget::ContextMenu),
+        item(8, 7, "Material", None),
+    ]);
+    assert!(!run.drawn(4));
+    run.right_click(2);
+    assert!(run.drawn(4) && run.drawn(5) && !run.drawn(8));
+    run.click(4);
+    assert_eq!(run.state.take_events(), vec![UiEvent::Clicked { id: 4 }]);
+    run.frame(vec![]);
+    assert!(!run.drawn(4), "the item closed the menu");
+    // Also on a text, and Escape closes it
+    run.right_click(6);
+    assert!(run.drawn(8));
+    run.frame(key(egui::Key::Escape, egui::Modifiers::NONE));
+    run.frame(vec![]);
+    assert!(!run.drawn(8));
+    assert!(run.state.take_events().is_empty());
+}
+
+#[test]
+fn a_tooltip_shows_nodes_while_the_pointer_rests() {
+    let mut run = Run::new(vec![
+        central(1),
+        node(2, Some(1), plain_button("Sonne")),
+        node(3, Some(2), Widget::Tooltip),
+        text(4, 3, "Höhe 45°"),
+        with(
+            node(
+                5,
+                Some(3),
+                Widget::ProgressBar {
+                    progress: 0.5,
+                    text: Some("Anteil".into()),
+                },
+            ),
+            UiModifier {
+                width: Some(160.0),
+                ..Default::default()
+            },
+        ),
+    ]);
+    run.hover(2);
+    for _ in 0..60 {
+        run.frame(vec![]);
+    }
+    assert!(run.drawn(4) && run.drawn(5), "the tooltip shows its nodes");
+    let (button, line) = (run.state.bounds[&2], run.state.bounds[&4]);
+    assert!(line.y > button.y, "{line:?} under {button:?}");
+    let bar = run.state.bounds[&5];
+    assert!(
+        (bar.width - 160.0).abs() < 0.5,
+        "the bar keeps its width: {bar:?}"
+    );
+    run.frame(vec![egui::Event::PointerMoved(egui::pos2(700.0, 500.0))]);
+    run.frame(vec![]);
+    assert!(!run.drawn(4), "gone when the pointer leaves");
+}
+
+#[test]
+fn kotlin_opens_a_popup_and_hears_when_the_user_closes_it() {
+    let mut nodes = vec![
+        central(1),
+        node(2, Some(1), plain_button("Ebenen")),
+        popup(3, 2, true, None),
+        checkbox(4, false),
+        popup(5, 2, false, Some(PopupSide::Right)),
+        text(6, 5, "rechts"),
+    ];
+    nodes[3].parent = Some(3);
+    let mut run = Run::new(nodes.clone());
+    assert!(run.drawn(4) && !run.drawn(6));
+    let (button, inside) = (run.state.bounds[&2], run.state.bounds[&4]);
+    assert!(
+        inside.y >= button.y + button.height,
+        "{inside:?} below {button:?}"
+    );
+    // A click inside keeps it open
+    run.click(4);
+    assert_eq!(
+        run.state.take_events(),
+        vec![UiEvent::Checked {
+            id: 4,
+            checked: true
+        }]
+    );
+    assert!(run.drawn(4));
+    // A click beside it closes it until Kotlin sends a tree
+    run.click_at(egui::pos2(600.0, 400.0));
+    assert_eq!(run.state.take_events(), vec![UiEvent::Closed { id: 3 }]);
+    run.frame(vec![]);
+    assert!(!run.drawn(4));
+    // Kotlin keeps it closed, then opens the other one at the right
+    nodes[2] = popup(3, 2, false, None);
+    nodes[4] = popup(5, 2, true, Some(PopupSide::Right));
+    run.state.set_tree(nodes.clone()).unwrap();
+    run.frame(vec![]);
+    run.frame(vec![]);
+    assert!(!run.drawn(4) && run.drawn(6));
+    let (button, right) = (run.state.bounds[&2], run.state.bounds[&6]);
+    assert!(
+        right.x >= button.x + button.width,
+        "{right:?} right of {button:?}"
+    );
+    run.frame(key(egui::Key::Escape, egui::Modifiers::NONE));
+    assert_eq!(run.state.take_events(), vec![UiEvent::Closed { id: 5 }]);
+}
+
+#[test]
+fn a_modal_blocks_the_rest_and_closes_on_escape_when_it_may() {
+    let modal = |dismissible| {
+        vec![
+            central(1),
+            node(2, Some(1), plain_button("Dahinter")),
+            node(10, None, Widget::Modal { dismissible }),
+            text(11, 10, "Szene verwerfen?"),
+            node(12, Some(10), plain_button("Verwerfen")),
+        ]
+    };
+    // The button behind is blocked; without dismissible neither a click beside it nor Escape closes it
+    let mut run = Run::new(modal(false));
+    assert!(run.drawn(11) && run.drawn(12));
+    run.click(2);
+    run.frame(key(egui::Key::Escape, egui::Modifiers::NONE));
+    assert!(run.state.take_events().is_empty());
+    run.click(12);
+    assert_eq!(run.state.take_events(), vec![UiEvent::Clicked { id: 12 }]);
+    assert!(run.drawn(11));
+    // With dismissible a click beside it closes it (and does not reach the button behind), as Escape does
+    let mut run = Run::new(modal(true));
+    run.click(2);
+    assert_eq!(run.state.take_events(), vec![UiEvent::Closed { id: 10 }]);
+    run.frame(vec![]);
+    assert!(!run.drawn(11), "hidden until the next tree");
+    let mut run = Run::new(modal(true));
+    run.frame(key(egui::Key::Escape, egui::Modifiers::NONE));
+    assert_eq!(run.state.take_events(), vec![UiEvent::Closed { id: 10 }]);
+}
+
+#[test]
+fn menus_and_popups_that_cannot_work_are_refused_with_the_reason() {
+    let base = || vec![central(1), node(2, Some(1), plain_button("A"))];
+    let with_nodes = |extra: Vec<UiNode>| {
+        let mut all = base();
+        all.extend(extra);
+        all
+    };
+    let why = invalid(with_nodes(vec![node(3, None, Widget::ContextMenu)]));
+    assert!(why.contains("belongs to the node"), "{why}");
+    let why = invalid(with_nodes(vec![
+        node(3, Some(2), Widget::Tooltip),
+        node(4, Some(2), Widget::Tooltip),
+    ]));
+    assert!(why.contains("second Tooltip"), "{why}");
+    let mut texted = base();
+    texted[1].tooltip = Some("Text".into());
+    texted.push(node(3, Some(2), Widget::Tooltip));
+    let why = invalid(texted);
+    assert!(why.contains("tooltip text as well"), "{why}");
+    let why = invalid(with_nodes(vec![
+        popup(3, 2, true, None),
+        node(4, Some(3), Widget::ContextMenu),
+    ]));
+    assert!(why.contains("cannot open it"), "{why}");
+    let why = invalid(with_nodes(vec![node(
+        3,
+        Some(2),
+        Widget::Popup {
+            open: true,
+            side: None,
+            align: None,
+            close: None,
+            width: Some(-5.0),
+        },
+    )]));
+    assert!(why.contains("width is -5"), "{why}");
+    let why = invalid(with_nodes(vec![node(
+        3,
+        Some(1),
+        Widget::Modal { dismissible: true },
+    )]));
+    assert!(why.contains("stands at the top"), "{why}");
+    // Two popups at one node are fine, a menu holds nodes
+    assert!(Tree::new(with_nodes(vec![
+        popup(3, 2, true, None),
+        popup(4, 2, false, None),
+        node(5, Some(1), Widget::MenuBar),
+        menu(6, 5, "Datei"),
+        item(7, 6, "Neu", None),
+    ]))
+    .is_ok());
+}

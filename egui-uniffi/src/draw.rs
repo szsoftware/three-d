@@ -3,9 +3,9 @@
 use crate::state::Focus;
 use crate::state::{Local, UiRect, UiState};
 use crate::{
-    Anchor, Arrangement, NoticeLevel, PlotSeries, ScrollDirection, SeriesKind, Side,
-    SliderClamping, SliderHandle, TextSpan, TextStyle, Tree, UiDate, UiEvent, UiInsets, UiModifier,
-    UiNode, Widget,
+    Align, Anchor, Arrangement, NoticeLevel, PlotSeries, PopupClose, PopupSide, ScrollDirection,
+    SeriesKind, Side, SliderClamping, SliderHandle, TextSpan, TextStyle, Tree, UiDate, UiEvent,
+    UiInsets, UiModifier, UiNode, Widget,
 };
 use std::collections::HashMap;
 use three_d::egui::{self, Color32, Id, Layout, Response, RichText, Ui, UiBuilder};
@@ -81,6 +81,22 @@ fn align2(anchor: Anchor) -> egui::Align2 {
     }
 }
 
+/// Where a popup opens next to its parent.
+fn rect_align(side: Option<PopupSide>, align: Option<Align>) -> egui::RectAlign {
+    use egui::RectAlign as R;
+    let pick = |start, center, end| match align.unwrap_or(Align::Start) {
+        Align::Start => start,
+        Align::Center => center,
+        Align::End => end,
+    };
+    match side.unwrap_or(PopupSide::Below) {
+        PopupSide::Below => pick(R::BOTTOM_START, R::BOTTOM, R::BOTTOM_END),
+        PopupSide::Above => pick(R::TOP_START, R::TOP, R::TOP_END),
+        PopupSide::Left => pick(R::LEFT_START, R::LEFT, R::LEFT_END),
+        PopupSide::Right => pick(R::RIGHT_START, R::RIGHT, R::RIGHT_END),
+    }
+}
+
 fn node_id(node: &UiNode) -> Id {
     Id::new(("three-d-egui", node.id))
 }
@@ -118,7 +134,7 @@ impl Frame<'_> {
 
     fn root(&mut self, ui: &mut Ui, node: &UiNode) {
         let id = node_id(node);
-        let rect = match &node.widget {
+        let response = match &node.widget {
             Widget::SidePanel {
                 side,
                 title,
@@ -156,7 +172,7 @@ impl Frame<'_> {
                     return;
                 };
                 self.state.panels.push(r.response.rect.into());
-                r.response.rect
+                r.response
             }
             Widget::TopBar { expanded } | Widget::BottomBar { expanded } => {
                 let panel = if matches!(node.widget, Widget::TopBar { .. }) {
@@ -170,7 +186,7 @@ impl Frame<'_> {
                     return;
                 };
                 self.state.panels.push(r.response.rect.into());
-                r.response.rect
+                r.response
             }
             Widget::CentralPanel { frame } => {
                 let panel = if *frame {
@@ -189,7 +205,7 @@ impl Frame<'_> {
                         }
                     }
                 }
-                r.response.rect
+                r.response
             }
             Widget::Window {
                 title,
@@ -258,7 +274,7 @@ impl Frame<'_> {
                         .change(Local::Closed, UiEvent::Closed { id: node.id });
                 }
                 match shown {
-                    Some(r) => r.response.rect,
+                    Some(r) => r.response,
                     None => return,
                 }
             }
@@ -279,12 +295,79 @@ impl Frame<'_> {
                             self.inside(ui, node);
                         }
                     });
-                r.response.rect
+                r.response
+            }
+            Widget::Modal { dismissible } => {
+                if self.state.local(node.id) == Some(&Local::Closed) {
+                    return;
+                }
+                let r = egui::Modal::new(id).show(ui.ctx(), |ui| self.inside(ui, node));
+                if *dismissible && r.should_close() {
+                    self.state
+                        .change(Local::Closed, UiEvent::Closed { id: node.id });
+                }
+                r.response
             }
             // Tree::new keeps everything else away from the top
             _ => return,
         };
-        self.state.bounds.insert(node.id, rect.into());
+        self.state.bounds.insert(node.id, response.rect.into());
+        self.attached(&response, node);
+    }
+
+    /// The menus, tooltips and popups that belong to `node`, at its `response`.
+    fn attached(&mut self, response: &Response, node: &UiNode) {
+        let Some(attached) = self.tree.attached.get(&node.id) else {
+            return;
+        };
+        for &index in attached {
+            let a = &self.tree.nodes[index];
+            match &a.widget {
+                Widget::ContextMenu => {
+                    response.context_menu(|ui| self.inside(ui, a));
+                }
+                Widget::Tooltip if node.enabled => {
+                    response.clone().on_hover_ui(|ui| self.inside(ui, a));
+                }
+                Widget::Tooltip => {
+                    response
+                        .clone()
+                        .on_disabled_hover_ui(|ui| self.inside(ui, a));
+                }
+                Widget::Popup {
+                    open,
+                    side,
+                    align,
+                    close,
+                    width,
+                } => {
+                    let shown = *open && self.state.local(a.id) != Some(&Local::Closed);
+                    let mut still = shown;
+                    let mut popup = egui::Popup::from_response(response)
+                        .id(node_id(a))
+                        .open_bool(&mut still)
+                        .align(rect_align(*side, *align))
+                        .close_behavior(match close.unwrap_or(PopupClose::ClickOutside) {
+                            PopupClose::Click => egui::PopupCloseBehavior::CloseOnClick,
+                            PopupClose::ClickOutside => {
+                                egui::PopupCloseBehavior::CloseOnClickOutside
+                            }
+                            PopupClose::Never => egui::PopupCloseBehavior::IgnoreClicks,
+                        });
+                    if let Some(w) = width {
+                        popup = popup.width(*w);
+                    }
+                    if let Some(r) = popup.show(|ui| self.inside(ui, a)) {
+                        self.state.bounds.insert(a.id, r.response.rect.into());
+                    }
+                    if shown && !still {
+                        self.state
+                            .change(Local::Closed, UiEvent::Closed { id: a.id });
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     /// A node inside a container: in a scope of its own id, so that egui keeps its state when nodes before it come and go.
@@ -345,7 +428,8 @@ impl Frame<'_> {
         if modifier.is_some_and(|m| m.focus_events) {
             self.watched.push((node.id, response.id));
         }
-        tooltip(response, node);
+        let response = tooltip(response, node);
+        self.attached(&response, node);
     }
 
     /// A [Widget::Shortcut]: [UiEvent::Clicked] when its keys are pressed. Without Ctrl or Alt it waits while a text
@@ -662,6 +746,15 @@ impl Frame<'_> {
                 return None;
             }
             Widget::Group => ui.group(|ui| self.children(ui, node)).response,
+            Widget::MenuBar => {
+                egui::MenuBar::new()
+                    .ui(ui, |ui| self.children(ui, node))
+                    .response
+            }
+            Widget::Menu { text } => {
+                ui.menu_button(text.as_str(), |ui| self.children(ui, node))
+                    .response
+            }
             Widget::Text {
                 text,
                 style,
@@ -1192,13 +1285,16 @@ impl Frame<'_> {
                 };
                 ui.colored_label(color, text.as_str())
             }
+            // Drawn by the node they belong to
+            Widget::ContextMenu | Widget::Tooltip | Widget::Popup { .. } => return None,
             // Tree::new keeps them at the top
             Widget::SidePanel { .. }
             | Widget::TopBar { .. }
             | Widget::BottomBar { .. }
             | Widget::CentralPanel { .. }
             | Widget::Window { .. }
-            | Widget::Area { .. } => return None,
+            | Widget::Area { .. }
+            | Widget::Modal { .. } => return None,
         })
     }
 }

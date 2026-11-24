@@ -13,7 +13,7 @@ bindings, with Compose as the model.
 | `EguiOverlay()` | an overlay without nodes; it makes its egui when it is painted the first time |
 | `setTree(nodes)` | the tree as a flat list of `UiNode(id, parent, widget, enabled, tooltip)`; only when Kotlin's state changed |
 | `input(event)` | pointer, key, text, clipboard and input method events in pixels from the top left; `true` if egui uses it (the camera leaves it alone) |
-| `takeEvents()` | `Clicked`, `Checked`, `Selected`, `IntChanged`, `FloatChanged`, `TextChanged`, `Submitted`, `Closed`, `ColorChanged`, `DateChanged`, `FocusChanged`, with the node's id |
+| `takeEvents()` | `Clicked`, `Checked`, `Selected`, `IntChanged`, `FloatChanged`, `TextChanged`, `Submitted`, `Closed`, `ColorChanged`, `DateChanged`, `FocusChanged`, with the node's id (`Closed` also for popups and modals) |
 | `takeOutput()` | what egui asks of the platform: text for the clipboard, a wish to paste, links to open, the pointer's look, where text is typed |
 | `requestFocus(id)` | gives a node the keyboard (Compose's `FocusRequester`), `null` takes it away |
 | `needsRepaint()` | whether the next frame looks different (new tree, input, egui's hover and animations) |
@@ -25,9 +25,9 @@ bindings, with Compose as the model.
 
 ## The tree
 
-At the top stand `SidePanel`, `TopBar`, `BottomBar`, `CentralPanel` (the room the others leave), `Window` and `Area`
-(pinned to a corner, an edge or the center). Inside them: the containers `Row`, `Column`, `Columns`, `Sides`, `Indent`,
-`Resize`, `Grid`, `Collapsible`, `ScrollArea`, `Group` and the widgets `Text`, `Separator`, `Spacer`, `Button`, `Checkbox`,
+At the top stand `SidePanel`, `TopBar`, `BottomBar`, `CentralPanel` (the room the others leave), `Window`, `Area`
+(pinned to a corner, an edge or the center) and `Modal`. Inside them: the containers `Row`, `Column`, `Columns`, `Sides`,
+`Indent`, `Resize`, `Grid`, `Collapsible`, `ScrollArea`, `Group`, `MenuBar`, `Menu` and the widgets `Text`, `Separator`, `Spacer`, `Button`, `Checkbox`,
 `SelectableLabel`, `ToggleButton`, `RadioButton`, `Switch`, `Radio`, `ComboBox`, `SliderInt`, `SliderFloat`, `DragValue`,
 `TextField`, `ColorPicker`, `DatePicker`, `Link`, `ProgressBar`, `Spinner`, `Notice` (info, warning, error) and `Plot`;
 `Shortcut` is a key that draws nothing. `setTree` refuses a tree with an id twice, a parent that is not there or holds no
@@ -91,6 +91,25 @@ cuts it with "…" or lets it run on; `selectable = false` keeps the user from s
 
 A modifier with `focus_events` reports `FocusChanged` when its node gets or loses the keyboard; `requestFocus(id)` gives
 it the keyboard from Kotlin.
+
+## Menus, popups and dialogs
+
+`MenuBar` holds `Menu`s, a `Menu` holds the items: buttons (with a `shortcut` text), checkboxes, separators and further
+`Menu`s, which open to the side. A click on an item reports it and closes the menu; a `Menu` outside a bar is a button
+with a dropdown.
+
+Three kinds of nodes belong to the node they open on instead of standing inside it; their parent may be any node, a
+button as well as a text or a panel:
+
+| Node | What it does |
+| --- | --- |
+| `ContextMenu` | its nodes as the menu of a right click on the parent |
+| `Tooltip` | its nodes in a tooltip while the pointer rests on the parent (instead of the `tooltip` text) |
+| `Popup` | its nodes next to the parent while `open`, at a `side` (below, above, left, right) and `align`; `close` says which clicks close it (any, beside it, none). When the user closes it, it reports `Closed` and stays closed until the next tree |
+
+A node has at most one `ContextMenu` and one `Tooltip`, any number of `Popup`s. A `Modal` stands at the top, in the
+middle over everything, and dims and blocks the rest while it is in the tree; `dismissible` lets Escape or a click beside
+it report `Closed`.
 
 ## What the platform does
 
@@ -160,4 +179,4 @@ links one copy. It has no log bridge of its own: that comes from the crate that 
 `cargo test -p three-d-egui-uniffi`: the tree, the values, the events, the clipboard, the input method and the focus with
 egui alone; painting, clicks through `input`, scale, style and repaints on OpenGL through EGL (Linux) and on wgpu.
 `THREE_D_SKIP_GPU_TESTS=1` leaves out the graphics card, `THREE_D_EGUI_PICTURE=<dir>` writes the pictures of the options
-panel, the plots, the settings window and the inputs as raw RGBA.
+panel, the plots, the settings window, the inputs, an open menu and a modal as raw RGBA.
