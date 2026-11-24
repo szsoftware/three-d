@@ -417,23 +417,28 @@ impl Frame<'_> {
         let dragged = reactions.is_some_and(|r| r.drag || r.drag_kind.is_some());
         let scope = ui.scope_builder(builder, |ui| match modifier {
             // A button wider than its text has it in the middle, as in Compose
-            Some(m) => modified(
-                ui,
-                m,
-                matches!(
-                    node.widget,
-                    Widget::Button { .. }
-                        | Widget::SelectableLabel { .. }
-                        | Widget::ToggleButton { .. }
-                ),
-                align,
-                |ui| {
-                    if dragged {
-                        ui.style_mut().interaction.selectable_labels = false;
-                    }
-                    self.widget(ui, node)
-                },
-            ),
+            Some(m) => {
+                if let Some(theme) = &m.theme {
+                    crate::theme::apply(ui.style_mut(), theme, &self.state.font_families);
+                }
+                modified(
+                    ui,
+                    m,
+                    matches!(
+                        node.widget,
+                        Widget::Button { .. }
+                            | Widget::SelectableLabel { .. }
+                            | Widget::ToggleButton { .. }
+                    ),
+                    align,
+                    |ui| {
+                        if dragged {
+                            ui.style_mut().interaction.selectable_labels = false;
+                        }
+                        self.widget(ui, node)
+                    },
+                )
+            }
             None => self.widget(ui, node),
         });
         // With a modifier the node is all of it, its frame too
@@ -1215,6 +1220,17 @@ impl Frame<'_> {
                 ui.add(label)
             }
             Widget::Separator => ui.separator(),
+            Widget::EguiTool { tool } => {
+                let ctx = ui.ctx().clone();
+                ui.scope(|ui| match tool {
+                    crate::EguiTool::Settings => ctx.settings_ui(ui),
+                    crate::EguiTool::Style => ctx.style_ui(ui, ctx.theme()),
+                    crate::EguiTool::Inspection => ctx.inspection_ui(ui),
+                    crate::EguiTool::Memory => ctx.memory_ui(ui),
+                    crate::EguiTool::Textures => ctx.texture_ui(ui),
+                })
+                .response
+            }
             Widget::Spacer { size } => {
                 ui.add_space(*size);
                 return None;
@@ -1935,15 +1951,8 @@ fn framed<R>(ui: &mut Ui, m: &UiModifier, centered: bool, add: impl FnOnce(&mut 
     if let Some(border) = m.border {
         frame = frame.stroke(egui::Stroke::new(border.width, argb(border.color)));
     }
-    if let Some(s) = m.shadow {
-        let i = |v: f32| v.round().clamp(i8::MIN as f32, i8::MAX as f32) as i8;
-        let u = |v: f32| v.round().clamp(0.0, u8::MAX as f32) as u8;
-        frame = frame.shadow(egui::Shadow {
-            offset: [i(s.dx), i(s.dy)],
-            blur: u(s.blur),
-            spread: u(s.spread),
-            color: argb(s.color),
-        });
+    if let Some(s) = &m.shadow {
+        frame = frame.shadow(crate::theme::shadow(s));
     }
     frame.show(ui, |ui| sized(ui, m, centered, add)).inner
 }

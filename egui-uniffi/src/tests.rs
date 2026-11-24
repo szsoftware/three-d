@@ -4754,3 +4754,67 @@ fn a_finger_held_still_is_one_long_press_or_a_right_click() {
         events => panic!("{events:?}"),
     }
 }
+
+#[test]
+fn a_node_of_its_own_theme_has_its_text_sizes_and_egui_s_panels_are_nodes() {
+    let themed = with(
+        node(2, Some(1), column()),
+        UiModifier {
+            theme: Some(UiTheme {
+                text_sizes: vec![UiTextSize {
+                    style: TextStyle::Body,
+                    size: 25.0,
+                    family: None,
+                }],
+                // A family without fonts is the text font
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+    let tool = |id, tool| node(id, Some(1), Widget::EguiTool { tool });
+    let mut run = Run::new(vec![
+        central(1),
+        plain_text(3, 1, "Säule"),
+        themed,
+        plain_text(4, 2, "Säule"),
+        tool(5, EguiTool::Settings),
+        tool(6, EguiTool::Style),
+        tool(7, EguiTool::Inspection),
+        tool(8, EguiTool::Memory),
+        tool(9, EguiTool::Textures),
+    ]);
+    run.frame(vec![]);
+    let (plain, large) = (run.state.bounds[&3], run.state.bounds[&4]);
+    assert!(large.height > plain.height * 1.6, "{plain:?} {large:?}");
+    for id in 5..=9 {
+        let r = run.state.bounds[&id];
+        assert!(r.height > 10.0, "{id}: {r:?}");
+    }
+    // Fonts egui could not read are refused before egui takes them
+    let font = |name: &str, bytes: Vec<u8>| UiFont {
+        name: name.into(),
+        bytes,
+        family: None,
+        fallback: false,
+        scale: None,
+        y_offset: None,
+    };
+    let hack = epaint_default_fonts::HACK_REGULAR.to_vec();
+    assert_eq!(
+        crate::theme::check_fonts(&[font("Hack", hack.clone())]),
+        Ok(())
+    );
+    for (fonts, why) in [
+        (vec![font("", hack.clone())], "a font needs a name"),
+        (
+            vec![font("Hack", hack.clone()), font("Hack", hack.clone())],
+            "two fonts are called 'Hack'",
+        ),
+    ] {
+        assert_eq!(crate::theme::check_fonts(&fonts), Err(why.to_string()));
+    }
+    assert!(crate::theme::check_fonts(&[font("Kaputt", vec![0; 64])])
+        .unwrap_err()
+        .starts_with("'Kaputt' is no TTF or OTF file"));
+}

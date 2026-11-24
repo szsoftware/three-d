@@ -146,7 +146,7 @@ impl Held {
     }
 
     /// Takes a modifier key, `true` if it was one.
-    fn key(&mut self, key: &str, down: bool) -> bool {
+    pub(crate) fn key(&mut self, key: &str, down: bool) -> bool {
         let held = match key {
             "Shift" | "ShiftLeft" | "ShiftRight" => &mut self.shift,
             "Control" | "Ctrl" | "CtrlLeft" | "CtrlRight" => &mut self.control,
@@ -333,9 +333,9 @@ pub(crate) fn key_named(name: &str) -> Option<egui::Key> {
         "Copy" => Copy,
         "Paste" => Paste,
         "Cut" => Cut,
-        "Minus" => Minus,
-        "Plus" => Plus,
-        "Equals" => Equals,
+        "Minus" | "-" => Minus,
+        "Plus" | "+" => Plus,
+        "Equals" | "=" => Equals,
         "Comma" | "," => Comma,
         "Period" | "." => Period,
         "Slash" | "/" => Slash,

@@ -194,6 +194,10 @@ pub struct UiModifier {
     /// What it reacts to besides its widget: clicks, the pointer, dragging, gestures, drag and drop.
     #[uniffi(default)]
     pub reactions: Option<UiReactions>,
+    /// The look of the node and the nodes inside it (Compose's nested `MaterialTheme`): what it leaves out stays as
+    /// around it. Windows, menus and popups that open from inside take the look of the whole overlay.
+    #[uniffi(default)]
+    pub theme: Option<crate::UiTheme>,
 }
 
 /// What a node reacts to besides its own widget, as Compose's `clickable`, `combinedClickable`, `hoverable`,
@@ -1616,6 +1620,12 @@ pub enum Widget {
         /// How urgent.
         level: NoticeLevel,
     },
+    /// One of egui's own panels: its settings, its style editor (every value of the style, live), what it knows of the
+    /// frame, its memory or its textures. For trying a look before it goes into a [crate::UiTheme], and for debugging.
+    EguiTool {
+        /// Which.
+        tool: crate::EguiTool,
+    },
 }
 
 impl Widget {
@@ -1725,6 +1735,7 @@ impl Widget {
             Self::Canvas { .. } => "Canvas",
             Self::Scene { .. } => "Scene",
             Self::Notice { .. } => "Notice",
+            Self::EguiTool { .. } => "EguiTool",
         }
     }
 

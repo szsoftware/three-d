@@ -17,8 +17,12 @@ bindings, with Compose as the model.
 | `takeOutput()` | what egui asks of the platform: text for the clipboard, a wish to paste, links to open, the pointer's look, where text is typed |
 | `requestFocus(id)` | gives a node the keyboard (Compose's `FocusRequester`), `null` takes it away |
 | `needsRepaint()` | whether the next frame looks different (new tree, input, egui's hover and animations) |
-| `setScale(pixelsPerPoint)` | Compose's density times a zoom |
+| `setScale(pixelsPerPoint)` | Compose's density |
 | `setStyle(UiStyle(dark, accent))` | egui's dark or light look with an accent color (ARGB) |
+| `setTheme(UiTheme(…))`, `setSystemTheme(dark)` | egui's whole style (see "Look and state"); a theme without `dark` follows the system |
+| `setFonts(fonts)` | TTF and OTF files: a text font, one for code, families of their own, icon fonts as fallbacks |
+| `setZoom(factor)`, `zoom()`, `setZoomKeys(enabled)` | the user's zoom on top of the scale; Ctrl and Plus, Minus, 0 change it (`ZoomChanged`) |
+| `saveState()`, `restoreState(bytes)` | what egui keeps of the user's doing as bytes: window places and sizes, open sections, column widths, plot views, the zoom |
 | `setImage(key, bytes)`, `setImageRgba(key, width, height, rgba)`, `removeImage(key)` | images for `Image`, buttons, canvases and plots, by key; PNG, JPEG, GIF, WebP and SVG files or pixels |
 | `setCanvasShapes(key, shapes)` | many shapes for a `Canvas` that seldom change (a floor plan), drawn under its own |
 | `covers(x, y)`, `bounds(id)` | whether a pixel is on egui, where a node was drawn (for tests that click on it) |
@@ -189,6 +193,38 @@ included.
 `UiInput.Touch(id, phase, x, y, force)` brings fingers: the first one also moves egui's pointer (a tap clicks, a long
 touch is a right click), two zoom a `Scene` or a `Plot` and report `Gesture`. three-d-raytrace-uniffi's
 `InputEvent.Touch` hands them to the overlay first; there the first finger moves the camera as the left button does.
+
+## Look and state
+
+`setTheme(UiTheme)` gives egui's whole style, as Compose's `MaterialTheme`; what it leaves out is egui's:
+
+| Field | Sets |
+| --- | --- |
+| `dark` | dark or light; `null` follows `setSystemTheme(dark)` (Compose's `isSystemInDarkTheme()`, `prefers-color-scheme` in the browser) |
+| `accent` | selections, slider tracks, links |
+| `colors` (`UiColors`) | text, weak text, panels, windows and their border, fields, stripes, widgets at rest, hovered and pressed, outlines, text on a selection, links, warnings, errors |
+| `cornerRadius`, `windowCornerRadius` | corners of widgets; of windows, menus and popups |
+| `strokeWidth` | outlines of widgets, separators and windows |
+| `spacing` (`UiSpacing`) | between widgets, inside buttons and windows, indent, the least height of widgets (40 for fingers), widths of sliders, fields and scroll bars |
+| `windowShadow`, `popupShadow` | shadows (`UiShadow`) |
+| `textSizes` (`UiTextSize(style, size, family)`) | size and font family of each `TextStyle`; buttons have the size of `Body` |
+| `animationTime` | egui's animations in seconds, 0 none |
+
+`UiModifier.theme` gives a node and the nodes inside it a theme of their own (a light card in a dark window, larger
+text); windows, menus and popups that open from it take the overlay's.
+
+`setFonts(listOf(UiFont(name, bytes, family, fallback, scale, yOffset)))` adds fonts to egui's: without a family the
+font of all text, `"monospace"` the one of code, any other name a family for `UiTextSize.family` (egui's fonts stand
+behind it); `fallback` puts an icon font behind the others. Files egui could not read are refused with `InvalidData`.
+
+Ctrl and Plus, Minus or 0 (Command on macOS) zoom the overlay in tenths, as in a browser: `input` says they are used,
+the overlay reports `ZoomChanged(factor)` and stays sharp (it is drawn larger, not scaled). `saveState()` gives egui's
+memory as bytes, which `restoreState(bytes)` brings back, also in the next run before the first frame: where the user
+moved windows to, their sizes, sections opened by the user, widths of table columns, views of plots, the zoom. Values
+Kotlin owns come from Kotlin's tree as always.
+
+`Widget.EguiTool(tool)` shows one of egui's own panels as a node: `SETTINGS`, `STYLE` (every value of the style, live,
+to find a look before it goes into a `UiTheme`), `INSPECTION`, `MEMORY`, `TEXTURES`.
 
 ## What the platform does
 

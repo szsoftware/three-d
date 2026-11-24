@@ -1,13 +1,13 @@
 use crate::input::{Held, Wanted};
 use crate::state::{Focus, UiState};
-use crate::{UiError, UiEvent, UiInput, UiNode, UiOutput, UiRect};
+use crate::{UiError, UiEvent, UiFont, UiInput, UiNode, UiOutput, UiRect, UiTheme};
 use cargo_uniffi_support::ThreadBound;
 use std::sync::{Arc, Mutex, MutexGuard};
 use three_d::egui;
 use three_d::{ColorTarget, Context, CoreError, Event, RenderTarget, Viewport, GUI};
 use web_time::Instant;
 
-/// Colors of the overlay: egui's dark or light look with an accent of the application.
+/// Colors of the overlay: egui's dark or light look with an accent of the application ([UiTheme] has all of the style).
 #[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
 pub struct UiStyle {
     /// egui's dark look, else the light one.
@@ -38,8 +38,20 @@ struct Shared {
     fingers: std::collections::HashMap<u64, bool>,
     egui: Option<egui::Context>,
     pixels_per_point: f32,
-    style: Option<UiStyle>,
+    /// The style from Kotlin; [Shared::apply_style] puts it onto egui when it changed.
+    theme: Option<UiTheme>,
     style_changed: bool,
+    /// Whether the system looks dark, if Kotlin said: for a theme that follows it.
+    system_dark: Option<bool>,
+    fonts: Vec<UiFont>,
+    fonts_changed: bool,
+    /// The user's zoom (Ctrl and Plus, Minus, 0), on top of [Shared::pixels_per_point].
+    zoom: f32,
+    zoom_keys: bool,
+    /// The modifiers as [EguiOverlay::input] saw them, before the frame turns the input into egui's events.
+    early: Held,
+    /// egui's memory from [EguiOverlay::restore_state] before there was an egui.
+    memory: Option<egui::Memory>,
 }
 
 /// egui with its painter, which belongs to the thread and the three-d context it was made on.
@@ -80,8 +92,15 @@ impl Default for EguiOverlay {
                 fingers: Default::default(),
                 egui: None,
                 pixels_per_point: 1.0,
-                style: None,
+                theme: None,
                 style_changed: false,
+                system_dark: None,
+                fonts: Vec::new(),
+                fonts_changed: false,
+                zoom: 1.0,
+                zoom_keys: true,
+                early: Held::default(),
+                memory: None,
             }),
             painting: Mutex::new(None),
         }
@@ -288,16 +307,123 @@ impl EguiOverlay {
 
     /// egui's dark or light look with an accent color.
     pub fn set_style(&self, style: UiStyle) {
+        self.set_theme(UiTheme {
+            dark: Some(style.dark),
+            accent: style.accent,
+            ..Default::default()
+        });
+    }
+
+    /// egui's whole style from Kotlin (Compose's `MaterialTheme`): colors, corners, room, outlines, shadows, the sizes
+    /// and fonts of text. What it leaves out is egui's; a new theme replaces the old one completely.
+    pub fn set_theme(&self, theme: UiTheme) {
         let mut shared = lock(&self.shared);
-        shared.style = Some(style);
+        shared.theme = Some(theme);
         shared.style_changed = true;
         shared.ui.dirty = true;
+    }
+
+    /// Whether the system looks dark (`None` if it does not say): a [UiTheme] without `dark` follows it. Kotlin tells
+    /// it at the start and when it changes (Compose's `isSystemInDarkTheme()`, `prefers-color-scheme` in the browser).
+    pub fn set_system_theme(&self, dark: Option<bool>) {
+        let mut shared = lock(&self.shared);
+        if shared.system_dark != dark {
+            shared.system_dark = dark;
+            shared.style_changed = true;
+            shared.ui.dirty = true;
+        }
+    }
+
+    /// Fonts from Kotlin besides egui's: a text font, one for code, families of their own for [crate::UiTextSize]
+    /// (headings), icon fonts as fallbacks. Replaces the fonts given before; an empty list leaves egui's.
+    pub fn set_fonts(&self, fonts: Vec<UiFont>) -> Result<(), UiError> {
+        crate::theme::check_fonts(&fonts).map_err(|why| UiError::InvalidData { why })?;
+        let mut shared = lock(&self.shared);
+        shared.ui.font_families = crate::theme::named_families(&fonts);
+        shared.fonts = fonts;
+        shared.fonts_changed = true;
+        shared.style_changed = shared.theme.is_some();
+        shared.ui.dirty = true;
+        Ok(())
+    }
+
+    /// The user's zoom, 1 at egui's size, on top of [EguiOverlay::set_scale] (as Ctrl and Plus has it in a browser).
+    pub fn set_zoom(&self, factor: f32) {
+        let mut shared = lock(&self.shared);
+        let zoom = zoom_within(factor);
+        if zoom != shared.zoom {
+            shared.zoom = zoom;
+            shared.ui.dirty = true;
+        }
+    }
+
+    /// The user's zoom.
+    pub fn zoom(&self) -> f32 {
+        lock(&self.shared).zoom
+    }
+
+    /// Whether Ctrl and Plus, Minus or 0 (Command on macOS) zoom the overlay: [UiEvent::ZoomChanged]. On by default.
+    pub fn set_zoom_keys(&self, enabled: bool) {
+        lock(&self.shared).zoom_keys = enabled;
+    }
+
+    /// What egui keeps of the user's doing, as bytes for the application to store: where windows were moved and how
+    /// large they were made, sections opened, widths of columns, views of diagrams, scroll positions, the zoom.
+    /// [EguiOverlay::restore_state] brings it back, also in the next run (node ids that stay give the same places).
+    pub fn save_state(&self) -> Vec<u8> {
+        let shared = lock(&self.shared);
+        let zoom = shared.zoom;
+        let text = match (&shared.egui, &shared.memory) {
+            (Some(egui), _) => {
+                egui.data_mut(|d| d.insert_persisted(zoom_id(), zoom));
+                egui.memory(ron::to_string)
+            }
+            (None, Some(memory)) => {
+                let mut memory = memory.clone();
+                memory.data.insert_persisted(zoom_id(), zoom);
+                ron::to_string(&memory)
+            }
+            (None, None) => {
+                let mut memory = egui::Memory::default();
+                memory.data.insert_persisted(zoom_id(), zoom);
+                ron::to_string(&memory)
+            }
+        };
+        text.map(String::into_bytes).unwrap_or_default()
+    }
+
+    /// Brings back what [EguiOverlay::save_state] gave (an empty list does nothing). Kotlin's own state (values, open
+    /// panels it owns) comes from Kotlin's tree as always.
+    pub fn restore_state(&self, bytes: Vec<u8>) -> Result<(), UiError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let invalid = |e: &dyn std::fmt::Display| UiError::InvalidData {
+            why: format!("not a state of save_state: {e}"),
+        };
+        let text = std::str::from_utf8(&bytes).map_err(|e| invalid(&e))?;
+        let mut memory: egui::Memory = ron::from_str(text).map_err(|e| invalid(&e))?;
+        let mut shared = lock(&self.shared);
+        if let Some(zoom) = memory.data.get_persisted::<f32>(zoom_id()) {
+            shared.zoom = zoom_within(zoom);
+        }
+        match shared.egui.clone() {
+            Some(egui) => {
+                egui.memory_mut(|m| *m = memory);
+                own_zoom(&egui);
+            }
+            None => shared.memory = Some(memory),
+        }
+        // The memory has egui's options with its styles: the theme from Kotlin counts
+        shared.style_changed = shared.theme.is_some();
+        shared.ui.dirty = true;
+        Ok(())
     }
 
     /// Whether the pixel (from the top left) lies on a panel, window or area of the last frame.
     pub fn covers(&self, x: f32, y: f32) -> bool {
         let shared = lock(&self.shared);
-        let s = shared.pixels_per_point;
+        let s = shared.scale();
         shared.over(x / s, y / s)
     }
 
@@ -305,7 +431,7 @@ impl EguiOverlay {
     /// section, a hidden window). For tests that click on a node, and to place things next to it.
     pub fn bounds(&self, id: u64) -> Option<UiRect> {
         let shared = lock(&self.shared);
-        let s = shared.pixels_per_point;
+        let s = shared.scale();
         let ui = &shared.ui;
         ui.screen_bounds
             .get(&id)
@@ -319,7 +445,49 @@ impl EguiOverlay {
     }
 }
 
+/// Where the overlay keeps its zoom in egui's memory.
+fn zoom_id() -> egui::Id {
+    egui::Id::new("three-d-egui-zoom")
+}
+
+/// A zoom as egui has it: from 0.2 to 5.
+fn zoom_within(factor: f32) -> f32 {
+    if factor.is_finite() {
+        factor.clamp(0.2, 5.0)
+    } else {
+        1.0
+    }
+}
+
+/// The overlay zooms itself: three-d sets egui's points per pixel every frame, which would undo egui's own zoom.
+fn own_zoom(egui: &egui::Context) {
+    egui.options_mut(|o| o.zoom_with_keyboard = false);
+}
+
 impl Shared {
+    /// Pixels per point of egui: the density and the user's zoom.
+    fn scale(&self) -> f32 {
+        self.pixels_per_point * self.zoom
+    }
+
+    /// The zoom after `input` if it is Ctrl and Plus, Minus or 0 (with the modifiers of the frame).
+    fn zoom_key(&self, input: &UiInput, modifiers: egui::Modifiers) -> Option<f32> {
+        let UiInput::Key { key, down: true } = input else {
+            return None;
+        };
+        if !self.zoom_keys || !modifiers.command {
+            return None;
+        }
+        // In steps of a tenth, as egui's own
+        let step = |d: f32| ((self.zoom + d).clamp(0.2, 5.0) * 10.0).round() / 10.0;
+        match crate::input::key_named(key)? {
+            egui::Key::Plus | egui::Key::Equals => Some(step(0.1)),
+            egui::Key::Minus => Some(step(-0.1)),
+            egui::Key::Num0 => Some(1.0),
+            _ => None,
+        }
+    }
+
     /// Whether the point (in points) is on egui: on a window, an area or a popup (their own layers), or on a panel.
     fn over(&self, x: f32, y: f32) -> bool {
         let on_layer = self.egui.as_ref().is_some_and(|egui| {
@@ -330,7 +498,13 @@ impl Shared {
     }
 
     fn uses(&mut self, event: &UiInput) -> bool {
-        let s = self.pixels_per_point;
+        let s = self.scale();
+        if let UiInput::Key { key, down } = event {
+            self.early.key(key, *down);
+            if self.zoom_key(event, self.early.modifiers()).is_some() {
+                return true;
+            }
+        }
         match *event {
             UiInput::Press { x, y, .. } => {
                 if self.pointer == Pointer::Free {
@@ -383,33 +557,29 @@ impl Shared {
     }
 
     fn apply_style(&mut self, egui: &egui::Context) {
+        if std::mem::take(&mut self.fonts_changed) {
+            egui.set_fonts(crate::theme::font_definitions(&self.fonts));
+        }
         if !std::mem::take(&mut self.style_changed) {
             return;
         }
-        let Some(style) = self.style else {
+        let Some(theme) = &self.theme else {
             return;
         };
-        let theme = if style.dark {
-            egui::Theme::Dark
+        let dark = theme.dark.or(self.system_dark).unwrap_or(true);
+        let (egui_theme, visuals) = if dark {
+            (egui::Theme::Dark, egui::Visuals::dark())
         } else {
-            egui::Theme::Light
+            (egui::Theme::Light, egui::Visuals::light())
         };
-        let mut visuals = theme.default_visuals();
-        if let Some(accent) = style.accent {
-            let [a, r, g, b] = accent.to_be_bytes();
-            let color = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
-            visuals.selection.bg_fill = color;
-            visuals.hyperlink_color = color;
-            // The text on a selection stays readable on light and dark accents
-            let light = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32 > 150.0;
-            visuals.selection.stroke.color = if light {
-                egui::Color32::BLACK
-            } else {
-                egui::Color32::WHITE
-            };
-        }
-        egui.set_theme(theme);
-        egui.set_visuals_of(theme, visuals);
+        // From egui's style on, so that what a new theme leaves out is egui's again
+        let mut style = egui::Style {
+            visuals,
+            ..Default::default()
+        };
+        crate::theme::apply(&mut style, theme, &self.ui.font_families);
+        egui.set_theme(egui_theme);
+        egui.set_style_of(egui_theme, style);
     }
 }
 
@@ -473,7 +643,16 @@ impl EguiOverlay {
         };
         if fresh {
             let gui = GUI::new(context);
-            lock(&self.shared).egui = Some(gui.context().clone());
+            own_zoom(gui.context());
+            {
+                let mut shared = lock(&self.shared);
+                if let Some(memory) = shared.memory.take() {
+                    gui.context().memory_mut(|m| *m = memory);
+                    own_zoom(gui.context());
+                }
+                shared.egui = Some(gui.context().clone());
+                shared.fonts_changed = !shared.fonts.is_empty();
+            }
             *painting = Some(ThreadBound::new(Painting {
                 gui,
                 context: context.clone(),
@@ -481,7 +660,7 @@ impl EguiOverlay {
                 viewport: None,
             }));
             let mut shared = lock(&self.shared);
-            shared.style_changed = shared.style.is_some();
+            shared.style_changed = shared.theme.is_some();
         }
         let painting = painting.as_ref().expect("made above");
         painting.with_mut(|p| -> Result<(), UiError> {
@@ -500,12 +679,19 @@ impl EguiOverlay {
                 return Ok(());
             }
             shared.apply_style(p.gui.context());
-            let scale = shared.pixels_per_point;
             let mut wanted = Wanted::default();
             let mut own = Vec::new();
-            for input in shared.input.drain(..) {
+            for input in std::mem::take(&mut shared.input) {
+                if let Some(zoom) = shared.zoom_key(&input, shared.held.modifiers()) {
+                    if zoom != shared.zoom {
+                        shared.zoom = zoom;
+                        shared.ui.push(UiEvent::ZoomChanged { factor: zoom });
+                    }
+                }
+                let scale = shared.scale();
                 own.extend(shared.held.events(input, scale, &mut wanted));
             }
+            let scale = shared.scale();
             shared.output.paste |= wanted.paste;
             shared.ui.dirty = false;
             let ms = p.started.elapsed().as_secs_f64() * 1000.0;
