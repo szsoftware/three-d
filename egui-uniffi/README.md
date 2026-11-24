@@ -23,6 +23,9 @@ bindings, with Compose as the model.
 | `setFonts(fonts)` | TTF and OTF files: a text font, one for code, families of their own, icon fonts as fallbacks |
 | `setZoom(factor)`, `zoom()`, `setZoomKeys(enabled)` | the user's zoom on top of the scale; Ctrl and Plus, Minus, 0 change it (`ZoomChanged`) |
 | `saveState()`, `restoreState(bytes)` | what egui keeps of the user's doing as bytes: window places and sizes, open sections, column widths, plot views, the zoom |
+| `setAccessibility(enabled)`, `takeAccessibility()` | egui's AccessKit tree of each frame as `UiAccessTree` for Compose's semantics or a browser's ARIA mirror (see "Accessibility"); off by default |
+| `accessAction(id, action)`, `accessSetValue(id, value)`, `accessSetText(id, text)` | what a screen reader does with a node of that tree: click, focus, a step, a number, a text |
+| `enableAtspi(name)`, `setAtspiWindow(bounds, focused)` | the tree for Orca on a Linux desktop over AT-SPI (feature `atspi`), where Compose has no accessibility |
 | `setImage(key, bytes)`, `setImageRgba(key, width, height, rgba)`, `removeImage(key)` | images for `Image`, buttons, canvases and plots, by key; PNG, JPEG, GIF, WebP and SVG files or pixels |
 | `setCanvasShapes(key, shapes)` | many shapes for a `Canvas` that seldom change (a floor plan), drawn under its own |
 | `covers(x, y)`, `bounds(id)` | whether a pixel is on egui, where a node was drawn (for tests that click on it) |
@@ -225,6 +228,46 @@ Kotlin owns come from Kotlin's tree as always.
 
 `Widget.EguiTool(tool)` shows one of egui's own panels as a node: `SETTINGS`, `STYLE` (every value of the style, live,
 to find a look before it goes into a `UiTheme`), `INSPECTION`, `MEMORY`, `TEXTURES`.
+
+## Accessibility
+
+egui describes each frame for assistive technology as an AccessKit tree once `setAccessibility(true)` asks it to (it
+costs a little time per frame, so it is off by default). `takeAccessibility()` after a frame gives that tree when it
+changed, as a list of `UiAccessNode`s in reading order, each after the node it is in:
+
+| Field | What it says |
+| --- | --- |
+| `id`, `parent` | the node for the actions below, the node it is in (`null` at the top) |
+| `node` | the id of the `UiNode` it is, if it is one (not a part of a widget, a row of a table's data) |
+| `role` | `AccessRole`: button, checkbox, switch, slider, text input, heading, window, dialog, pane, tab, status, alert, … (the comment of each names ARIA's role and Compose's `Role`) |
+| `label`, `description`, `value`, `placeholder` | its name (a button's text, a field's label, a window's title), a hint, its value as text |
+| `numeric`, `min`, `max`, `step` | the number of a slider, a drag value, a progress bar |
+| `toggled`, `selected`, `expanded`, `state` | on, off or mixed; chosen; open; the state in words |
+| `live`, `disabled`, `readOnly`, `focused` | how changes are read out (status lines, notices); whether it is greyed out, can be changed, has the keyboard |
+| `bounds`, `actions` | where it is in pixels; what `accessAction` can do with it |
+
+The containers egui makes for its layout are left out, a text that only repeats the name of the control beside it
+too; a panel's title is its name, a field's label the field's. `accessAction(id, CLICK)` and the others reach egui as
+AccessKit's requests: the node reports its usual events (`Clicked`, `Checked`, `FloatChanged`, `TextChanged`), so
+Kotlin's lambdas run as for the pointer.
+
+`UiModifier.semantics` (`UiSemantics`) tells more than the widget, as Compose's `Modifier.semantics`: a `label` read
+instead of the text (an icon button), a `description`, a `state` in words, a `role` (tabs of `SelectableLabel`s),
+`selected`, `live` (a status line), `merge` (a card read as one node, its texts as its name) and `hidden`
+(decoration). A node with `reactions.click` is a button for a screen reader as well. The DSL gives headings, switches,
+dialogs, notices and panels their roles itself.
+
+How the tree reaches a screen reader depends on the platform, because egui draws into one surface that the platform
+knows nothing about:
+
+| Platform | Path |
+| --- | --- |
+| Android, macOS, Windows (Compose) | An invisible box with Compose semantics per node, at its `bounds`, over the composable that shows the overlay (`EguiSemantics` in the Kotlin DSL's handover). TalkBack, VoiceOver and Narrator find them as they find Compose's own widgets; their actions (`onClick`, `setProgress`, `setText`, `requestFocus`, `expand`) call `accessAction`, `accessSetValue` and `accessSetText`. The boxes take no pointer input. |
+| Browser | An invisible copy of the tree as HTML with ARIA roles over the canvas (`AriaMirror` in the Kotlin DSL's handover): `button`, `switch`, `slider`, `textbox`, `tab`, `dialog`, `aria-live` and so on. Elements are kept from frame to frame, focus follows egui's in both directions. |
+| Linux desktop | Compose has no screen reader support there; with the feature `atspi` the overlay speaks AT-SPI itself through [accesskit_unix](https://crates.io/crates/accesskit_unix) (Orca). `enableAtspi(name)` starts it, `setAtspiWindow(bounds, focused)` says where the window is on the screen and whether it is active. Requests of the reader arrive with the next frame. |
+
+`cargo run -p three-d-egui-uniffi --example atspi --features atspi -- 60` shows a panel for a minute to try it with Orca
+or `accerciser`. Without the feature (or off Linux) `enableAtspi` returns `false` and nothing else changes.
 
 ## What the platform does
 

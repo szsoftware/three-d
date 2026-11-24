@@ -73,9 +73,9 @@ jobs:
       - name: Clippy ray tracing for Kotlin
         run: cargo clippy -p three-d-raytrace-uniffi --all-targets -- -D warnings
 
-      # egui described from Kotlin (egui-uniffi)
+      # egui described from Kotlin (egui-uniffi), with the bridge to the screen readers of Linux (only built there)
       - name: Clippy egui for Kotlin
-        run: cargo clippy -p three-d-egui-uniffi --all-targets -- -D warnings
+        run: cargo clippy -p three-d-egui-uniffi --all-targets --features atspi -- -D warnings
 
       # Software drivers for Vulkan and OpenGL (through EGL), so that the tests of the wgpu backend run without a GPU and compare it with the OpenGL backend
       - if: startsWith(matrix.os, 'ubuntu')

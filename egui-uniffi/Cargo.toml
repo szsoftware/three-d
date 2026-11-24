@@ -21,6 +21,10 @@ syntect = ["egui_extras/syntect"]
 # Widget::Image and the other images from the bytes of PNG, JPEG, GIF and WebP files (moving ones too) and SVG (sharp
 # at any size), decoded by egui_extras' loaders; without it only images from pixels (set_image_rgba)
 images = ["egui_extras/image", "egui_extras/gif", "egui_extras/webp", "egui_extras/svg", "dep:image"]
+# The accessibility tree for the screen readers of a Linux desktop (AT-SPI: Orca), where Compose has none
+# (EguiOverlay.enable_atspi); AccessKit's adapter for Unix with zbus, about 1.5 MB. Without it, or on other systems,
+# enable_atspi says false.
+atspi = ["dep:accesskit_unix"]
 
 [dependencies]
 uniffi = "0.32"
@@ -41,6 +45,10 @@ skrifa = { version = "0.40", default-features = false, features = ["std"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
 # The days of Widget::DatePicker, as egui_extras has them
 jiff = { version = "0.2.23", default-features = false, features = ["std"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# The version for egui's AccessKit 0.24
+accesskit_unix = { version = "0.22", optional = true }
 
 [dev-dependencies]
 # egui's own fonts as fonts from Kotlin in the tests

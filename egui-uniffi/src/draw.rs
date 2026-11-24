@@ -17,6 +17,8 @@ pub(crate) fn draw(ui: &mut Ui, state: &mut UiState) {
     state.previous = std::mem::take(&mut state.bounds);
     state.screen_bounds.clear();
     state.panels.clear();
+    state.access_nodes.clear();
+    state.access_merged.clear();
     crate::pictures::hand_images(ui.ctx(), state);
     if state.focus == Some(Focus::Clear) {
         state.focus = None;
@@ -173,8 +175,12 @@ impl Frame<'_> {
                 }
                 // Folded away (after its animation) it is not there at all
                 let Some(r) = panel.show_animated_inside(ui, *expanded, |ui| {
+                    self.access_root(ui, node);
                     if let Some(title) = title {
-                        ui.heading(title);
+                        let r = ui.heading(title);
+                        if self.state.access {
+                            crate::access::heading(ui.ctx(), r.id, title);
+                        }
                     }
                     self.inside(ui, node);
                 }) else {
@@ -190,6 +196,7 @@ impl Frame<'_> {
                     egui::Panel::bottom(id)
                 };
                 let Some(r) = panel.show_animated_inside(ui, *expanded, |ui| {
+                    self.access_root(ui, node);
                     ui.horizontal(|ui| self.inside(ui, node));
                 }) else {
                     return;
@@ -203,7 +210,10 @@ impl Frame<'_> {
                 } else {
                     egui::CentralPanel::no_frame()
                 };
-                let r = panel.show_inside(ui, |ui| self.inside(ui, node));
+                let r = panel.show_inside(ui, |ui| {
+                    self.access_root(ui, node);
+                    self.inside(ui, node)
+                });
                 if *frame {
                     self.state.panels.push(r.response.rect.into());
                 } else {
@@ -276,6 +286,7 @@ impl Frame<'_> {
                             ui.set_height(*h);
                         }
                     }
+                    self.access_root(ui, node);
                     self.inside(ui, node)
                 });
                 if *kotlin_open && !open {
@@ -298,6 +309,7 @@ impl Frame<'_> {
                     .show(ui.ctx(), |ui| {
                         // An area is as wide as its content: a frame time near the edge does not wrap
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                        self.access_root(ui, node);
                         if *frame {
                             egui::Frame::popup(ui.style()).show(ui, |ui| self.inside(ui, node));
                         } else {
@@ -310,7 +322,10 @@ impl Frame<'_> {
                 if self.state.local(node.id) == Some(&Local::Closed) {
                     return;
                 }
-                let r = egui::Modal::new(id).show(ui.ctx(), |ui| self.inside(ui, node));
+                let r = egui::Modal::new(id).show(ui.ctx(), |ui| {
+                    self.access_root(ui, node);
+                    self.inside(ui, node)
+                });
                 if *dismissible && r.should_close() {
                     self.state
                         .change(Local::Closed, UiEvent::Closed { id: node.id });
@@ -322,6 +337,14 @@ impl Frame<'_> {
         };
         self.state.bounds.insert(node.id, response.rect.into());
         self.attached(&response, node);
+    }
+
+    /// What assistive technology learns of a panel, a window or an area: on the ui of the nodes inside, which egui's
+    /// AccessKit tree has them in.
+    fn access_root(&mut self, ui: &Ui, node: &UiNode) {
+        if self.state.access {
+            crate::access::node(ui.ctx(), self.state, node, ui.unique_id(), false);
+        }
     }
 
     /// The menus, tooltips and popups that belong to `node`, at its `response`.
@@ -472,6 +495,10 @@ impl Frame<'_> {
             );
         }
         let response = scope.inner.unwrap_or(scope.response);
+        if self.state.access {
+            let clicks = response.sense.senses_click();
+            crate::access::node(ui.ctx(), self.state, node, response.id, clicks);
+        }
         if self.state.focus == Some(Focus::Node(node.id)) {
             self.state.focus = None;
             response.request_focus();
@@ -1560,10 +1587,15 @@ impl Frame<'_> {
                     job.wrap.max_width = wrap;
                     ui.fonts_mut(|f| f.layout_job(job))
                 };
+                let access = state.access;
                 let r = ui
                     .horizontal(|ui| {
                         if !label.is_empty() {
-                            ui.label(label.as_str());
+                            let l = ui.label(label.as_str());
+                            // The label is the field's name for a screen reader, not a text of its own
+                            if access {
+                                crate::access::hide(ui.ctx(), l.id);
+                            }
                         }
                         let mut shown: &str = &text.clone();
                         let buffer: &mut dyn egui::TextBuffer =
@@ -1595,8 +1627,17 @@ impl Frame<'_> {
                         ui.add(edit)
                     })
                     .inner;
+                // A new text from assistive technology: a screen reader's edit, the input of a browser's ARIA mirror
+                let mut typed = r.changed();
+                if access && !*read_only {
+                    crate::access::takes_text(ui.ctx(), r.id, label);
+                    if let Some(new) = crate::access::new_text(ui, r.id) {
+                        text = new;
+                        typed = true;
+                    }
+                }
                 // egui reports a change for a key that changes nothing (Delete at the end, typing into a field to read)
-                if r.changed() && text != before {
+                if typed && text != before {
                     state.change(
                         Local::Text(text.clone()),
                         UiEvent::TextChanged {
