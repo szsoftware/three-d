@@ -21,6 +21,7 @@ uniffi::setup_scaffolding!();
 mod draw;
 mod error;
 mod input;
+mod output;
 mod overlay;
 mod state;
 #[cfg(test)]
@@ -29,10 +30,12 @@ mod tree;
 
 pub use error::*;
 pub use input::UiInput;
+pub use output::{UiCursor, UiLink, UiOutput, UiTextInput};
 pub use overlay::*;
 pub use state::{UiEvent, UiRect};
 pub(crate) use tree::Tree;
 pub use tree::{
     Align, Anchor, Arrangement, NoticeLevel, PlotSeries, ScrollDirection, SeriesKind, Side,
-    TextSpan, TextStyle, TextWrap, UiInsets, UiModifier, UiNode, UiShadow, UiStroke, Widget,
+    SliderClamping, SliderHandle, TextSpan, TextStyle, TextWrap, UiDate, UiInsets, UiModifier,
+    UiNode, UiShadow, UiStroke, Widget,
 };

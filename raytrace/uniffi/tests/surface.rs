@@ -798,6 +798,7 @@ fn realtime_view_with_egui_over_it() {
                 Widget::Checkbox {
                     text: "Sun".into(),
                     checked: false,
+                    indeterminate: false,
                 },
             ),
         ])

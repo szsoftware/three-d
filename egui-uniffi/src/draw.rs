@@ -1,9 +1,11 @@
 //! The tree drawn with egui, in immediate mode, every frame.
 
+use crate::state::Focus;
 use crate::state::{Local, UiRect, UiState};
 use crate::{
-    Anchor, Arrangement, NoticeLevel, PlotSeries, ScrollDirection, SeriesKind, Side, TextSpan,
-    TextStyle, Tree, UiEvent, UiInsets, UiModifier, UiNode, Widget,
+    Anchor, Arrangement, NoticeLevel, PlotSeries, ScrollDirection, SeriesKind, Side,
+    SliderClamping, SliderHandle, TextSpan, TextStyle, Tree, UiDate, UiEvent, UiInsets, UiModifier,
+    UiNode, Widget,
 };
 use std::collections::HashMap;
 use three_d::egui::{self, Color32, Id, Layout, Response, RichText, Ui, UiBuilder};
@@ -13,11 +15,51 @@ pub(crate) fn draw(ui: &mut Ui, state: &mut UiState) {
     let tree = std::mem::take(&mut state.tree);
     state.previous = std::mem::take(&mut state.bounds);
     state.panels.clear();
-    let mut frame = Frame { tree: &tree, state };
+    if state.focus == Some(Focus::Clear) {
+        state.focus = None;
+        ui.ctx().memory_mut(|m| {
+            if let Some(id) = m.focused() {
+                m.surrender_focus(id);
+            }
+        });
+    }
+    let mut frame = Frame {
+        tree: &tree,
+        state,
+        watched: Vec::new(),
+    };
     for &root in &tree.roots {
-        frame.root(ui, &tree.nodes[root]);
+        let node = &tree.nodes[root];
+        if matches!(node.widget, Widget::Shortcut { .. }) {
+            frame.shortcut(ui.ctx(), node);
+        } else {
+            frame.root(ui, node);
+        }
+    }
+    let watched = frame.watched;
+    // Who has the keyboard after all nodes are drawn: one may have taken it from another drawn before
+    let focused = ui.ctx().memory(|m| {
+        watched
+            .iter()
+            .find(|(_, id)| m.has_focus(*id))
+            .map(|(node, _)| *node)
+    });
+    if focused != state.focused {
+        if let Some(id) = state.focused {
+            state.push(UiEvent::FocusChanged { id, focused: false });
+        }
+        if let Some(id) = focused {
+            state.push(UiEvent::FocusChanged { id, focused: true });
+        }
+        state.focused = focused;
     }
     state.tree = tree;
+}
+
+/// ARGB of an egui color.
+fn to_argb(c: Color32) -> u32 {
+    let [r, g, b, a] = c.to_srgba_unmultiplied();
+    u32::from_be_bytes([a, r, g, b])
 }
 
 fn argb(c: u32) -> Color32 {
@@ -54,6 +96,8 @@ fn tooltip(response: Response, node: &UiNode) -> Response {
 struct Frame<'a> {
     tree: &'a Tree,
     state: &'a mut UiState,
+    /// The nodes that report focus ([UiModifier::focus_events]) with the ids of their responses.
+    watched: Vec<(u64, Id)>,
 }
 
 impl Frame<'_> {
@@ -245,6 +289,11 @@ impl Frame<'_> {
 
     /// A node inside a container: in a scope of its own id, so that egui keeps its state when nodes before it come and go.
     fn node(&mut self, ui: &mut Ui, node: &UiNode) {
+        // A key takes no room
+        if matches!(node.widget, Widget::Shortcut { .. }) {
+            self.shortcut(ui.ctx(), node);
+            return;
+        }
         let mut builder = UiBuilder::new().id_salt(("three-d-egui", node.id));
         if !node.enabled {
             builder = builder.disabled();
@@ -267,7 +316,12 @@ impl Frame<'_> {
             Some(m) => modified(
                 ui,
                 m,
-                matches!(node.widget, Widget::Button { .. }),
+                matches!(
+                    node.widget,
+                    Widget::Button { .. }
+                        | Widget::SelectableLabel { .. }
+                        | Widget::ToggleButton { .. }
+                ),
                 align,
                 |ui| self.widget(ui, node),
             ),
@@ -283,14 +337,53 @@ impl Frame<'_> {
                 .request_discard("a node in a row changed its height");
         }
         self.state.bounds.insert(node.id, rect.into());
-        tooltip(scope.inner.unwrap_or(scope.response), node);
+        let response = scope.inner.unwrap_or(scope.response);
+        if self.state.focus == Some(Focus::Node(node.id)) {
+            self.state.focus = None;
+            response.request_focus();
+        }
+        if modifier.is_some_and(|m| m.focus_events) {
+            self.watched.push((node.id, response.id));
+        }
+        tooltip(response, node);
+    }
+
+    /// A [Widget::Shortcut]: [UiEvent::Clicked] when its keys are pressed. Without Ctrl or Alt it waits while a text
+    /// field has the keyboard, which needs the keys itself.
+    fn shortcut(&mut self, ctx: &egui::Context, node: &UiNode) {
+        let Widget::Shortcut {
+            key,
+            ctrl,
+            shift,
+            alt,
+        } = &node.widget
+        else {
+            return;
+        };
+        let Some(key) = crate::input::key_named(key) else {
+            return;
+        };
+        if !node.enabled || (!ctrl && !alt && ctx.text_edit_focused()) {
+            return;
+        }
+        let modifiers = egui::Modifiers {
+            alt: *alt,
+            shift: *shift,
+            command: *ctrl,
+            ..Default::default()
+        };
+        let shortcut = egui::KeyboardShortcut::new(modifiers, key);
+        if ctx.input_mut(|i| i.consume_shortcut(&shortcut)) {
+            self.state.push(UiEvent::Clicked { id: node.id });
+        }
     }
 
     /// Where a node goes in a row that has its nodes in the middle or at the bottom, and its height of the last pass.
     ///
     /// egui puts a node across before the node has its height, which it knows beforehand only for a single widget: a
     /// button lands in the middle, but a column, a frame or a button with a size would start at the middle and hang
-    /// down. They go where their height of the last pass puts them (the first pass is redone). `None`: egui places it.
+    /// down, as a field of several lines does. They go where their height of the last pass puts them (the first pass is
+    /// redone). `None`: egui places it.
     fn across(&self, ui: &Ui, node: &UiNode) -> Option<(egui::Rect, f32)> {
         use egui::emath::GuiRounding;
         let layout = ui.layout();
@@ -300,6 +393,7 @@ impl Frame<'_> {
             .map_or(layout.cross_align, Into::into);
         // What fills the height takes the row as it is
         let measured = (node.widget.is_container()
+            || node.widget.grows_down()
             || m.is_some_and(|m| m.has_frame() || m.has_size()))
             && !m.is_some_and(|m| m.fill_height);
         if !layout.is_horizontal() || layout.cross_justify || cross == egui::Align::Min || !measured
@@ -609,19 +703,75 @@ impl Frame<'_> {
                 ui.add_space(*size);
                 return None;
             }
-            Widget::Button { text } => {
-                let r = ui.button(text.as_str());
+            Widget::Button {
+                text,
+                small,
+                frame,
+                selected,
+                shortcut,
+                fill,
+            } => {
+                let mut button = egui::Button::new(text.as_str())
+                    .frame(*frame)
+                    .selected(*selected);
+                if *small {
+                    button = button.small();
+                }
+                if let Some(shortcut) = shortcut {
+                    button = button.shortcut_text(shortcut.as_str());
+                }
+                if let Some(fill) = fill {
+                    button = button.fill(argb(*fill));
+                }
+                let r = ui.add(button);
                 if r.clicked() {
                     state.push(UiEvent::Clicked { id });
                 }
                 r
             }
-            Widget::Checkbox { text, checked } => {
+            Widget::SelectableLabel { text, selected } => {
+                let r = ui.selectable_label(*selected, text.as_str());
+                if r.clicked() {
+                    state.push(UiEvent::Clicked { id });
+                }
+                r
+            }
+            Widget::RadioButton { text, selected } => {
+                let r = ui.radio(*selected, text.as_str());
+                if r.clicked() {
+                    state.push(UiEvent::Clicked { id });
+                }
+                r
+            }
+            Widget::ToggleButton { text, checked } | Widget::Switch { text, checked } => {
                 let mut value = match state.local(id) {
                     Some(Local::Bool(v)) => *v,
                     _ => *checked,
                 };
-                let r = ui.checkbox(&mut value, text.as_str());
+                let r = if matches!(node.widget, Widget::Switch { .. }) {
+                    switch(ui, &mut value, text)
+                } else {
+                    ui.toggle_value(&mut value, text.as_str())
+                };
+                if r.changed() {
+                    state.change(Local::Bool(value), UiEvent::Checked { id, checked: value });
+                }
+                r
+            }
+            Widget::Checkbox {
+                text,
+                checked,
+                indeterminate,
+            } => {
+                let mut value = match state.local(id) {
+                    Some(Local::Bool(v)) => *v,
+                    _ => *checked,
+                };
+                // Until Kotlin answers a click, the box shows what the user chose
+                let indeterminate = *indeterminate && state.local(id).is_none();
+                let r = ui.add(
+                    egui::Checkbox::new(&mut value, text.as_str()).indeterminate(indeterminate),
+                );
                 if r.changed() {
                     state.change(Local::Bool(value), UiEvent::Checked { id, checked: value });
                 }
@@ -693,12 +843,34 @@ impl Frame<'_> {
                 value,
                 min,
                 max,
+                logarithmic,
+                suffix,
+                prefix,
+                step,
+                vertical,
+                clamping,
+                show_value,
+                trailing_fill,
+                handle,
             } => {
                 let mut v = match state.local(id) {
                     Some(Local::Int(v)) => *v,
                     _ => *value,
                 };
-                let r = ui.add(egui::Slider::new(&mut v, *min..=*max).text(label.as_str()));
+                let slider = egui::Slider::new(&mut v, *min..=*max)
+                    .text(label.as_str())
+                    .logarithmic(*logarithmic)
+                    .suffix(suffix.as_str());
+                let options = SliderOptions {
+                    prefix,
+                    step: *step,
+                    vertical: *vertical,
+                    clamping: *clamping,
+                    show_value: *show_value,
+                    trailing_fill: *trailing_fill,
+                    handle: *handle,
+                };
+                let r = ui.add(options.apply(slider));
                 if r.changed() {
                     state.change(Local::Int(v), UiEvent::IntChanged { id, value: v });
                 }
@@ -712,6 +884,13 @@ impl Frame<'_> {
                 logarithmic,
                 decimals,
                 suffix,
+                prefix,
+                step,
+                vertical,
+                clamping,
+                show_value,
+                trailing_fill,
+                handle,
             } => {
                 let mut v = match state.local(id) {
                     Some(Local::Float(v)) => *v,
@@ -724,7 +903,16 @@ impl Frame<'_> {
                 if let Some(d) = decimals {
                     slider = slider.fixed_decimals(*d as usize);
                 }
-                let r = ui.add(slider);
+                let options = SliderOptions {
+                    prefix,
+                    step: *step,
+                    vertical: *vertical,
+                    clamping: *clamping,
+                    show_value: *show_value,
+                    trailing_fill: *trailing_fill,
+                    handle: *handle,
+                };
+                let r = ui.add(options.apply(slider));
                 if r.changed() {
                     state.change(Local::Float(v), UiEvent::FloatChanged { id, value: v });
                 }
@@ -738,19 +926,37 @@ impl Frame<'_> {
                 max,
                 decimals,
                 suffix,
+                prefix,
+                hexadecimal,
+                angle,
             } => {
                 let mut v = match state.local(id) {
                     Some(Local::Float(v)) => *v,
                     _ => *value,
                 };
+                // An angle is dragged in degrees and kept in radians, as egui's drag_angle
+                let unit = if *angle { 1f64.to_degrees() } else { 1.0 };
+                let mut shown = v * unit;
                 let r = ui
                     .horizontal(|ui| {
-                        let mut drag = egui::DragValue::new(&mut v)
+                        let suffix = if *angle && suffix.is_empty() {
+                            "°"
+                        } else {
+                            suffix.as_str()
+                        };
+                        let mut drag = egui::DragValue::new(&mut shown)
                             .speed(*speed)
-                            .range(min.unwrap_or(f64::NEG_INFINITY)..=max.unwrap_or(f64::INFINITY))
-                            .suffix(suffix.as_str());
+                            .range(
+                                min.map_or(f64::NEG_INFINITY, |m| m * unit)
+                                    ..=max.map_or(f64::INFINITY, |m| m * unit),
+                            )
+                            .prefix(prefix.as_str())
+                            .suffix(suffix);
                         if let Some(d) = decimals {
                             drag = drag.fixed_decimals(*d as usize);
+                        }
+                        if *hexadecimal {
+                            drag = drag.hexadecimal(1, false, true);
                         }
                         let r = ui.add(drag);
                         if !label.is_empty() {
@@ -760,6 +966,7 @@ impl Frame<'_> {
                     })
                     .inner;
                 if r.changed() {
+                    v = shown / unit;
                     state.change(Local::Float(v), UiEvent::FloatChanged { id, value: v });
                 }
                 r
@@ -769,24 +976,80 @@ impl Frame<'_> {
                 value,
                 hint,
                 password,
+                lines,
+                code,
+                language,
+                char_limit,
+                align,
+                read_only,
             } => {
                 let mut text = match state.local(id) {
                     Some(Local::Text(v)) => v.clone(),
                     _ => value.clone(),
+                };
+                let before = text.clone();
+                let edit_id = node_id(node).with("text");
+                // Several lines take Enter for a new line: Ctrl+Enter is done
+                let submit = lines.is_some()
+                    && ui.memory(|m| m.has_focus(edit_id))
+                    && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
+                // A size of the modifier is the field's
+                let fill = node
+                    .modifier
+                    .as_ref()
+                    .is_some_and(|m| m.width.is_some() || m.fill_width);
+                let mut layouter = |ui: &Ui, buffer: &dyn egui::TextBuffer, wrap: f32| {
+                    let theme = egui_extras::syntax_highlighting::CodeTheme::from_memory(
+                        ui.ctx(),
+                        ui.style(),
+                    );
+                    let mut job = egui_extras::syntax_highlighting::highlight(
+                        ui.ctx(),
+                        ui.style(),
+                        &theme,
+                        buffer.as_str(),
+                        language.as_deref().unwrap_or_default(),
+                    );
+                    job.wrap.max_width = wrap;
+                    ui.fonts_mut(|f| f.layout_job(job))
                 };
                 let r = ui
                     .horizontal(|ui| {
                         if !label.is_empty() {
                             ui.label(label.as_str());
                         }
-                        ui.add(
-                            egui::TextEdit::singleline(&mut text)
-                                .hint_text(hint.as_str())
-                                .password(*password),
-                        )
+                        let mut shown: &str = &text.clone();
+                        let buffer: &mut dyn egui::TextBuffer =
+                            if *read_only { &mut shown } else { &mut text };
+                        let mut edit = match lines {
+                            Some(rows) => {
+                                egui::TextEdit::multiline(buffer).desired_rows(*rows as usize)
+                            }
+                            None => egui::TextEdit::singleline(buffer),
+                        }
+                        .id(edit_id)
+                        .hint_text(hint.as_str())
+                        .password(*password);
+                        if *code {
+                            edit = edit.code_editor();
+                        }
+                        if let Some(limit) = char_limit {
+                            edit = edit.char_limit(*limit as usize);
+                        }
+                        if let Some(align) = align {
+                            edit = edit.horizontal_align((*align).into());
+                        }
+                        if fill {
+                            edit = edit.desired_width(f32::INFINITY);
+                        }
+                        if language.is_some() {
+                            edit = edit.layouter(&mut layouter);
+                        }
+                        ui.add(edit)
                     })
                     .inner;
-                if r.changed() {
+                // egui reports a change for a key that changes nothing (Delete at the end, typing into a field to read)
+                if r.changed() && text != before {
                     state.change(
                         Local::Text(text.clone()),
                         UiEvent::TextChanged {
@@ -795,11 +1058,120 @@ impl Frame<'_> {
                         },
                     );
                 }
-                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                if submit
+                    || (lines.is_none()
+                        && r.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                {
                     state.push(UiEvent::Submitted { id, value: text });
                 }
                 r
             }
+            Widget::ColorPicker {
+                label,
+                color,
+                alpha,
+                inline,
+            } => {
+                let mut c = match state.local(id) {
+                    Some(Local::Color(v)) => argb(*v),
+                    _ => argb(*color),
+                };
+                let alpha = if *alpha {
+                    egui::color_picker::Alpha::OnlyBlend
+                } else {
+                    egui::color_picker::Alpha::Opaque
+                };
+                let r = ui
+                    .horizontal(|ui| {
+                        let mut r = if *inline {
+                            let mut changed = false;
+                            let mut r = ui
+                                .vertical(|ui| {
+                                    changed =
+                                        egui::color_picker::color_picker_color32(ui, &mut c, alpha)
+                                })
+                                .response;
+                            if changed {
+                                r.mark_changed();
+                            }
+                            r
+                        } else {
+                            egui::color_picker::color_edit_button_srgba(ui, &mut c, alpha)
+                        };
+                        if !label.is_empty() {
+                            r = r.union(ui.label(label.as_str()));
+                        }
+                        r
+                    })
+                    .inner;
+                if r.changed() {
+                    let color = to_argb(c);
+                    state.change(Local::Color(color), UiEvent::ColorChanged { id, color });
+                }
+                r
+            }
+            Widget::DatePicker {
+                label,
+                date,
+                format,
+                calendar_week,
+                highlight_weekends,
+                first_year,
+                last_year,
+            } => {
+                let shown = match state.local(id) {
+                    Some(Local::Date(d)) => *d,
+                    _ => *date,
+                };
+                // Checked with the tree
+                let mut day = shown.to_jiff().unwrap_or_default();
+                let salt = format!("three-d-egui-date-{id}");
+                let r = ui
+                    .horizontal(|ui| {
+                        let mut picker = egui_extras::DatePickerButton::new(&mut day)
+                            .id_salt(&salt)
+                            .calendar_week(*calendar_week)
+                            .highlight_weekends(*highlight_weekends);
+                        if let Some(format) = format {
+                            picker = picker.format(format.as_str());
+                        }
+                        if first_year.is_some() || last_year.is_some() {
+                            let now = jiff::Zoned::now().year() as i32;
+                            let year = |y: i32| y.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                            picker = picker.start_end_years(
+                                year(first_year.unwrap_or(now - 100))
+                                    ..=year(last_year.unwrap_or(now + 10)),
+                            );
+                        }
+                        let r = ui.add(picker);
+                        if !label.is_empty() {
+                            ui.label(label.as_str());
+                        }
+                        r
+                    })
+                    .inner;
+                if r.changed() {
+                    let date = UiDate::from_jiff(day);
+                    state.change(Local::Date(date), UiEvent::DateChanged { id, date });
+                }
+                r
+            }
+            Widget::Link { text, url, new_tab } => {
+                let r = match url {
+                    Some(url) => ui.add(
+                        egui::Hyperlink::from_label_and_url(text.as_str(), url)
+                            .open_in_new_tab(*new_tab),
+                    ),
+                    None => ui.link(text.as_str()),
+                };
+                if r.clicked() {
+                    state.push(UiEvent::Clicked { id });
+                }
+                r
+            }
+            // Handled before, in Frame::node
+            Widget::Shortcut { .. } => return None,
             Widget::ProgressBar { progress, text } => {
                 let mut bar = egui::ProgressBar::new(progress.clamp(0.0, 1.0));
                 bar = match text {
@@ -1310,4 +1682,91 @@ fn box_text(s: &PlotSeries, places: &Places, unit: &str) -> BoxText {
             number(v.lower_whisker)
         )
     })
+}
+
+/// The options both sliders have.
+struct SliderOptions<'a> {
+    prefix: &'a str,
+    step: Option<f64>,
+    vertical: bool,
+    clamping: Option<SliderClamping>,
+    show_value: bool,
+    trailing_fill: Option<bool>,
+    handle: Option<SliderHandle>,
+}
+
+impl SliderOptions<'_> {
+    fn apply<'s>(&self, mut slider: egui::Slider<'s>) -> egui::Slider<'s> {
+        slider = slider.prefix(self.prefix).show_value(self.show_value);
+        if let Some(step) = self.step {
+            slider = slider.step_by(step);
+        }
+        if self.vertical {
+            slider = slider.vertical();
+        }
+        if let Some(clamping) = self.clamping {
+            slider = slider.clamping(match clamping {
+                SliderClamping::Never => egui::SliderClamping::Never,
+                SliderClamping::Edits => egui::SliderClamping::Edits,
+                SliderClamping::Always => egui::SliderClamping::Always,
+            });
+        }
+        if let Some(fill) = self.trailing_fill {
+            slider = slider.trailing_fill(fill);
+        }
+        if let Some(handle) = self.handle {
+            slider = slider.handle_shape(match handle {
+                SliderHandle::Circle => egui::style::HandleShape::Circle,
+                SliderHandle::Rect { aspect_ratio } => {
+                    egui::style::HandleShape::Rect { aspect_ratio }
+                }
+            });
+        }
+        slider
+    }
+}
+
+/// A switch as Compose's `Switch` (egui's demo has it as `toggle_switch`): a track with a knob that slides over when it is
+/// clicked, in the accent color when on; the text beside it is clicked as well.
+fn switch(ui: &mut Ui, on: &mut bool, text: &str) -> Response {
+    ui.horizontal(|ui| {
+        let size = ui.spacing().interact_size.y * egui::vec2(2.0, 1.0);
+        let (rect, mut response) = ui.allocate_exact_size(size, egui::Sense::click());
+        if !text.is_empty() {
+            response = response.union(
+                ui.add(egui::Label::new(text).sense(egui::Sense::click()))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand),
+            );
+        }
+        if response.clicked() {
+            *on = !*on;
+            response.mark_changed();
+        }
+        let checked = *on;
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), checked, text)
+        });
+        if ui.is_rect_visible(rect) {
+            let how_on = ui.ctx().animate_bool_responsive(response.id, *on);
+            let visuals = ui.style().interact_selectable(&response, *on);
+            let rect = rect.expand(visuals.expansion);
+            let radius = 0.5 * rect.height();
+            ui.painter().rect(
+                rect,
+                radius,
+                visuals.bg_fill,
+                visuals.bg_stroke,
+                egui::StrokeKind::Inside,
+            );
+            let x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), how_on);
+            ui.painter().circle(
+                egui::pos2(x, rect.center().y),
+                0.75 * radius,
+                visuals.bg_fill,
+                visuals.fg_stroke,
+            );
+        }
+        response
+    })
+    .inner
 }

@@ -59,6 +59,7 @@ fn tree(checked: bool) -> Vec<UiNode> {
             Widget::Checkbox {
                 text: "Shadows".into(),
                 checked,
+                indeterminate: false,
             },
         ),
         node(
@@ -66,6 +67,11 @@ fn tree(checked: bool) -> Vec<UiNode> {
             Some(1),
             Widget::Button {
                 text: "Photo".into(),
+                small: false,
+                frame: true,
+                selected: false,
+                shortcut: None,
+                fill: None,
             },
         ),
     ]
@@ -439,6 +445,7 @@ fn an_options_panel_as_in_the_raytrace_window() {
             Widget::Checkbox {
                 text: "Denoise".into(),
                 checked: true,
+                indeterminate: false,
             },
         ),
         node(4, Some(1), text("Tracer")),
@@ -451,6 +458,15 @@ fn an_options_panel_as_in_the_raytrace_window() {
                 value: 2,
                 min: 1,
                 max: 8,
+                logarithmic: false,
+                suffix: String::new(),
+                prefix: String::new(),
+                step: None,
+                vertical: false,
+                clamping: None,
+                show_value: true,
+                trailing_fill: None,
+                handle: None,
             },
         ),
         node(7, Some(1), Widget::Separator),
@@ -460,6 +476,11 @@ fn an_options_panel_as_in_the_raytrace_window() {
             Some(8),
             Widget::Button {
                 text: "Photo".into(),
+                small: false,
+                frame: true,
+                selected: false,
+                shortcut: None,
+                fill: None,
             },
         ),
         node(
@@ -467,6 +488,11 @@ fn an_options_panel_as_in_the_raytrace_window() {
             Some(8),
             Widget::Button {
                 text: "Cancel".into(),
+                small: false,
+                frame: true,
+                selected: false,
+                shortcut: None,
+                fill: None,
             },
         ),
         node(
@@ -713,7 +739,20 @@ fn a_settings_window_with_frames_rows_and_text_in_parts() {
             },
         )
     };
-    let button = |id, parent, s: &str| node(id, Some(parent), Widget::Button { text: s.into() });
+    let button = |id, parent, s: &str| {
+        node(
+            id,
+            Some(parent),
+            Widget::Button {
+                text: s.into(),
+                small: false,
+                frame: true,
+                selected: false,
+                shortcut: None,
+                fill: None,
+            },
+        )
+    };
     let mut card = node(5, Some(1), column());
     card.modifier = Some(UiModifier {
         fill_width: true,
@@ -851,6 +890,204 @@ fn a_settings_window_with_frames_rows_and_text_in_parts() {
         assert!(
             apply.x + apply.width > window.x + window.width - 20.0,
             "{name}: {apply:?} {window:?}"
+        );
+        drop(overlay);
+        release(context);
+    }
+}
+
+#[test]
+fn switches_pickers_and_code_of_the_second_phase() {
+    const ACCENT: u32 = 0xFF00A040;
+    const PURPLE: u32 = 0xFF9B59B6;
+    let row = |id| node(id, Some(1), row());
+    let nodes = vec![
+        node(
+            1,
+            None,
+            Widget::Window {
+                title: "Inputs".into(),
+                x: 10.0,
+                y: 10.0,
+                width: Some(370.0),
+                closable: false,
+                collapsible: false,
+                resizable: false,
+                height: None,
+                anchor: Some(Anchor::TopLeft),
+                movable: true,
+                title_bar: true,
+                fixed_size: true,
+                scroll: false,
+                open: true,
+            },
+        ),
+        row(2),
+        node(
+            3,
+            Some(2),
+            Widget::Switch {
+                text: "Shadows".into(),
+                checked: true,
+            },
+        ),
+        node(
+            4,
+            Some(2),
+            Widget::ToggleButton {
+                text: "Grid".into(),
+                checked: true,
+            },
+        ),
+        node(
+            5,
+            Some(2),
+            Widget::SelectableLabel {
+                text: "Garden".into(),
+                selected: true,
+            },
+        ),
+        row(6),
+        node(
+            7,
+            Some(6),
+            Widget::ColorPicker {
+                label: "Sky".into(),
+                color: PURPLE,
+                alpha: false,
+                inline: false,
+            },
+        ),
+        node(
+            8,
+            Some(6),
+            Widget::DatePicker {
+                label: "Day".into(),
+                date: UiDate {
+                    year: 2026,
+                    month: 11,
+                    day: 24,
+                },
+                format: Some("%d.%m.%Y".into()),
+                calendar_week: true,
+                highlight_weekends: true,
+                first_year: None,
+                last_year: None,
+            },
+        ),
+        row(9),
+        node(
+            10,
+            Some(9),
+            Widget::SliderFloat {
+                label: String::new(),
+                value: 0.7,
+                min: 0.0,
+                max: 1.0,
+                logarithmic: false,
+                decimals: Some(1),
+                suffix: String::new(),
+                prefix: String::new(),
+                step: None,
+                vertical: true,
+                clamping: None,
+                show_value: false,
+                trailing_fill: Some(true),
+                handle: None,
+            },
+        ),
+        node(
+            11,
+            Some(9),
+            Widget::TextField {
+                label: String::new(),
+                value: "fn main() {\n    let light = \"sun\";\n    trace(light, 64);\n}".into(),
+                hint: String::new(),
+                password: false,
+                lines: Some(4),
+                code: true,
+                language: Some("rs".into()),
+                char_limit: None,
+                align: None,
+                read_only: false,
+            },
+        ),
+        node(
+            12,
+            Some(1),
+            Widget::Link {
+                text: "three-d".into(),
+                url: Some("https://github.com/asny/three-d".into()),
+                new_tab: true,
+            },
+        ),
+    ];
+    let argb = |c: u32| {
+        let [_, r, g, b] = c.to_be_bytes();
+        [r, g, b]
+    };
+    for (name, context) in contexts() {
+        let overlay = EguiOverlay::new();
+        overlay.set_style(UiStyle {
+            dark: true,
+            accent: Some(ACCENT),
+        });
+        overlay.set_tree(nodes.clone()).unwrap();
+        for _ in 0..100 {
+            frame(&context, &overlay);
+            if !overlay.needs_repaint() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let picture = frame(&context, &overlay);
+        if let Some(dir) = std::env::var_os("THREE_D_EGUI_PICTURE") {
+            let bytes: Vec<u8> = picture.iter().flatten().copied().collect();
+            std::fs::write(
+                std::path::Path::new(&dir).join(format!("inputs-{name}.rgba")),
+                bytes,
+            )
+            .unwrap();
+        }
+        let count = |id: u64, test: &dyn Fn([u8; 4]) -> bool| {
+            let r = overlay.bounds(id).expect("drawn");
+            let mut n = 0;
+            for y in r.y as u32..(r.y + r.height) as u32 {
+                for x in r.x as u32..(r.x + r.width) as u32 {
+                    if test(pixel(&picture, x, y)) {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        let accent = |p| near(p, argb(ACCENT), 12);
+        // What is on or chosen shows the accent color
+        for id in [3, 4, 5] {
+            let n = count(id, &accent);
+            assert!(n > 40, "{name}: {n} pixels of the accent in node {id}");
+        }
+        // The color picker's button has its color, the slider stands upright with its track filled
+        let n = count(7, &|p| near(p, argb(PURPLE), 6));
+        assert!(n > 40, "{name}: {n} pixels of the chosen color");
+        let slider = overlay.bounds(10).unwrap();
+        assert!(slider.height > 2.0 * slider.width, "{name}: {slider:?}");
+        let n = count(10, &accent);
+        assert!(n > 20, "{name}: {n} pixels of the filled track");
+        // The code is colored: keywords, strings and numbers in their own colors
+        let colored = |p: [u8; 4]| {
+            let (max, min) = (p[0].max(p[1]).max(p[2]), p[0].min(p[1]).min(p[2]));
+            max - min > 60 && !accent(p)
+        };
+        let n = count(11, &colored);
+        assert!(n > 60, "{name}: {n} colored pixels in the code");
+        let field = overlay.bounds(11).unwrap();
+        assert!(field.height > 50.0, "{name}: four lines in {field:?}");
+        // egui draws the field in a frame that would hang down from the middle of the row: it is in the middle
+        let middle = |r: UiRect| r.y + r.height / 2.0;
+        assert!(
+            (middle(field) - middle(slider)).abs() < 2.0,
+            "{name}: {field:?} beside {slider:?}"
         );
         drop(overlay);
         release(context);

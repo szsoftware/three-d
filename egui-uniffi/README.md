@@ -12,8 +12,10 @@ bindings, with Compose as the model.
 | --- | --- |
 | `EguiOverlay()` | an overlay without nodes; it makes its egui when it is painted the first time |
 | `setTree(nodes)` | the tree as a flat list of `UiNode(id, parent, widget, enabled, tooltip)`; only when Kotlin's state changed |
-| `input(event)` | pointer, key and text events in pixels from the top left; `true` if egui uses it (the camera leaves it alone) |
-| `takeEvents()` | `Clicked`, `Checked`, `Selected`, `IntChanged`, `FloatChanged`, `TextChanged`, `Submitted`, `Closed`, with the node's id |
+| `input(event)` | pointer, key, text, clipboard and input method events in pixels from the top left; `true` if egui uses it (the camera leaves it alone) |
+| `takeEvents()` | `Clicked`, `Checked`, `Selected`, `IntChanged`, `FloatChanged`, `TextChanged`, `Submitted`, `Closed`, `ColorChanged`, `DateChanged`, `FocusChanged`, with the node's id |
+| `takeOutput()` | what egui asks of the platform: text for the clipboard, a wish to paste, links to open, the pointer's look, where text is typed |
+| `requestFocus(id)` | gives a node the keyboard (Compose's `FocusRequester`), `null` takes it away |
 | `needsRepaint()` | whether the next frame looks different (new tree, input, egui's hover and animations) |
 | `setScale(pixelsPerPoint)` | Compose's density times a zoom |
 | `setStyle(UiStyle(dark, accent))` | egui's dark or light look with an accent color (ARGB) |
@@ -26,9 +28,11 @@ bindings, with Compose as the model.
 At the top stand `SidePanel`, `TopBar`, `BottomBar`, `CentralPanel` (the room the others leave), `Window` and `Area`
 (pinned to a corner, an edge or the center). Inside them: the containers `Row`, `Column`, `Columns`, `Sides`, `Indent`,
 `Resize`, `Grid`, `Collapsible`, `ScrollArea`, `Group` and the widgets `Text`, `Separator`, `Spacer`, `Button`, `Checkbox`,
-`Radio`, `ComboBox`, `SliderInt`, `SliderFloat`, `DragValue`, `TextField`, `ProgressBar`, `Spinner`, `Notice` (info,
-warning, error) and `Plot`. `setTree` refuses a tree with an id twice, a parent that is not there or holds no nodes, a
-panel inside a node, a second `CentralPanel`, `Sides` without exactly two nodes, or values that do not fit.
+`SelectableLabel`, `ToggleButton`, `RadioButton`, `Switch`, `Radio`, `ComboBox`, `SliderInt`, `SliderFloat`, `DragValue`,
+`TextField`, `ColorPicker`, `DatePicker`, `Link`, `ProgressBar`, `Spinner`, `Notice` (info, warning, error) and `Plot`;
+`Shortcut` is a key that draws nothing. `setTree` refuses a tree with an id twice, a parent that is not there or holds no
+nodes, a panel inside a node, a second `CentralPanel`, `Sides` without exactly two nodes, or values that do not fit (a
+step of 0, a logarithmic slider below 0, a field of 0 lines, a day that does not exist, a key without a name).
 
 Fields added after the first version have defaults (`#[uniffi(default)]`), so Kotlin that builds nodes without them keeps
 building.
@@ -69,6 +73,40 @@ what the others leave; without its `frame` the picture shows through and only it
 `Text` is `text` followed by `spans` in their own styles (Compose's `AnnotatedString`): each `TextSpan` may change the
 style, color, background and size and be italic, underlined, struck through, code or raised. `wrap` breaks it into lines,
 cuts it with "…" or lets it run on; `selectable = false` keeps the user from selecting it.
+
+## Inputs
+
+| Widget | Options |
+| --- | --- |
+| `Button` | `small` (toolbars), `frame = false` (Compose's `TextButton`), `selected`, `shortcut` (a faint key at its right), `fill` |
+| `SelectableLabel`, `ToggleButton` | a text that is chosen, a button that stays pressed: tabs and toolbars |
+| `RadioButton`, `Checkbox`, `Switch` | a single round button (its group are the other nodes), `indeterminate` (a dash), a switch that slides |
+| `SliderInt`, `SliderFloat` | `prefix`, `suffix`, `step`, `vertical`, `clamping` (always, never, only what the user types), `show_value`, `trailing_fill`, `handle` (round, a bar with its aspect) |
+| `DragValue` | `prefix`, `hexadecimal`, `angle` (radians, shown and dragged in degrees) |
+| `TextField` | `lines` (Enter makes a line, Ctrl+Enter submits), `code` (fixed width, Tab indents), `language` (colored as "rs", "toml", "py", "c", "cpp"; more with the feature `syntect`), `char_limit`, `align`, `read_only` |
+| `ColorPicker` | a button with the color that opens egui's picker, `alpha`, `inline` (the picker in the panel) |
+| `DatePicker` | a button with the day that opens a calendar (egui_extras), `format` (strftime), `calendar_week`, `highlight_weekends`, `first_year`, `last_year` |
+| `Link` | `Clicked`; with a `url` the application opens it as well (`takeOutput().open`) |
+| `Shortcut` | `key` with `ctrl` (Command on macOS), `shift`, `alt`: `Clicked` while its node is drawn (in an open window, a shown panel, or always at the top of the tree); without Ctrl or Alt it waits while a field has the keyboard |
+
+A modifier with `focus_events` reports `FocusChanged` when its node gets or loses the keyboard; `requestFocus(id)` gives
+it the keyboard from Kotlin.
+
+## What the platform does
+
+egui does not reach the clipboard, the browser or the input method itself: `takeOutput()` after a frame says what it asks
+for, and Kotlin answers through `input`.
+
+| `UiOutput` | What Kotlin does |
+| --- | --- |
+| `copy` | puts the text on the clipboard (after Ctrl+C or Ctrl+X, or `UiInput.Copy` and `UiInput.Cut`) |
+| `paste` | sends `UiInput.Paste(text)` with the clipboard's text (after Ctrl+V); in a browser the `paste` event brings it |
+| `open` | opens each link, in a new tab if asked |
+| `cursor` | shows this pointer (35 of them, with their CSS names) |
+| `text_input` | a field has the keyboard: show a touch keyboard, put the box of the input method at `cursor` (in pixels) |
+
+An input method composes with `ImeStart`, `ImeCompose(text)` (shown underlined), `ImeCommit(text)` and `ImeEnd`.
+`copy`, `paste` and `open` are taken with the output, `cursor` and `text_input` stay as they are.
 
 ## Plots
 
@@ -119,7 +157,7 @@ links one copy. It has no log bridge of its own: that comes from the crate that 
 
 ## Tests
 
-`cargo test -p three-d-egui-uniffi`: the tree, the values and the events with egui alone; painting, clicks through
-`input`, scale, style and repaints on OpenGL through EGL (Linux) and on wgpu. `THREE_D_SKIP_GPU_TESTS=1` leaves out the
-graphics card, `THREE_D_EGUI_PICTURE=<dir>` writes the pictures of the options panel, the plots and the settings window
-as raw RGBA.
+`cargo test -p three-d-egui-uniffi`: the tree, the values, the events, the clipboard, the input method and the focus with
+egui alone; painting, clicks through `input`, scale, style and repaints on OpenGL through EGL (Linux) and on wgpu.
+`THREE_D_SKIP_GPU_TESTS=1` leaves out the graphics card, `THREE_D_EGUI_PICTURE=<dir>` writes the pictures of the options
+panel, the plots, the settings window and the inputs as raw RGBA.

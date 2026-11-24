@@ -88,6 +88,33 @@ impl GUI {
         device_pixel_ratio: f32,
         callback: impl FnMut(&mut egui::Ui),
     ) -> bool {
+        self.update_with_egui_events(
+            Vec::new(),
+            egui::Modifiers::NONE,
+            events,
+            accumulated_time_in_ms,
+            viewport,
+            device_pixel_ratio,
+            callback,
+        )
+    }
+
+    ///
+    /// [update](Self::update) with events of egui itself before the given ones, in their order: for what three-d's
+    /// [Event] has nothing for (the clipboard, input methods) or an application translates itself. `egui_modifiers` are
+    /// held in addition to the modifiers of three-d's events.
+    ///
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_with_egui_events(
+        &mut self,
+        egui_events: Vec<egui::Event>,
+        egui_modifiers: egui::Modifiers,
+        events: &mut [Event],
+        accumulated_time_in_ms: f64,
+        viewport: Viewport,
+        device_pixel_ratio: f32,
+        callback: impl FnMut(&mut egui::Ui),
+    ) -> bool {
         self.egui_context.set_pixels_per_point(device_pixel_ratio);
         self.viewport = viewport;
         let egui_input = egui::RawInput {
@@ -104,10 +131,10 @@ impl GUI {
                 },
             }),
             time: Some(accumulated_time_in_ms * 0.001),
-            modifiers: (&self.modifiers).into(),
-            events: events
-                .iter()
-                .filter_map(|event| match event {
+            modifiers: egui_modifiers | (&self.modifiers).into(),
+            events: egui_events
+                .into_iter()
+                .chain(events.iter().filter_map(|event| match event {
                     Event::KeyPress {
                         kind,
                         modifiers,
@@ -221,7 +248,7 @@ impl GUI {
                         }
                     }
                     _ => None,
-                })
+                }))
                 .collect::<Vec<_>>(),
             ..Default::default()
         };
@@ -286,6 +313,19 @@ impl GUI {
         }
         self.egui_context.egui_wants_pointer_input()
             || self.egui_context.egui_wants_keyboard_input()
+    }
+
+    ///
+    /// What egui wants of the platform after the last [update](Self::update): text for the clipboard, links to open,
+    /// the look of the mouse cursor, where an input method shows its candidates. Taken once; call it before
+    /// [render](Self::render), which takes the rest of the frame.
+    ///
+    pub fn take_platform_output(&self) -> egui::PlatformOutput {
+        self.output
+            .borrow_mut()
+            .as_mut()
+            .map(|output| std::mem::take(&mut output.platform_output))
+            .unwrap_or_default()
     }
 
     ///
