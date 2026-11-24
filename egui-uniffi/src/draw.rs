@@ -1158,6 +1158,8 @@ impl Frame<'_> {
                 r
             }
             Widget::Link { text, url, new_tab } => {
+                // egui's link is a label: selectable, it would show the text cursor while it is pressed
+                ui.style_mut().interaction.selectable_labels = false;
                 let r = match url {
                     Some(url) => ui.add(
                         egui::Hyperlink::from_label_and_url(text.as_str(), url)

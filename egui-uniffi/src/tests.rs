@@ -2318,6 +2318,19 @@ fn links_open_their_address_and_shortcuts_work_while_drawn() {
     };
     assert_eq!(cursor(&mut run, 2), crate::UiCursor::PointingHand);
     assert_eq!(cursor(&mut run, 4), crate::UiCursor::Text);
+    // Also in the frames of a click: egui's label under the link would show the text cursor
+    let at = run.center(2);
+    let button = |pressed| egui::Event::PointerButton {
+        pos: at,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: Default::default(),
+    };
+    for event in [button(true), button(false)] {
+        let mut out = UiOutput::default();
+        out.add(run.frame(vec![event]).platform_output, 1.0);
+        assert_eq!(out.cursor, crate::UiCursor::PointingHand);
+    }
 }
 
 #[test]
