@@ -453,6 +453,122 @@ pub struct UiDate {
     pub day: u32,
 }
 
+/// How wide a column of a [Widget::Table] is (egui_extras' `Column`).
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Enum)]
+pub enum ColumnWidth {
+    /// As wide as its widest cell that was drawn (egui's default). A column the user may resize takes the width of
+    /// the first frame only, the user widens it then: with many rows only those in sight were drawn.
+    Auto,
+    /// This wide at first; the user may change it if the column is resizable.
+    Initial {
+        /// In points.
+        width: f32,
+    },
+    /// Always this wide, what does not fit is cut.
+    Exact {
+        /// In points.
+        width: f32,
+    },
+    /// What the other columns leave, shared with the other columns of this kind. Columns the user may resize keep
+    /// their width of the first frame, in which [ColumnWidth::Auto] ones take a guess: only the last column takes all
+    /// that is left in every frame.
+    Remainder,
+}
+
+/// A column of a [Widget::Table].
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct TableColumn {
+    /// In the header; a table whose columns have no titles and no [Widget::TableRow] header has no header.
+    #[uniffi(default)]
+    pub title: String,
+    /// How wide, `None` [ColumnWidth::Auto].
+    #[uniffi(default)]
+    pub width: Option<ColumnWidth>,
+    /// At least this wide, in points.
+    #[uniffi(default)]
+    pub min_width: Option<f32>,
+    /// At most this wide, in points.
+    #[uniffi(default)]
+    pub max_width: Option<f32>,
+    /// The user may drag its right edge, `None` as the table says ([Widget::Table::resizable]).
+    #[uniffi(default)]
+    pub resizable: Option<bool>,
+    /// Cuts what is wider than the column instead of letting it run into the next one.
+    #[uniffi(default)]
+    pub clip: bool,
+    /// Where the cells sit across the column, `None` at the start.
+    #[uniffi(default)]
+    pub align: Option<Align>,
+    /// A click on the title sorts by this column ([crate::UiEvent::SortChanged]); the title shows an arrow while the
+    /// table is sorted by it ([Widget::Table::sort]).
+    #[uniffi(default)]
+    pub sortable: bool,
+    /// The style of its text from [crate::EguiOverlay::set_table_data], `None` [TextStyle::Body].
+    #[uniffi(default)]
+    pub style: Option<TextStyle>,
+}
+
+/// How many rows of a [Widget::Table] the user may select.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum TableSelection {
+    /// One: a click selects its row.
+    Single,
+    /// Any: a click selects its row, with Ctrl (Command on a Mac) it adds or removes it, with Shift it selects the rows
+    /// from the last clicked one to it.
+    Multiple,
+}
+
+/// The column a [Widget::Table] is sorted by, as Kotlin sorted it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct TableSort {
+    /// Its index.
+    pub column: u32,
+    /// Smallest first.
+    pub ascending: bool,
+}
+
+/// The room of a cell of a [Widget::Strip] along it (egui_extras' `Size`).
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Enum)]
+pub enum StripSize {
+    /// Always this many points.
+    Exact {
+        /// In points.
+        points: f32,
+    },
+    /// This many points at first (a strip does not let the user change it, so it is as [StripSize::Exact] with
+    /// bounds).
+    Initial {
+        /// In points.
+        points: f32,
+        /// At least this many points.
+        #[uniffi(default)]
+        min: Option<f32>,
+        /// At most this many points.
+        #[uniffi(default)]
+        max: Option<f32>,
+    },
+    /// This part of the whole strip (not of what the exact cells leave), 0.25 for a quarter.
+    Relative {
+        /// From 0 to 1.
+        fraction: f32,
+        /// At least this many points.
+        #[uniffi(default)]
+        min: Option<f32>,
+        /// At most this many points.
+        #[uniffi(default)]
+        max: Option<f32>,
+    },
+    /// What the other cells leave, shared with the other cells of this kind.
+    Remainder {
+        /// At least this many points.
+        #[uniffi(default)]
+        min: Option<f32>,
+        /// At most this many points.
+        #[uniffi(default)]
+        max: Option<f32>,
+    },
+}
+
 /// What a node is. The panels, windows and areas stand at the top of the tree (no parent), the containers hold other
 /// nodes, the rest are widgets. Sizes are in points of egui (pixels divided by [crate::EguiOverlay::set_scale]).
 ///
@@ -637,6 +753,70 @@ pub enum Widget {
     },
     /// Its nodes in a frame.
     Group,
+    /// A table of rows and columns (egui_extras' `TableBuilder`): a header from the columns' titles (a click on a
+    /// sortable one sorts) or from a header [Widget::TableRow], rows that scroll under it, every other one striped, rows
+    /// the user selects, columns the user makes wider. The rows are either [Widget::TableRow] nodes (a few dozen with
+    /// widgets in their cells) or the text of [crate::EguiOverlay::set_table_data] under [Widget::Table::data] (tens of
+    /// thousands, of which only those seen are drawn).
+    Table {
+        /// Its columns, at least one.
+        columns: Vec<TableColumn>,
+        /// The key of the rows' text given with [crate::EguiOverlay::set_table_data], instead of row nodes.
+        #[uniffi(default)]
+        data: Option<String>,
+        /// Every other row on a darker background.
+        #[uniffi(default = true)]
+        striped: bool,
+        /// The user may drag the edges of the columns (each column may say otherwise).
+        #[uniffi(default)]
+        resizable: bool,
+        /// Whether and how many rows the user may select ([crate::UiEvent::RowsSelected]), and a double click on a row
+        /// reports it ([crate::UiEvent::RowActivated]); `None` the rows do not react.
+        #[uniffi(default)]
+        selection: Option<TableSelection>,
+        /// The selected rows, by their index.
+        #[uniffi(default)]
+        selected: Vec<u64>,
+        /// The column the rows are sorted by, as Kotlin sorted them.
+        #[uniffi(default)]
+        sort: Option<TableSort>,
+        /// The height of a row in points, `None` a line of text; a [Widget::TableRow] may have its own.
+        #[uniffi(default)]
+        row_height: Option<f32>,
+        /// The height the rows take at most before they scroll, `None` all there is.
+        #[uniffi(default)]
+        max_height: Option<f32>,
+        /// Stays at the end while rows come at the end, as a log does, until the user scrolls away.
+        #[uniffi(default)]
+        stick_to_end: bool,
+        /// Scrolls to the row with this index when the value changes.
+        #[uniffi(default)]
+        scroll_to: Option<u64>,
+    },
+    /// A row of a [Widget::Table]: one node per column, the first in the first column (a [Widget::Row] or
+    /// [Widget::Column] for several in one cell). Fewer nodes than columns leave the last cells empty.
+    TableRow {
+        /// The header of the table instead of a row (only its first node may be one); the columns' titles are not shown
+        /// then.
+        #[uniffi(default)]
+        header: bool,
+        /// The height of this row in points, `None` the table's.
+        #[uniffi(default)]
+        height: Option<f32>,
+    },
+    /// Its nodes side by side (or one under the other) in cells of the given sizes (egui_extras' `StripBuilder`): a
+    /// sidebar of 200 points and the rest, three thirds. One node per cell (a [Widget::Column] for several), fewer
+    /// nodes leave the last cells empty; a strip in a cell divides that cell.
+    Strip {
+        /// The size of each cell along the strip.
+        sizes: Vec<StripSize>,
+        /// One under the other instead of side by side.
+        #[uniffi(default)]
+        vertical: bool,
+        /// Cuts what does not fit into its cell.
+        #[uniffi(default)]
+        clip: bool,
+    },
     /// A bar of [Widget::Menu]s, as at the top of an application window: a click opens one, the pointer moves on to the
     /// next.
     MenuBar,
@@ -1063,6 +1243,9 @@ impl Widget {
                     | Self::Collapsible { .. }
                     | Self::ScrollArea { .. }
                     | Self::Group
+                    | Self::Table { .. }
+                    | Self::TableRow { .. }
+                    | Self::Strip { .. }
                     | Self::MenuBar
                     | Self::Menu { .. }
             )
@@ -1093,6 +1276,9 @@ impl Widget {
             Self::Collapsible { .. } => "Collapsible",
             Self::ScrollArea { .. } => "ScrollArea",
             Self::Group => "Group",
+            Self::Table { .. } => "Table",
+            Self::TableRow { .. } => "TableRow",
+            Self::Strip { .. } => "Strip",
             Self::Text { .. } => "Text",
             Self::Separator => "Separator",
             Self::Spacer { .. } => "Spacer",
@@ -1220,7 +1406,103 @@ impl Widget {
                 "the key '{key}' is none egui knows (\"S\", \"F5\", \"Delete\", \"ArrowUp\")"
             )),
             Self::Popup { width, .. } => negative("width", width),
+            Self::Table { columns, .. } if columns.is_empty() => {
+                Some("a table needs at least one column".into())
+            }
+            Self::Table {
+                columns,
+                selection,
+                selected,
+                sort,
+                row_height,
+                max_height,
+                ..
+            } => columns
+                .iter()
+                .enumerate()
+                .find_map(|(i, c)| c.check().map(|why| format!("column {i}: {why}")))
+                .or_else(|| match (selection, selected.len()) {
+                    (None, n) if n > 0 => Some(format!(
+                        "{n} rows are selected, but the table has no selection"
+                    )),
+                    (Some(TableSelection::Single), n) if n > 1 => {
+                        Some(format!("{n} rows are selected, but the table selects one"))
+                    }
+                    _ => None,
+                })
+                .or_else(|| {
+                    sort.filter(|s| s.column as usize >= columns.len())
+                        .map(|s| {
+                            format!(
+                                "it is sorted by column {}, it has {}",
+                                s.column,
+                                columns.len()
+                            )
+                        })
+                })
+                .or_else(|| above_zero("row_height", row_height))
+                .or_else(|| negative("max_height", max_height)),
+            Self::TableRow { height, .. } => above_zero("height", height),
+            Self::Strip { sizes, .. } if sizes.is_empty() => {
+                Some("a strip needs at least one size".into())
+            }
+            Self::Strip { sizes, .. } => sizes
+                .iter()
+                .enumerate()
+                .find_map(|(i, size)| size.check().map(|why| format!("size {i}: {why}"))),
             _ => None,
+        }
+    }
+}
+
+/// Why `v` is not above 0, if it is not.
+fn above_zero(name: &str, v: &Option<f32>) -> Option<String> {
+    v.filter(|v| !(v.is_finite() && *v > 0.0))
+        .map(|v| format!("the {name} is {v}, it needs one above 0"))
+}
+
+/// Why `min` and `max` do not fit, if they do not.
+fn bounds(min: Option<f32>, max: Option<f32>) -> Option<String> {
+    let bad = |v: f32| !(v.is_finite() && v >= 0.0);
+    match (min, max) {
+        (Some(v), _) | (_, Some(v)) if bad(v) => {
+            Some(format!("a bound is {v}, it needs 0 or more"))
+        }
+        (Some(min), Some(max)) if min > max => Some(format!("min {min} > max {max}")),
+        _ => None,
+    }
+}
+
+impl TableColumn {
+    /// Why its values do not fit together, if they do not.
+    fn check(&self) -> Option<String> {
+        match self.width {
+            Some(ColumnWidth::Initial { width } | ColumnWidth::Exact { width })
+                if !(width.is_finite() && width > 0.0) =>
+            {
+                Some(format!("the width is {width}, it needs one above 0"))
+            }
+            _ => bounds(self.min_width, self.max_width),
+        }
+    }
+}
+
+impl StripSize {
+    /// Why its values do not fit together, if they do not.
+    fn check(&self) -> Option<String> {
+        match *self {
+            Self::Exact { points } | Self::Initial { points, .. }
+                if !(points.is_finite() && points >= 0.0) =>
+            {
+                Some(format!("{points} points, it needs 0 or more"))
+            }
+            Self::Relative { fraction, .. } if !(0.0..=1.0).contains(&fraction) => Some(format!(
+                "the fraction is {fraction}, it needs one from 0 to 1"
+            )),
+            Self::Exact { .. } => None,
+            Self::Initial { min, max, .. }
+            | Self::Relative { min, max, .. }
+            | Self::Remainder { min, max } => bounds(min, max),
         }
     }
 }
@@ -1303,6 +1585,69 @@ fn out_of_order(min: f64, max: f64) -> bool {
         min.partial_cmp(&max),
         None | Some(std::cmp::Ordering::Greater)
     )
+}
+
+/// Why `node` does not fit as a table, a row of one or a strip, if it does not: rows only in tables, tables only of
+/// rows, no more cells than columns or sizes.
+fn tables_and_strips(
+    node: &UiNode,
+    nodes: &[UiNode],
+    widgets: &HashMap<u64, &Widget>,
+    children: &HashMap<u64, Vec<usize>>,
+) -> Option<String> {
+    let inside = children.get(&node.id).map_or(&[][..], Vec::as_slice);
+    match &node.widget {
+        Widget::TableRow { .. } => match node.parent.and_then(|p| widgets.get(&p)) {
+            Some(Widget::Table { .. }) => None,
+            parent => Some(format!(
+                "TableRow {} is inside {}: rows belong to a Table",
+                node.id,
+                parent.map_or("nothing", |p| p.name())
+            )),
+        },
+        Widget::Table { columns, data, .. } => {
+            for (i, &child) in inside.iter().enumerate() {
+                let row = &nodes[child];
+                let Widget::TableRow { header, .. } = row.widget else {
+                    return Some(format!(
+                        "{} {} is inside Table {}, which holds TableRows",
+                        row.widget.name(),
+                        row.id,
+                        node.id
+                    ));
+                };
+                if header && i > 0 {
+                    return Some(format!(
+                        "TableRow {} is a header, but not the first row of Table {}",
+                        row.id, node.id
+                    ));
+                }
+                if !header && data.is_some() {
+                    return Some(format!(
+                        "TableRow {} is a row of Table {}, which has its rows from data: one of them",
+                        row.id, node.id
+                    ));
+                }
+                let cells = children.get(&row.id).map_or(0, Vec::len);
+                if cells > columns.len() {
+                    return Some(format!(
+                        "TableRow {} has {cells} cells, Table {} has {} columns",
+                        row.id,
+                        node.id,
+                        columns.len()
+                    ));
+                }
+            }
+            None
+        }
+        Widget::Strip { sizes, .. } if inside.len() > sizes.len() => Some(format!(
+            "Strip {} holds {} nodes in {} sizes: one node per size",
+            node.id,
+            inside.len(),
+            sizes.len()
+        )),
+        _ => None,
+    }
 }
 
 /// A checked tree: the nodes, where each one is and which are inside which.
@@ -1442,6 +1787,12 @@ impl Tree {
                 sides.id,
                 children.get(&sides.id).map_or(0, Vec::len)
             )));
+        }
+        if let Some(why) = nodes
+            .iter()
+            .find_map(|n| tables_and_strips(n, &nodes, &widgets, &children))
+        {
+            return Err(invalid(why));
         }
         // egui gives the room in the order of the panels: bars and side panels first, then the central panel with the
         // rest; windows and areas lie on layers of their own

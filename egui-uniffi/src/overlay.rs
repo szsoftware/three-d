@@ -103,6 +103,69 @@ impl EguiOverlay {
         lock(&self.shared).ui.set_tree(nodes)
     }
 
+    /// The text of the rows of every [crate::Widget::Table] whose `data` is `key`: `cells` row by row, `columns` per row
+    /// (a table shows as many of them as it has columns). Replaces what `key` had. Kotlin sends the rows when they
+    /// change, not with every tree; the table draws only the rows that are seen, so tens of thousands are fine.
+    pub fn set_table_data(
+        &self,
+        key: String,
+        columns: u32,
+        cells: Vec<String>,
+    ) -> Result<(), UiError> {
+        let invalid = |why: String| UiError::InvalidData { why };
+        if columns == 0 {
+            return Err(invalid(format!(
+                "the rows of '{key}' need at least one cell"
+            )));
+        }
+        if !cells.len().is_multiple_of(columns as usize) {
+            return Err(invalid(format!(
+                "{} cells of '{key}' do not fill rows of {columns}",
+                cells.len()
+            )));
+        }
+        let mut shared = lock(&self.shared);
+        let data = crate::state::TableData {
+            columns: columns as usize,
+            cells,
+        };
+        if shared.ui.tables.insert(key, data.clone()).as_ref() != Some(&data) {
+            shared.ui.dirty = true;
+        }
+        Ok(())
+    }
+
+    /// More rows at the end of the rows of `key`, as many cells per row as [EguiOverlay::set_table_data] gave: a log
+    /// that grows without sending what it had.
+    pub fn append_table_rows(&self, key: String, cells: Vec<String>) -> Result<(), UiError> {
+        let mut shared = lock(&self.shared);
+        let Some(data) = shared.ui.tables.get_mut(&key) else {
+            return Err(UiError::InvalidData {
+                why: format!("'{key}' has no rows yet: set_table_data first"),
+            });
+        };
+        if !cells.len().is_multiple_of(data.columns) {
+            return Err(UiError::InvalidData {
+                why: format!(
+                    "{} cells do not fill rows of {} of '{key}'",
+                    cells.len(),
+                    data.columns
+                ),
+            });
+        }
+        data.cells.extend(cells);
+        shared.ui.dirty = true;
+        Ok(())
+    }
+
+    /// Forgets the rows of `key`; a table that still names it shows none.
+    pub fn remove_table_data(&self, key: String) {
+        let mut shared = lock(&self.shared);
+        if shared.ui.tables.remove(&key).is_some() {
+            shared.ui.dirty = true;
+        }
+    }
+
     /// Hands an event to egui with the next frame. `true` if egui uses it: then the application leaves it alone (does
     /// not turn the camera, for example).
     pub fn input(&self, event: UiInput) -> bool {

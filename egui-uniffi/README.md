@@ -27,7 +27,7 @@ bindings, with Compose as the model.
 
 At the top stand `SidePanel`, `TopBar`, `BottomBar`, `CentralPanel` (the room the others leave), `Window`, `Area`
 (pinned to a corner, an edge or the center) and `Modal`. Inside them: the containers `Row`, `Column`, `Columns`, `Sides`,
-`Indent`, `Resize`, `Grid`, `Collapsible`, `ScrollArea`, `Group`, `MenuBar`, `Menu` and the widgets `Text`, `Separator`, `Spacer`, `Button`, `Checkbox`,
+`Indent`, `Resize`, `Grid`, `Collapsible`, `ScrollArea`, `Group`, `Table` (of `TableRow`s), `Strip`, `MenuBar`, `Menu` and the widgets `Text`, `Separator`, `Spacer`, `Button`, `Checkbox`,
 `SelectableLabel`, `ToggleButton`, `RadioButton`, `Switch`, `Radio`, `ComboBox`, `SliderInt`, `SliderFloat`, `DragValue`,
 `TextField`, `ColorPicker`, `DatePicker`, `Link`, `ProgressBar`, `Spinner`, `Notice` (info, warning, error) and `Plot`;
 `Shortcut` is a key that draws nothing. `setTree` refuses a tree with an id twice, a parent that is not there or holds no
@@ -111,6 +111,32 @@ A node has at most one `ContextMenu` and one `Tooltip`, any number of `Popup`s. 
 middle over everything, and dims and blocks the rest while it is in the tree; `dismissible` lets Escape or a click beside
 it report `Closed`.
 
+## Tables and strips
+
+`Table` (egui_extras' `TableBuilder`) has `columns`, each with a `title`, a `width` (`Auto`, `Initial`, `Exact`,
+`Remainder`), `min_width`/`max_width`, `resizable`, `clip`, an `align` for its cells, `sortable` and a text `style`. The
+rows come in one of two ways:
+
+| Rows | When | How |
+| --- | --- | --- |
+| `TableRow` nodes | a few dozen rows with widgets in their cells | one node per column (a `Row` or `Column` for several), fewer leave cells empty; a `TableRow` with `header` as the first one replaces the titles |
+| `data` | tens of thousands of rows of text | `setTableData(key, columns, cells)` once the rows change (row by row), `appendTableRows(key, cells)` for a log; the tree only names the key |
+
+Only the rows in sight are drawn, for nodes as for data. With a `selection` (`Single` or `Multiple`) a click selects a
+row, Ctrl (Command on a Mac) adds or removes one, Shift selects from the row clicked before; `RowsSelected` reports all
+selected rows and `selected` shows them, a double click reports `RowActivated`. A click on a sortable title reports
+`SortChanged` (ascending unless it was ascending before); Kotlin sorts its rows, sends them, and `sort` shows the arrow.
+`striped`, `resizable` (all columns), `row_height`, `max_height` (the rows scroll beyond it), `stick_to_end` (a log) and
+`scroll_to` (once, when the row changes) do what they say. A table takes the room there is: in a `ScrollArea` give it a
+`max_height`, so that it scrolls itself and draws only the rows in sight. In a container that shrinks to its content (a
+`Column`, a node with a frame) it takes what is seen below it, as does a `Strip`. Columns the user may resize keep their
+width of the first frame, in which `Auto` ones guess from the rows in sight: only the last column, if `Remainder`, takes
+all that is left in every frame.
+
+`Strip` (egui_extras' `StripBuilder`) divides its room side by side (or one under the other with `vertical`) into cells of
+`sizes`: `Exact` points, `Initial` points with bounds, `Relative` parts of the whole strip, `Remainder` for what is left.
+One node per cell, a `Strip` in a cell divides that cell.
+
 ## What the platform does
 
 egui does not reach the clipboard, the browser or the input method itself: `takeOutput()` after a frame says what it asks
@@ -179,4 +205,4 @@ links one copy. It has no log bridge of its own: that comes from the crate that 
 `cargo test -p three-d-egui-uniffi`: the tree, the values, the events, the clipboard, the input method and the focus with
 egui alone; painting, clicks through `input`, scale, style and repaints on OpenGL through EGL (Linux) and on wgpu.
 `THREE_D_SKIP_GPU_TESTS=1` leaves out the graphics card, `THREE_D_EGUI_PICTURE=<dir>` writes the pictures of the options
-panel, the plots, the settings window, the inputs, an open menu and a modal as raw RGBA.
+panel, the plots, the settings window, the inputs, an open menu, a modal and the tables as raw RGBA.

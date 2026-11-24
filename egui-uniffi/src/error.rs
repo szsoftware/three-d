@@ -7,6 +7,12 @@ pub enum UiError {
         /// Why.
         why: String,
     },
+    /// Rows of a table that do not fit: no cells per row, a number of cells that does not fill the last row, rows for
+    /// a key that has none yet.
+    InvalidData {
+        /// Why.
+        why: String,
+    },
     /// Painting failed on the graphics card.
     Gpu {
         /// Why.
@@ -22,6 +28,7 @@ impl std::fmt::Display for UiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidTree { why } => write!(f, "invalid tree: {why}"),
+            Self::InvalidData { why } => write!(f, "invalid data: {why}"),
             Self::Gpu { why } => write!(f, "GPU: {why}"),
             Self::WrongThread => write!(
                 f,
