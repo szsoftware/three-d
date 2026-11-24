@@ -172,6 +172,14 @@ pub struct PreviewSettings {
     /// with a `gpu_frame_time`. On by default.
     ///
     pub gpu_sharp_when_still: bool,
+    ///
+    /// Whether the GPU finds hits with hardware ray queries where the device has them, see
+    /// [ComputeTracer::uses_ray_queries](crate::ComputeTracer::uses_ray_queries) and [crate::ray_query_problem] for
+    /// why not. Changing it makes the GPU's tracer anew in the background, the old one traces until it is ready; the
+    /// image then starts again. Without ray queries on the device it changes nothing. On by default, which only uses
+    /// them where the context was made with `THREE_D_RAY_QUERY=1`.
+    ///
+    pub gpu_ray_queries: bool,
     /// The CPU traces at width and height divided by this, 4 by default and 8 in browsers.
     pub cpu_downscale: u32,
     ///
@@ -232,6 +240,7 @@ impl Default for PreviewSettings {
             gpu_frame_time: Some(std::time::Duration::from_millis(40)),
             gpu_falls_back_to_cpu: true,
             gpu_sharp_when_still: true,
+            gpu_ray_queries: true,
             cpu_downscale: if cfg!(target_arch = "wasm32") { 8 } else { 4 },
             cpu_frame_time: if cfg!(target_arch = "wasm32") {
                 Some(std::time::Duration::from_millis(12))
@@ -406,8 +415,33 @@ struct Compiling {
 
 #[cfg(feature = "wgpu")]
 impl Compiling {
+    /// Makes the tracer for the device on a thread, with hardware ray queries if `ray_queries` and the device has them.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start_for(
+        gpu: crate::GpuDevice,
+        info: Option<three_d::wgpu::AdapterInfo>,
+        ray_queries: bool,
+    ) -> Self {
+        let (send, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            crate::priority::lower_this_thread(crate::priority::COMPILING);
+            let _ = send.send(Box::new(crate::ComputeTracer::for_adapter_with(
+                &gpu,
+                info,
+                ray_queries,
+            )));
+        });
+        Self {
+            receiver: Some(receiver),
+            deferred: None,
+        }
+    }
+
+    ///
     /// Makes the tracer for the context: natively on a thread, in a browser with the browser's background compiling.
-    fn start(context: &Context) -> Option<Self> {
+    /// With hardware ray queries if `ray_queries` and the device has them (never in browsers or on OpenGL).
+    ///
+    fn start(context: &Context, #[allow(unused_variables)] ray_queries: bool) -> Option<Self> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let gpu = crate::GpuDevice::from_context(context)?;
@@ -421,15 +455,7 @@ impl Compiling {
                     deferred: Some((gpu, info, std::cell::Cell::new(0))),
                 });
             }
-            let (send, receiver) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                crate::priority::lower_this_thread(crate::priority::COMPILING);
-                let _ = send.send(Box::new(crate::ComputeTracer::for_adapter(&gpu, info)));
-            });
-            Some(Self {
-                receiver: Some(receiver),
-                deferred: None,
-            })
+            Some(Self::start_for(gpu, info, ray_queries))
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -618,7 +644,7 @@ impl RaytracePreview {
         #[cfg(feature = "wgpu")]
         let compiling = if availability == PreviewAvailability::Gpu {
             // The shaders take seconds to compile on some drivers; the CPU traces meanwhile
-            Compiling::start(context)
+            Compiling::start(context, settings.gpu_ray_queries)
         } else {
             None
         };
@@ -707,7 +733,7 @@ impl RaytracePreview {
     pub fn kind(&self) -> TracerKind {
         match &self.engine {
             #[cfg(feature = "wgpu")]
-            Engine::Gpu { .. } => TracerKind::Compute,
+            Engine::Gpu { tracer, .. } => crate::Tracer::kind(tracer.as_ref()),
             Engine::Cpu { .. } => TracerKind::CpuReference,
             #[cfg(not(target_arch = "wasm32"))]
             Engine::CpuWorker { .. } => TracerKind::CpuReference,
@@ -756,7 +782,13 @@ impl RaytracePreview {
         #[cfg(feature = "wgpu")]
         let new_limit = settings.gpu_frame_time != self.settings.gpu_frame_time
             || (self.settings.gpu_falls_back_to_cpu && !settings.gpu_falls_back_to_cpu);
+        #[cfg(feature = "wgpu")]
+        let new_ray_queries = settings.gpu_ray_queries != self.settings.gpu_ray_queries;
         self.settings = settings;
+        #[cfg(feature = "wgpu")]
+        if new_ray_queries {
+            self.follow_ray_queries();
+        }
         #[cfg(feature = "wgpu")]
         if new_limit {
             self.sharp_too_slow = false;
@@ -917,7 +949,7 @@ impl RaytracePreview {
                 self.compiling = Some(compiling);
                 return;
             }
-            self.take_gpu(compiling.wait());
+            self.arrived(compiling.wait());
         }
     }
 
@@ -927,7 +959,63 @@ impl RaytracePreview {
         let shown = self.sample_count() > 0;
         if let Some(tracer) = self.compiling.as_ref().and_then(|c| c.poll(shown)) {
             self.compiling = None;
+            self.arrived(tracer);
+        }
+    }
+
+    ///
+    /// A tracer made in the background: the first one goes on with the GPU; one made for another
+    /// [PreviewSettings::gpu_ray_queries] replaces the tracer in use (or the one kept while the CPU traces because the
+    /// GPU was too slow), and if it failed the old one stays.
+    ///
+    #[cfg(feature = "wgpu")]
+    fn arrived(&mut self, tracer: GpuTracer) {
+        let replaces = matches!(self.engine, Engine::Gpu { .. }) || self.slow_tracer.is_some();
+        if !replaces {
             self.take_gpu(tracer);
+            self.follow_ray_queries();
+            return;
+        }
+        let Some(tracer) = tracer else {
+            return;
+        };
+        if self.slow_tracer.is_some() {
+            self.slow_tracer = Some(tracer);
+        } else {
+            self.restart_cause = Some(PreviewRestart::Settings);
+            self.take_gpu(Some(tracer));
+        }
+    }
+
+    ///
+    /// Makes the GPU's tracer anew in the background when it does not use hardware ray queries as
+    /// [PreviewSettings::gpu_ray_queries] asks and the device has them. While the first tracer is made, that tracer is
+    /// checked when it is ready.
+    ///
+    #[cfg(feature = "wgpu")]
+    fn follow_ray_queries(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let tracer = match &self.engine {
+                Engine::Gpu { tracer, .. } => Some(tracer.as_ref()),
+                _ => self.slow_tracer.as_deref(),
+            };
+            let Some(tracer) = tracer else {
+                return;
+            };
+            let wanted = self.settings.gpu_ray_queries && tracer.ray_queries_available();
+            if tracer.uses_ray_queries() == wanted {
+                // Asked back while the other one is made
+                if self.compiling.is_some() {
+                    self.compiling = None;
+                }
+                return;
+            }
+            self.compiling = Some(Compiling::start_for(
+                tracer.gpu().clone(),
+                Some(tracer.adapter_info().clone()),
+                wanted,
+            ));
         }
     }
 
@@ -1673,6 +1761,15 @@ impl RaytracePreview {
     /// Draws the image into the whole target, exposed and tone mapped with [PreviewSettings::tone_mapping] and in sRGB.
     pub fn render(&self, target: &RenderTarget) {
         let viewer = three_d::Camera::new_2d(target.viewport());
+        target.apply_screen_effect(&self.effect(), &viewer, &[], None, None);
+    }
+
+    ///
+    /// Draws the image into `viewport` of the target (from the bottom left), for example the part of an application's
+    /// screen that shows the view; see [RaytracePreview::render].
+    ///
+    pub fn render_in(&self, target: &RenderTarget, viewport: three_d::Viewport) {
+        let viewer = three_d::Camera::new_2d(viewport);
         target.apply_screen_effect(&self.effect(), &viewer, &[], None, None);
     }
 

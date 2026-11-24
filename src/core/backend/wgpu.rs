@@ -74,6 +74,8 @@ pub(crate) struct WgpuBackend {
     gl: bool,
     /// Whether the device can render into textures of 32 bit floats. If not, see [TextureEntry::bits].
     pub(super) float32_renderable: bool,
+    /// What the adapter offers, when the backend asked for the device itself, see [Context::wgpu_adapter_features].
+    pub(crate) adapter_features: Option<w::Features>,
     /// Whether the device is lost, see [Context::is_lost]. Only known for a device that the backend created.
     lost: Arc<reset::DeviceLost>,
     /// The browser's own device and adapter info, if the backend asked the browser for the device.
@@ -429,6 +431,7 @@ impl WgpuBackend {
             gl: gl_device(&device),
             // Who has the adapter knows better, see [WgpuBackend::request]
             float32_renderable: !gl_device(&device),
+            adapter_features: None,
             state: Mutex::new(State {
                 next_id: 0,
                 buffers: HashMap::new(),
