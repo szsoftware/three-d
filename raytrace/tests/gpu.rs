@@ -42,6 +42,22 @@ fn compute_is_supported_on_wgpu() {
 }
 
 #[test]
+fn ray_queries_say_why_not() {
+    let Some(context) = context() else { return };
+    // Only asked for with THREE_D_RAY_QUERY (tests/ray_query.rs)
+    if std::env::var_os("THREE_D_RAY_QUERY").is_some() {
+        return;
+    }
+    let why = ray_query_problem(&context).expect("no ray queries without THREE_D_RAY_QUERY");
+    let offered = context
+        .wgpu_adapter_features()
+        .is_some_and(|f| f.contains(three_d::wgpu::Features::EXPERIMENTAL_RAY_QUERY));
+    assert_eq!(why.contains("THREE_D_RAY_QUERY=1"), offered, "{why}");
+    let tracer = ComputeTracer::from_context(&context);
+    assert!(tracer.is_none_or(|t| !t.uses_ray_queries() && !t.ray_queries_available()));
+}
+
+#[test]
 fn render_image_shows_upright_in_three_d() {
     let Some(context) = context() else { return };
     let render_image = numbered_image(3, 2);

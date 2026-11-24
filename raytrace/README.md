@@ -134,6 +134,10 @@ uses it (`uses_ray_queries()`, off again with `with_ray_queries(false)`). The me
 structures and the instances into a top level one; only the traversal of the shader is replaced
 (`compute/walk_ray_query.wgsl` between the `TRAVERSAL` markers of `trace.wgsl`), everything after the hit is the same.
 Without the variable, without ray queries on the device and in browsers (WebGPU has none) the tracer stays as before.
+`ray_query_problem(&context)` says why not, for a switch shown as disabled (the variable missing on a graphics card
+that has them, or no ray queries at all). `RaytracePreview` switches with `PreviewSettings::gpu_ray_queries` while it
+runs: the other tracer is made in the background and replaces the one in use when ready (uniffi:
+`PreviewOptions.rayQueries`, `PreviewCapabilities.rayQuery` and `rayQueryReason`).
 
 Both tracers draw the same random numbers: on lavapipe the garden, pergola, caustics and downlights give the same image
 pixel for pixel (`tests/ray_query.rs`). Where surfaces of two solids lie exactly on each other (the tank's front walls
