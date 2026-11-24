@@ -10,6 +10,23 @@ use three_d_egui_uniffi::*;
 const W: u32 = 400;
 const H: u32 = 300;
 
+fn row() -> Widget {
+    Widget::Row {
+        wrap: false,
+        align: None,
+        arrangement: None,
+        spacing: None,
+    }
+}
+
+fn column() -> Widget {
+    Widget::Column {
+        align: None,
+        arrangement: None,
+        spacing: None,
+    }
+}
+
 fn node(id: u64, parent: Option<u64>, widget: Widget) -> UiNode {
     UiNode {
         id,
@@ -17,6 +34,7 @@ fn node(id: u64, parent: Option<u64>, widget: Widget) -> UiNode {
         widget,
         enabled: true,
         tooltip: None,
+        modifier: None,
     }
 }
 
@@ -30,6 +48,9 @@ fn tree(checked: bool) -> Vec<UiNode> {
                 title: Some("Options".into()),
                 width: 150.0,
                 resizable: false,
+                min_width: None,
+                max_width: None,
+                expanded: true,
             },
         ),
         node(
@@ -373,6 +394,9 @@ fn an_options_panel_as_in_the_raytrace_window() {
         text: t.into(),
         style: TextStyle::Body,
         color: None,
+        spans: vec![],
+        wrap: None,
+        selectable: true,
     };
     let mut gpu = node(
         5,
@@ -394,6 +418,9 @@ fn an_options_panel_as_in_the_raytrace_window() {
                 title: Some("Raytrace".into()),
                 width: 180.0,
                 resizable: true,
+                min_width: None,
+                max_width: None,
+                expanded: true,
             },
         ),
         node(
@@ -427,7 +454,7 @@ fn an_options_panel_as_in_the_raytrace_window() {
             },
         ),
         node(7, Some(1), Widget::Separator),
-        node(8, Some(1), Widget::Row),
+        node(8, Some(1), row()),
         node(
             9,
             Some(8),
@@ -475,6 +502,9 @@ fn an_options_panel_as_in_the_raytrace_window() {
                 text: "11.8 ms".into(),
                 style: TextStyle::Monospace,
                 color: None,
+                spans: vec![],
+                wrap: None,
+                selectable: true,
             },
         ),
     ];
@@ -558,6 +588,13 @@ fn plots_of_a_benchmark() {
                 closable: false,
                 collapsible: false,
                 resizable: false,
+                height: None,
+                anchor: None,
+                movable: true,
+                title_bar: true,
+                fixed_size: false,
+                scroll: false,
+                open: true,
             },
         ),
         node(
@@ -651,6 +688,169 @@ fn plots_of_a_benchmark() {
         assert!(
             overlay.input(UiInput::Move { x, y }) && overlay.needs_repaint(),
             "{name}"
+        );
+        drop(overlay);
+        release(context);
+    }
+}
+
+#[test]
+fn a_settings_window_with_frames_rows_and_text_in_parts() {
+    const CARD: u32 = 0xFF1F4E79;
+    const EDGE: u32 = 0xFFF39C12;
+    const GOOD: u32 = 0xFF2ECC71;
+    let text = |id, parent, s: &str, spans: Vec<TextSpan>| {
+        node(
+            id,
+            Some(parent),
+            Widget::Text {
+                text: s.into(),
+                style: TextStyle::Body,
+                color: None,
+                spans,
+                wrap: None,
+                selectable: true,
+            },
+        )
+    };
+    let button = |id, parent, s: &str| node(id, Some(parent), Widget::Button { text: s.into() });
+    let mut card = node(5, Some(1), column());
+    card.modifier = Some(UiModifier {
+        fill_width: true,
+        background: Some(CARD),
+        border: Some(UiStroke {
+            width: 2.0,
+            color: EDGE,
+        }),
+        corner_radius: 6.0,
+        padding: Some(UiInsets {
+            left: 10.0,
+            top: 8.0,
+            right: 10.0,
+            bottom: 8.0,
+        }),
+        ..Default::default()
+    });
+    let nodes = vec![
+        node(
+            1,
+            None,
+            Widget::Window {
+                title: "Settings".into(),
+                x: 10.0,
+                y: 10.0,
+                width: Some(360.0),
+                closable: false,
+                collapsible: false,
+                resizable: false,
+                height: None,
+                anchor: Some(Anchor::TopLeft),
+                movable: true,
+                title_bar: true,
+                fixed_size: true,
+                scroll: false,
+                open: true,
+            },
+        ),
+        text(
+            2,
+            1,
+            "Frame time ",
+            vec![
+                TextSpan {
+                    text: "12.9 ms".into(),
+                    style: Some(TextStyle::Strong),
+                    ..Default::default()
+                },
+                TextSpan {
+                    text: "  smooth".into(),
+                    color: Some(GOOD),
+                    size: Some(18.0),
+                    ..Default::default()
+                },
+            ],
+        ),
+        card,
+        text(6, 5, "Shadows and reflections", vec![]),
+        node(7, Some(5), Widget::Sides),
+        text(8, 7, "Quality", vec![]),
+        button(9, 7, "High"),
+        node(10, Some(1), Widget::Columns),
+        text(11, 10, "Trace", vec![]),
+        text(12, 10, "Denoise", vec![]),
+        text(13, 10, "Present", vec![]),
+        node(
+            14,
+            Some(1),
+            Widget::Row {
+                wrap: false,
+                align: None,
+                arrangement: Some(Arrangement::End),
+                spacing: None,
+            },
+        ),
+        button(15, 14, "Cancel"),
+        button(16, 14, "Apply"),
+    ];
+    let argb = |c: u32| {
+        let [_, r, g, b] = c.to_be_bytes();
+        [r, g, b]
+    };
+    for (name, context) in contexts() {
+        let overlay = EguiOverlay::new();
+        overlay.set_tree(nodes.clone()).unwrap();
+        // Until the window faded in
+        for _ in 0..100 {
+            frame(&context, &overlay);
+            if !overlay.needs_repaint() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let picture = frame(&context, &overlay);
+        if let Some(dir) = std::env::var_os("THREE_D_EGUI_PICTURE") {
+            let bytes: Vec<u8> = picture.iter().flatten().copied().collect();
+            std::fs::write(
+                std::path::Path::new(&dir).join(format!("layout-{name}.rgba")),
+                bytes,
+            )
+            .unwrap();
+        }
+        let count = |id: u64, color: u32| {
+            let r = overlay.bounds(id).expect("drawn");
+            let mut n = 0;
+            for y in r.y as u32..(r.y + r.height) as u32 {
+                for x in r.x as u32..(r.x + r.width) as u32 {
+                    if near(pixel(&picture, x, y), argb(color), 12) {
+                        n += 1;
+                    }
+                }
+            }
+            (n, r)
+        };
+        // The card fills the width of the window with its background, inside its border
+        let (fill, card) = count(5, CARD);
+        assert!(
+            fill as f32 > 0.4 * card.width * card.height,
+            "{name}: {fill} pixels of the card's background in {card:?}"
+        );
+        let (edge, _) = count(5, EDGE);
+        assert!(
+            edge as f32 > card.width + card.height,
+            "{name}: {edge} pixels of the border"
+        );
+        let window = overlay.bounds(1).unwrap();
+        assert!(
+            card.width > 340.0 && card.width < window.width,
+            "{name}: {card:?}"
+        );
+        // The colored part of the text, and the buttons at the right
+        let (good, _) = count(2, GOOD);
+        assert!(good > 20, "{name}: {good} pixels of the colored part");
+        let apply = overlay.bounds(16).unwrap();
+        assert!(
+            apply.x + apply.width > window.x + window.width - 20.0,
+            "{name}: {apply:?} {window:?}"
         );
         drop(overlay);
         release(context);

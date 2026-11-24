@@ -4,6 +4,23 @@ use crate::state::UiState;
 use crate::*;
 use three_d::egui;
 
+fn row() -> Widget {
+    Widget::Row {
+        wrap: false,
+        align: None,
+        arrangement: None,
+        spacing: None,
+    }
+}
+
+fn column() -> Widget {
+    Widget::Column {
+        align: None,
+        arrangement: None,
+        spacing: None,
+    }
+}
+
 fn node(id: u64, parent: Option<u64>, widget: Widget) -> UiNode {
     UiNode {
         id,
@@ -11,6 +28,7 @@ fn node(id: u64, parent: Option<u64>, widget: Widget) -> UiNode {
         widget,
         enabled: true,
         tooltip: None,
+        modifier: None,
     }
 }
 
@@ -23,6 +41,9 @@ fn panel() -> UiNode {
             title: Some("Options".into()),
             width: 200.0,
             resizable: false,
+            min_width: None,
+            max_width: None,
+            expanded: true,
         },
     )
 }
@@ -143,8 +164,8 @@ fn trees_that_cannot_be_drawn_are_refused_with_the_reason() {
     .contains("inside Checkbox 2, which holds no nodes"));
     assert!(invalid(vec![
         panel(),
-        node(2, Some(3), Widget::Row),
-        node(3, Some(2), Widget::Row)
+        node(2, Some(3), row()),
+        node(3, Some(2), row())
     ])
     .contains("go round in a circle"));
     assert!(invalid(vec![
@@ -185,7 +206,10 @@ fn trees_that_cannot_be_drawn_are_refused_with_the_reason() {
             Some(1),
             Widget::Grid {
                 columns: 0,
-                striped: false
+                striped: false,
+                column_spacing: None,
+                row_spacing: None,
+                min_column_width: None,
             }
         )
     ])
@@ -197,7 +221,10 @@ fn trees_that_cannot_be_drawn_are_refused_with_the_reason() {
             Some(1),
             Widget::Grid {
                 columns: 2,
-                striped: true
+                striped: true,
+                column_spacing: None,
+                row_spacing: None,
+                min_column_width: None,
             }
         ),
         node(3, Some(2), Widget::Separator),
@@ -307,7 +334,7 @@ fn buttons_options_and_sliders_report_their_ids() {
                 suffix: String::new(),
             },
         ),
-        node(5, Some(1), Widget::Row),
+        node(5, Some(1), row()),
         node(
             6,
             Some(5),
@@ -382,6 +409,13 @@ fn a_closed_window_reports_it_and_stays_hidden_until_kotlin_answers() {
                 closable: true,
                 collapsible: false,
                 resizable: false,
+                height: None,
+                anchor: None,
+                movable: true,
+                title_bar: true,
+                fixed_size: false,
+                scroll: false,
+                open: true,
             },
         )
     };
@@ -446,7 +480,7 @@ fn every_widget_draws() {
     let s = String::new;
     let mut nodes = vec![
         panel(),
-        node(10, None, Widget::TopBar),
+        node(10, None, Widget::TopBar { expanded: true }),
         node(
             11,
             Some(10),
@@ -454,7 +488,7 @@ fn every_widget_draws() {
                 text: "File".into(),
             },
         ),
-        node(20, None, Widget::BottomBar),
+        node(20, None, Widget::BottomBar { expanded: true }),
         node(21, Some(20), Widget::Spinner),
         node(
             30,
@@ -473,6 +507,9 @@ fn every_widget_draws() {
                 text: "16.7 ms".into(),
                 style: TextStyle::Monospace,
                 color: Some(0xFFFF8800),
+                spans: vec![],
+                wrap: None,
+                selectable: true,
             },
         ),
     ];
@@ -481,6 +518,9 @@ fn every_widget_draws() {
             text: "Heading".into(),
             style: TextStyle::Heading,
             color: None,
+            spans: vec![],
+            wrap: None,
+            selectable: true,
         },
         Widget::Separator,
         Widget::Spacer { size: 4.0 },
@@ -543,12 +583,18 @@ fn every_widget_draws() {
         },
         Widget::ScrollArea {
             max_height: Some(50.0),
+            direction: None,
+            max_width: None,
+            stick_to_end: false,
         },
         Widget::Grid {
             columns: 2,
             striped: true,
+            column_spacing: None,
+            row_spacing: None,
+            min_column_width: None,
         },
-        Widget::Column,
+        column(),
         plot(vec![
             series("Frame", line(), vec![], vec![12.0, 14.0, 13.0]),
             series(
@@ -575,6 +621,9 @@ fn every_widget_draws() {
                     text: format!("{c}.{j}"),
                     style: TextStyle::Body,
                     color: None,
+                    spans: vec![],
+                    wrap: None,
+                    selectable: true,
                 },
             ));
         }
@@ -621,6 +670,9 @@ fn text_in_an_area_at_the_edge_does_not_wrap() {
                     text: text.into(),
                     style: TextStyle::Monospace,
                     color: None,
+                    spans: vec![],
+                    wrap: None,
+                    selectable: true,
                 },
             ),
         ]
@@ -896,4 +948,651 @@ fn linked_plots_move_together_and_fixed_ones_stay() {
         before[2],
         "the plot without interaction moved"
     );
+}
+
+// Phase 1: modifiers, layouts, panels, windows, scrolling, text in parts
+
+fn text(id: u64, parent: u64, s: &str) -> UiNode {
+    node(
+        id,
+        Some(parent),
+        Widget::Text {
+            text: s.into(),
+            style: TextStyle::Body,
+            color: None,
+            spans: vec![],
+            wrap: None,
+            selectable: true,
+        },
+    )
+}
+
+fn button(id: u64, parent: u64, s: &str) -> UiNode {
+    node(id, Some(parent), Widget::Button { text: s.into() })
+}
+
+fn with(mut node: UiNode, modifier: UiModifier) -> UiNode {
+    node.modifier = Some(modifier);
+    node
+}
+
+fn insets(v: f32) -> Option<UiInsets> {
+    Some(UiInsets {
+        left: v,
+        top: v,
+        right: v,
+        bottom: v,
+    })
+}
+
+fn central(id: u64) -> UiNode {
+    node(id, None, Widget::CentralPanel { frame: true })
+}
+
+fn right(r: UiRect) -> f32 {
+    r.x + r.width
+}
+
+fn bottom(r: UiRect) -> f32 {
+    r.y + r.height
+}
+
+/// The galley of the text that says `text`.
+fn galley(output: &egui::FullOutput, text: &str) -> std::sync::Arc<egui::Galley> {
+    fn find(shape: &egui::Shape, text: &str) -> Option<std::sync::Arc<egui::Galley>> {
+        match shape {
+            egui::Shape::Text(t) if t.galley.text() == text => Some(t.galley.clone()),
+            egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| find(s, text)),
+            _ => None,
+        }
+    }
+    output
+        .shapes
+        .iter()
+        .find_map(|c| find(&c.shape, text))
+        .unwrap_or_else(|| panic!("no text '{text}' among {:?}", texts(output)))
+}
+
+#[test]
+fn modifiers_size_frame_and_place_a_node() {
+    let mut run = Run::new(vec![
+        panel(),
+        button(2, 1, "Plain"),
+        with(
+            button(3, 1, "Wide"),
+            UiModifier {
+                width: Some(150.0),
+                ..Default::default()
+            },
+        ),
+        with(
+            button(4, 1, "Full"),
+            UiModifier {
+                fill_width: true,
+                ..Default::default()
+            },
+        ),
+        with(
+            button(5, 1, "Right"),
+            UiModifier {
+                align: Some(Align::End),
+                ..Default::default()
+            },
+        ),
+        with(
+            text(6, 1, "Framed"),
+            UiModifier {
+                background: Some(0xFF336699),
+                padding: insets(8.0),
+                margin: insets(4.0),
+                ..Default::default()
+            },
+        ),
+        text(7, 1, "Framed"),
+        with(
+            button(8, 1, "Hidden"),
+            UiModifier {
+                invisible: true,
+                ..Default::default()
+            },
+        ),
+        with(
+            button(9, 1, "Boxed"),
+            UiModifier {
+                width: Some(120.0),
+                height: Some(40.0),
+                padding: insets(4.0),
+                border: Some(UiStroke {
+                    width: 2.0,
+                    color: 0xFFFFFFFF,
+                }),
+                ..Default::default()
+            },
+        ),
+        with(
+            text(10, 1, "Not wider than this, so it wraps into lines"),
+            UiModifier {
+                max_width: Some(90.0),
+                ..Default::default()
+            },
+        ),
+    ]);
+    let b = |id: u64| run.state.bounds[&id];
+    assert!((b(3).width - 150.0).abs() < 0.5, "{:?}", b(3));
+    // All the width of the panel's inside, from where the other nodes start
+    assert!((b(4).x - b(2).x).abs() < 0.5, "{:?} {:?}", b(4), b(2));
+    assert!(b(4).width > 150.0 && right(b(4)) <= 200.0, "{:?}", b(4));
+    assert!((right(b(5)) - right(b(4))).abs() < 1.0, "{:?}", b(5));
+    // The frame: padding and margin on each side
+    assert!(
+        (b(6).width - (b(7).width + 24.0)).abs() < 1.0,
+        "{:?} {:?}",
+        b(6),
+        b(7)
+    );
+    assert!((b(6).height - (b(7).height + 24.0)).abs() < 1.0);
+    // The size counts padding and border
+    assert!(
+        (b(9).width - 120.0).abs() < 0.5 && (b(9).height - 40.0).abs() < 0.5,
+        "{:?}",
+        b(9)
+    );
+    assert!(
+        b(10).width <= 90.0 && b(10).height > 2.0 * b(7).height,
+        "{:?}",
+        b(10)
+    );
+    // Invisible keeps its room but does not react
+    assert!(b(8).width > 0.0 && b(8).y > bottom(b(7)));
+    run.click(8);
+    assert_eq!(run.state.take_events(), vec![]);
+    run.click(9);
+    assert_eq!(run.state.take_events(), vec![UiEvent::Clicked { id: 9 }]);
+
+    let refused = |m: UiModifier| invalid(vec![panel(), with(button(2, 1, "x"), m)]);
+    assert!(refused(UiModifier {
+        width: Some(-1.0),
+        ..Default::default()
+    })
+    .contains("Button 2: the modifier's width is -1"));
+    assert!(refused(UiModifier {
+        min_height: Some(30.0),
+        max_height: Some(20.0),
+        ..Default::default()
+    })
+    .contains("min_height 30 > max_height 20"));
+    assert!(refused(UiModifier {
+        opacity: Some(2.0),
+        ..Default::default()
+    })
+    .contains("opacity is 2"));
+}
+
+fn flow_row(arrangement: Option<Arrangement>, wrap: bool, spacing: Option<f32>) -> Widget {
+    Widget::Row {
+        wrap,
+        align: None,
+        arrangement,
+        spacing,
+    }
+}
+
+#[test]
+fn rows_gather_their_nodes_at_the_start_in_the_middle_or_at_the_end() {
+    let mut nodes = vec![
+        central(1),
+        node(10, Some(1), flow_row(Some(Arrangement::End), false, None)),
+        button(11, 10, "First"),
+        button(12, 10, "Second"),
+        node(
+            20,
+            Some(1),
+            flow_row(Some(Arrangement::Center), false, None),
+        ),
+        button(21, 20, "First"),
+        button(22, 20, "Second"),
+        node(30, Some(1), flow_row(None, false, Some(20.0))),
+        button(31, 30, "First"),
+        button(32, 30, "Second"),
+        node(40, Some(1), flow_row(None, true, None)),
+    ];
+    for i in 0..30 {
+        nodes.push(button(41 + i, 40, &format!("Button {i}")));
+    }
+    let run = Run::new(nodes);
+    let b = |id: u64| run.state.bounds[&id];
+    let inside = b(1);
+    // At the end, in their order
+    assert!(b(11).x < b(12).x);
+    assert!(
+        right(b(12)) > right(inside) - 20.0,
+        "{:?} {:?}",
+        b(12),
+        inside
+    );
+    // In the middle: as much room on the left as on the right
+    let (left_gap, right_gap) = (b(21).x - inside.x, right(inside) - right(b(22)));
+    assert!(
+        left_gap > 100.0 && (left_gap - right_gap).abs() < 2.0,
+        "{left_gap} {right_gap}"
+    );
+    assert!((b(32).x - right(b(31)) - 20.0).abs() < 0.5);
+    // Lines that wrap
+    assert!(b(70).y > bottom(b(41)), "{:?} {:?}", b(41), b(70));
+    assert!(right(b(70)) <= right(inside));
+}
+
+#[test]
+fn nodes_in_a_row_line_up_in_the_middle_or_at_the_bottom_whatever_they_are() {
+    let bottom_row = Widget::Row {
+        wrap: false,
+        align: Some(Align::End),
+        arrangement: None,
+        spacing: None,
+    };
+    let nodes = vec![
+        central(1),
+        // A button with a size next to one without, at the end (the settings' Reset and Apply)
+        node(10, Some(1), flow_row(Some(Arrangement::End), false, None)),
+        button(11, 10, "Reset"),
+        with(
+            button(12, 10, "Apply"),
+            UiModifier {
+                width: Some(110.0),
+                ..Default::default()
+            },
+        ),
+        // A button before a column of two lines and a framed button
+        node(20, Some(1), row()),
+        button(21, 20, "Short"),
+        node(22, Some(20), column()),
+        text(23, 22, "One"),
+        text(24, 22, "Two"),
+        with(
+            button(25, 20, "Framed"),
+            UiModifier {
+                background: Some(0xFF1F4E79),
+                padding: insets(6.0),
+                ..Default::default()
+            },
+        ),
+        // At the bottom
+        node(30, Some(1), bottom_row),
+        button(31, 30, "Low"),
+        node(32, Some(30), column()),
+        text(33, 32, "One"),
+        text(34, 32, "Two"),
+    ];
+    let run = Run::new(nodes);
+    let b = |id: u64| run.state.bounds[&id];
+    let middle = |id: u64| run.center(id).y;
+    assert!((b(12).width - 110.0).abs() < 0.5, "{:?}", b(12));
+    assert!(
+        (b(11).y - b(12).y).abs() < 0.5 && (b(11).height - b(12).height).abs() < 0.5,
+        "{:?} {:?}",
+        b(11),
+        b(12)
+    );
+    // The column is as high as two lines, the row as high as it: nothing hangs down
+    assert!(b(22).height > 1.5 * b(21).height, "{:?}", b(22));
+    assert!(
+        (b(20).height - b(22).height).abs() < 0.5,
+        "{:?} {:?}",
+        b(20),
+        b(22)
+    );
+    for id in [21, 25] {
+        assert!(
+            (middle(id) - middle(22)).abs() < 1.0,
+            "{id}: {:?} {:?}",
+            b(id),
+            b(22)
+        );
+    }
+    assert!(
+        (bottom(b(31)) - bottom(b(32))).abs() < 1.0,
+        "{:?} {:?}",
+        b(31),
+        b(32)
+    );
+    assert!(
+        (b(30).height - b(32).height).abs() < 0.5,
+        "{:?} {:?}",
+        b(30),
+        b(32)
+    );
+}
+
+#[test]
+fn columns_gather_their_nodes_across_and_along() {
+    let column_with = |align, arrangement| Widget::Column {
+        align,
+        arrangement,
+        spacing: None,
+    };
+    let tree = |align, arrangement| {
+        vec![
+            panel(),
+            node(2, Some(1), column_with(align, arrangement)),
+            button(3, 2, "One"),
+            button(4, 2, "Two"),
+        ]
+    };
+    let run = Run::new(tree(Some(Align::Center), None));
+    let (one, two) = (run.state.bounds[&3], run.state.bounds[&4]);
+    let middle = |r: UiRect| r.x + r.width / 2.0;
+    assert!((middle(one) - 100.0).abs() < 2.0, "{one:?}");
+    assert!((middle(two) - 100.0).abs() < 2.0, "{two:?}");
+    // At the bottom of the panel, in their order
+    let run = Run::new(tree(None, Some(Arrangement::End)));
+    let (one, two) = (run.state.bounds[&3], run.state.bounds[&4]);
+    assert!(one.y < two.y && bottom(two) > 580.0, "{one:?} {two:?}");
+    let run = Run::new(tree(None, Some(Arrangement::Center)));
+    let (one, two) = (run.state.bounds[&3], run.state.bounds[&4]);
+    let middle = (one.y + bottom(two)) / 2.0;
+    // The middle of what is left under the title
+    assert!((middle - 310.0).abs() < 20.0, "{one:?} {two:?}");
+}
+
+#[test]
+fn columns_sides_indents_and_resize_boxes_place_their_nodes() {
+    let run = Run::new(vec![
+        central(1),
+        node(10, Some(1), Widget::Columns),
+        text(11, 10, "a"),
+        text(12, 10, "b"),
+        text(13, 10, "c"),
+        node(20, Some(1), Widget::Sides),
+        text(21, 20, "Title"),
+        button(22, 20, "Close"),
+        node(30, Some(1), column()),
+        text(31, 30, "Before"),
+        node(32, Some(30), Widget::Indent),
+        text(33, 32, "Inside"),
+        node(
+            40,
+            Some(1),
+            Widget::Resize {
+                width: 300.0,
+                height: 120.0,
+            },
+        ),
+        text(41, 40, "Drag the corner"),
+    ]);
+    let b = |id: u64| run.state.bounds[&id];
+    let inside = b(1);
+    assert!(b(11).x < b(12).x && b(12).x < b(13).x);
+    assert!(((b(12).x - b(11).x) - (b(13).x - b(12).x)).abs() < 1.0);
+    assert!(b(12).x - b(11).x > 200.0, "{:?} {:?}", b(11), b(12));
+    assert!(b(21).x < inside.x + 20.0);
+    assert!(right(b(22)) > right(inside) - 20.0, "{:?}", b(22));
+    assert!((b(21).y - b(22).y).abs() < 10.0);
+    assert!(b(33).x > b(31).x + 5.0);
+    assert!(
+        (b(40).width - 300.0).abs() < 20.0 && (b(40).height - 120.0).abs() < 20.0,
+        "{:?}",
+        b(40)
+    );
+    assert!(invalid(vec![
+        central(1),
+        node(2, Some(1), Widget::Sides),
+        text(3, 2, "x")
+    ])
+    .contains("Sides 2 holds 1 nodes"));
+}
+
+#[test]
+fn panels_fold_away_and_the_central_panel_takes_the_rest() {
+    let tree = |expanded| {
+        vec![
+            // Before the side panel in the list, but it gets what the panel leaves
+            central(9),
+            node(
+                1,
+                None,
+                Widget::SidePanel {
+                    side: Side::Left,
+                    title: None,
+                    width: 200.0,
+                    resizable: false,
+                    min_width: None,
+                    max_width: None,
+                    expanded,
+                },
+            ),
+            text(2, 1, "Panel"),
+            text(10, 9, "Rest"),
+        ]
+    };
+    let mut run = Run::new(tree(true));
+    let (side, rest) = (run.state.bounds[&1], run.state.bounds[&9]);
+    assert!((rest.x - right(side)).abs() < 1.0, "{side:?} {rest:?}");
+    assert!((right(rest) - 800.0).abs() < 1.0);
+    assert_eq!(run.state.panels.len(), 2);
+    run.state.set_tree(tree(false)).unwrap();
+    for _ in 0..30 {
+        run.frame(vec![]);
+    }
+    assert!(!run.state.bounds.contains_key(&1));
+    assert!(run.state.bounds[&9].x < 1.0);
+    // Without its background only its nodes cover the picture
+    let run = Run::new(vec![
+        node(1, None, Widget::CentralPanel { frame: false }),
+        text(2, 1, "Over the picture"),
+    ]);
+    assert_eq!(run.state.panels, vec![run.state.bounds[&2]]);
+    assert!(invalid(vec![central(1), central(2)]).contains("CentralPanel 2 is the second one"));
+}
+
+#[test]
+fn windows_are_pinned_sized_without_a_title_and_closed_by_kotlin() {
+    let window = |title_bar, open| {
+        node(
+            1,
+            None,
+            Widget::Window {
+                title: "Stats".into(),
+                x: -10.0,
+                y: -10.0,
+                width: Some(200.0),
+                closable: true,
+                collapsible: false,
+                resizable: false,
+                height: Some(100.0),
+                anchor: Some(Anchor::BottomRight),
+                movable: true,
+                title_bar,
+                fixed_size: true,
+                scroll: false,
+                open,
+            },
+        )
+    };
+    let long = "A line much longer than the two hundred points of the window, which wraps";
+    let settle = |run: &mut Run| {
+        for _ in 0..20 {
+            run.frame(vec![]);
+        }
+    };
+    let mut run = Run::new(vec![window(true, true), text(2, 1, long)]);
+    settle(&mut run);
+    let w = run.state.bounds[&1];
+    assert!(
+        (right(w) - 790.0).abs() < 1.0 && (bottom(w) - 590.0).abs() < 1.0,
+        "{w:?}"
+    );
+    assert!((200.0..=230.0).contains(&w.width), "{w:?}");
+    assert!(w.height >= 100.0, "{w:?}");
+    let below_title = run.state.bounds[&2].y - w.y;
+    let mut run = Run::new(vec![window(false, true), text(2, 1, long)]);
+    settle(&mut run);
+    let without = run.state.bounds[&2].y - run.state.bounds[&1].y;
+    assert!(without + 15.0 < below_title, "{without} {below_title}");
+    // Closed by Kotlin: it fades out without an event
+    run.state
+        .set_tree(vec![window(false, false), text(2, 1, long)])
+        .unwrap();
+    settle(&mut run);
+    assert!(!run.state.bounds.contains_key(&1));
+    assert_eq!(run.state.take_events(), vec![]);
+}
+
+#[test]
+fn scroll_areas_scroll_sideways_and_stay_at_the_end() {
+    let mut nodes = vec![
+        central(1),
+        node(
+            10,
+            Some(1),
+            Widget::ScrollArea {
+                max_height: Some(100.0),
+                direction: None,
+                max_width: None,
+                stick_to_end: true,
+            },
+        ),
+    ];
+    for i in 0..50 {
+        nodes.push(text(11 + i, 10, &format!("Line {i}")));
+    }
+    nodes.push(node(
+        70,
+        Some(1),
+        Widget::ScrollArea {
+            max_height: None,
+            direction: Some(ScrollDirection::Horizontal),
+            max_width: Some(120.0),
+            stick_to_end: false,
+        },
+    ));
+    nodes.push(node(71, Some(70), row()));
+    for i in 0..9 {
+        nodes.push(button(72 + i, 71, &format!("Button {i}")));
+    }
+    let mut run = Run::new(nodes);
+    run.frame(vec![]);
+    let b = |id: u64| run.state.bounds[&id];
+    let area = b(10);
+    assert!(area.height <= 100.5, "{area:?}");
+    // The last line in sight, the first scrolled away above
+    assert!(
+        bottom(b(60)) <= bottom(area) + 1.0 && b(60).y >= area.y,
+        "{area:?} {:?}",
+        b(60)
+    );
+    assert!(b(11).y < area.y);
+    let sideways = b(70);
+    assert!(sideways.width <= 120.5, "{sideways:?}");
+    assert!(b(80).x > right(sideways));
+}
+
+#[test]
+fn texts_come_in_parts_wrap_or_are_cut_and_can_be_selected() {
+    let long = "A text that is much too long for the panel it stands in";
+    let text_with = |id, s: &str, spans, wrap, selectable| {
+        node(
+            id,
+            Some(1),
+            Widget::Text {
+                text: s.into(),
+                style: TextStyle::Body,
+                color: None,
+                spans,
+                wrap,
+                selectable,
+            },
+        )
+    };
+    let mut run = Run::new(vec![
+        panel(),
+        text_with(
+            2,
+            "Frame time ",
+            vec![
+                TextSpan {
+                    text: "12.9 ms".into(),
+                    style: Some(TextStyle::Strong),
+                    ..Default::default()
+                },
+                TextSpan {
+                    text: " (lavapipe)".into(),
+                    italic: true,
+                    color: Some(0xFF00FF00),
+                    ..Default::default()
+                },
+            ],
+            None,
+            true,
+        ),
+        text_with(3, long, vec![], Some(TextWrap::Truncate), true),
+        text_with(4, long, vec![], Some(TextWrap::Wrap), true),
+        text_with(5, "Select me", vec![], None, true),
+        text_with(6, "Not me", vec![], None, false),
+    ]);
+    let output = run.frame(vec![]);
+    let parts = galley(&output, "Frame time 12.9 ms (lavapipe)");
+    let sections = &parts.job.sections;
+    assert_eq!(sections.len(), 3);
+    assert_eq!(
+        sections[1].format.color,
+        run.egui.global_style().visuals.strong_text_color()
+    );
+    assert!(sections[2].format.italics);
+    assert_eq!(sections[2].format.color, egui::Color32::GREEN);
+    let line = run.state.bounds[&5].height;
+    assert!((run.state.bounds[&3].height - line).abs() < 1.0);
+    assert!(galley(&output, long).elided || texts(&output).iter().any(|t| t == long));
+    assert!(run.state.bounds[&4].height > 1.5 * line);
+    // A text that can be selected shows the text cursor
+    let mut cursor = |id| {
+        run.frame(vec![egui::Event::PointerMoved(run.center(id))]);
+        run.frame(vec![]).platform_output.cursor_icon
+    };
+    assert_eq!(cursor(5), egui::CursorIcon::Text);
+    assert_eq!(cursor(6), egui::CursorIcon::Default);
+
+    assert!(invalid(vec![
+        panel(),
+        text_with(
+            2,
+            "",
+            vec![TextSpan {
+                text: "tiny".into(),
+                size: Some(0.0),
+                ..Default::default()
+            }],
+            None,
+            true
+        )
+    ])
+    .contains("the part 'tiny' has the size 0"));
+}
+
+#[test]
+fn grids_keep_the_room_between_cells() {
+    let grid = |row_spacing| {
+        Run::new(vec![
+            panel(),
+            node(
+                2,
+                Some(1),
+                Widget::Grid {
+                    columns: 2,
+                    striped: false,
+                    column_spacing: Some(40.0),
+                    row_spacing,
+                    min_column_width: Some(50.0),
+                },
+            ),
+            text(3, 2, "a"),
+            text(4, 2, "b"),
+            text(5, 2, "c"),
+            text(6, 2, "d"),
+        ])
+    };
+    let (spaced, tight) = (grid(Some(12.0)), grid(Some(0.0)));
+    let b = |run: &Run, id: u64| run.state.bounds[&id];
+    assert!(b(&spaced, 4).x - b(&spaced, 3).x >= 90.0 - 0.5);
+    let pitch = |run: &Run| b(run, 5).y - b(run, 3).y;
+    assert!((pitch(&spaced) - pitch(&tight) - 12.0).abs() < 0.5);
 }

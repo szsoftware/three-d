@@ -187,9 +187,13 @@ fn a_host_on_opengl_draws_the_view_onto_its_screen() {
                 title: None,
                 width: 24.0,
                 resizable: false,
+                min_width: None,
+                max_width: None,
+                expanded: true,
             },
             enabled: true,
             tooltip: None,
+            modifier: None,
         }])
         .unwrap();
     hosted.set_overlay(Some(overlay)).unwrap();

@@ -144,6 +144,9 @@ pub(crate) struct UiState {
     events: Vec<UiEvent>,
     /// Where each node was drawn last frame, in points.
     pub bounds: HashMap<u64, UiRect>,
+    /// [UiState::bounds] of the frame before, while a frame is drawn: a row that wraps needs the sizes before it
+    /// draws.
+    pub previous: HashMap<u64, UiRect>,
     /// The panels of last frame: they lie on egui's background layer, which has no area of its own to hit.
     pub panels: Vec<UiRect>,
     /// Something changed that the picture does not show yet.

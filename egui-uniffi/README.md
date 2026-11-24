@@ -23,12 +23,52 @@ bindings, with Compose as the model.
 
 ## The tree
 
-At the top stand `SidePanel`, `TopBar`, `BottomBar`, `Window` and `Area` (pinned to a corner, an edge or the center).
-Inside them: the containers `Row`, `Column`, `Grid`, `Collapsible`, `ScrollArea`, `Group` and the widgets `Text` (body,
-heading, strong, small, weak, monospace), `Separator`, `Spacer`, `Button`, `Checkbox`, `Radio`, `ComboBox`, `SliderInt`,
-`SliderFloat`, `DragValue`, `TextField`, `ProgressBar`, `Spinner`, `Notice` (info, warning, error) and `Plot`. `setTree`
-refuses a tree with an id twice, a parent that is not there or holds no nodes, a panel inside a node, or values that do
-not fit.
+At the top stand `SidePanel`, `TopBar`, `BottomBar`, `CentralPanel` (the room the others leave), `Window` and `Area`
+(pinned to a corner, an edge or the center). Inside them: the containers `Row`, `Column`, `Columns`, `Sides`, `Indent`,
+`Resize`, `Grid`, `Collapsible`, `ScrollArea`, `Group` and the widgets `Text`, `Separator`, `Spacer`, `Button`, `Checkbox`,
+`Radio`, `ComboBox`, `SliderInt`, `SliderFloat`, `DragValue`, `TextField`, `ProgressBar`, `Spinner`, `Notice` (info,
+warning, error) and `Plot`. `setTree` refuses a tree with an id twice, a parent that is not there or holds no nodes, a
+panel inside a node, a second `CentralPanel`, `Sides` without exactly two nodes, or values that do not fit.
+
+Fields added after the first version have defaults (`#[uniffi(default)]`), so Kotlin that builds nodes without them keeps
+building.
+
+## Layout
+
+Every node may carry a `UiModifier`, as Compose's `Modifier`:
+
+| Field | What it does |
+| --- | --- |
+| `width`, `height` | exactly this size; a button or a field fills it |
+| `min_width` … `max_height` | at least, at most (longer text wraps) |
+| `fill_width`, `fill_height` | all the room of the container (`fillMaxWidth`) |
+| `background`, `border`, `corner_radius`, `shadow` | a frame of egui around the node |
+| `padding`, `margin` | room inside the frame, room around it |
+| `align` | where it sits across its container: start, center, end |
+| `opacity`, `invisible` | fainter with everything inside; keeps its room but is neither drawn nor reacts |
+
+Sizes count the padding and the border, not the margin (`Modifier.width(120.dp).background(…).padding(8.dp)`). A modified
+node's `bounds` include its frame.
+
+`Row` and `Column` take `align` (across), `arrangement` (start, center or end along them, in their order) and `spacing`;
+a row may `wrap` into lines, it decides with the sizes of the frame before. The middle needs the length of the frame
+before as well (egui lays out in one go): the first frame is laid out twice. Across a row, egui knows the height of a
+single widget before it places it, but not of a column, a frame or a widget with a size: these sit in the middle (or at the
+bottom) by their height of the frame before, and a row that does not wrap is as high as its highest node from the start, so
+that all its nodes line up. The middle and the end of a `Column` need a
+known height (a panel), not a `ScrollArea`. `Columns` puts each node in a column of the same width, `Sides` its first
+node at the left and its second at the right edge, `Indent` moves its nodes in, `Resize` has a corner to drag.
+
+Panels fold away animated with `expanded = false`; side panels have `min_width` and `max_width`. A `CentralPanel` takes
+what the others leave; without its `frame` the picture shows through and only its nodes cover it. Windows may be pinned
+(`anchor`, `x` and `y` as the distance), have a `fixed_size`, no `title_bar`, `scroll`, not be `movable`, and
+`open = false` fades them out without an event. `ScrollArea` scrolls up and down, sideways or both, and with
+`stick_to_end` stays at the end while nodes come in, as a log. `Grid` has `column_spacing`, `row_spacing` and
+`min_column_width`.
+
+`Text` is `text` followed by `spans` in their own styles (Compose's `AnnotatedString`): each `TextSpan` may change the
+style, color, background and size and be italic, underlined, struck through, code or raised. `wrap` breaks it into lines,
+cuts it with "…" or lets it run on; `selectable = false` keeps the user from selecting it.
 
 ## Plots
 
@@ -81,4 +121,5 @@ links one copy. It has no log bridge of its own: that comes from the crate that 
 
 `cargo test -p three-d-egui-uniffi`: the tree, the values and the events with egui alone; painting, clicks through
 `input`, scale, style and repaints on OpenGL through EGL (Linux) and on wgpu. `THREE_D_SKIP_GPU_TESTS=1` leaves out the
-graphics card, `THREE_D_EGUI_PICTURE=<dir>` writes the pictures of the options panel test as raw RGBA.
+graphics card, `THREE_D_EGUI_PICTURE=<dir>` writes the pictures of the options panel, the plots and the settings window
+as raw RGBA.
