@@ -771,6 +771,7 @@ fn realtime_view_with_egui_over_it() {
         widget,
         enabled: true,
         tooltip: None,
+        modifier: None,
     };
     overlay
         .set_tree(vec![
@@ -782,6 +783,9 @@ fn realtime_view_with_egui_over_it() {
                     title: None,
                     width: 80.0,
                     resizable: false,
+                    min_width: None,
+                    max_width: None,
+                    expanded: true,
                 },
             ),
             node(

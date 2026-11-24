@@ -2,14 +2,15 @@
 
 use crate::state::{Local, UiState};
 use crate::{
-    Anchor, NoticeLevel, PlotSeries, SeriesKind, Side, TextStyle, Tree, UiEvent, UiNode, Widget,
+    Anchor, Arrangement, NoticeLevel, PlotSeries, ScrollDirection, SeriesKind, Side, TextSpan,
+    TextStyle, Tree, UiEvent, UiInsets, UiModifier, UiNode, Widget,
 };
-use three_d::egui::{self, Color32, Id, Response, RichText, Ui, UiBuilder};
+use three_d::egui::{self, Color32, Id, Layout, Response, RichText, Ui, UiBuilder};
 
 /// Draws the whole tree onto the root `ui` of a frame and notes what the user did in `state`.
 pub(crate) fn draw(ui: &mut Ui, state: &mut UiState) {
     let tree = std::mem::take(&mut state.tree);
-    state.bounds.clear();
+    state.previous = std::mem::take(&mut state.bounds);
     state.panels.clear();
     let mut frame = Frame { tree: &tree, state };
     for &root in &tree.roots {
@@ -21,6 +22,20 @@ pub(crate) fn draw(ui: &mut Ui, state: &mut UiState) {
 fn argb(c: u32) -> Color32 {
     let [a, r, g, b] = c.to_be_bytes();
     Color32::from_rgba_unmultiplied(r, g, b, a)
+}
+
+fn align2(anchor: Anchor) -> egui::Align2 {
+    match anchor {
+        Anchor::TopLeft => egui::Align2::LEFT_TOP,
+        Anchor::Top => egui::Align2::CENTER_TOP,
+        Anchor::TopRight => egui::Align2::RIGHT_TOP,
+        Anchor::Left => egui::Align2::LEFT_CENTER,
+        Anchor::Center => egui::Align2::CENTER_CENTER,
+        Anchor::Right => egui::Align2::RIGHT_CENTER,
+        Anchor::BottomLeft => egui::Align2::LEFT_BOTTOM,
+        Anchor::Bottom => egui::Align2::CENTER_BOTTOM,
+        Anchor::BottomRight => egui::Align2::RIGHT_BOTTOM,
+    }
 }
 
 fn node_id(node: &UiNode) -> Id {
@@ -64,36 +79,71 @@ impl Frame<'_> {
                 title,
                 width,
                 resizable,
+                min_width,
+                max_width,
+                expanded,
             } => {
                 let panel = match side {
                     Side::Left => egui::Panel::left(id),
                     Side::Right => egui::Panel::right(id),
                 };
                 // Not resizable: exactly as wide, else egui shrinks it to its content
-                let panel = if *resizable {
+                let mut panel = if *resizable {
                     panel.resizable(true).default_size(*width)
                 } else {
                     panel.resizable(false).exact_size(*width)
                 };
-                let r = panel.show_inside(ui, |ui| {
+                if *resizable {
+                    if let Some(min) = min_width {
+                        panel = panel.min_size(*min);
+                    }
+                    if let Some(max) = max_width {
+                        panel = panel.max_size(*max);
+                    }
+                }
+                // Folded away (after its animation) it is not there at all
+                let Some(r) = panel.show_animated_inside(ui, *expanded, |ui| {
                     if let Some(title) = title {
                         ui.heading(title);
                     }
                     self.inside(ui, node);
-                });
+                }) else {
+                    return;
+                };
                 self.state.panels.push(r.response.rect.into());
                 r.response.rect
             }
-            Widget::TopBar | Widget::BottomBar => {
-                let panel = if matches!(node.widget, Widget::TopBar) {
+            Widget::TopBar { expanded } | Widget::BottomBar { expanded } => {
+                let panel = if matches!(node.widget, Widget::TopBar { .. }) {
                     egui::Panel::top(id)
                 } else {
                     egui::Panel::bottom(id)
                 };
-                let r = panel.show_inside(ui, |ui| {
+                let Some(r) = panel.show_animated_inside(ui, *expanded, |ui| {
                     ui.horizontal(|ui| self.inside(ui, node));
-                });
+                }) else {
+                    return;
+                };
                 self.state.panels.push(r.response.rect.into());
+                r.response.rect
+            }
+            Widget::CentralPanel { frame } => {
+                let panel = if *frame {
+                    egui::CentralPanel::default()
+                } else {
+                    egui::CentralPanel::no_frame()
+                };
+                let r = panel.show_inside(ui, |ui| self.inside(ui, node));
+                if *frame {
+                    self.state.panels.push(r.response.rect.into());
+                } else {
+                    // Without a background only its nodes cover the picture: the rest goes to the application
+                    for &child in self.tree.children(node.id) {
+                        if let Some(&rect) = self.state.bounds.get(&self.tree.nodes[child].id) {
+                            self.state.panels.push(rect);
+                        }
+                    }
+                }
                 r.response.rect
             }
             Widget::Window {
@@ -104,24 +154,61 @@ impl Frame<'_> {
                 closable,
                 collapsible,
                 resizable,
+                height,
+                anchor,
+                movable,
+                title_bar,
+                fixed_size,
+                scroll,
+                open: kotlin_open,
             } => {
                 if self.state.local(node.id) == Some(&Local::Closed) {
                     return;
                 }
-                let mut open = true;
+                let mut open = *kotlin_open;
                 let mut window = egui::Window::new(title.as_str())
                     .id(id)
-                    .default_pos([*x, *y])
                     .collapsible(*collapsible)
-                    .resizable(*resizable);
-                if let Some(width) = width {
-                    window = window.default_width(*width);
+                    .resizable(*resizable && !*fixed_size)
+                    .movable(*movable)
+                    .title_bar(*title_bar)
+                    .vscroll(*scroll);
+                window = match anchor {
+                    Some(anchor) => window.anchor(align2(*anchor), [*x, *y]),
+                    None => window.default_pos([*x, *y]),
+                };
+                if *fixed_size {
+                    if let Some(w) = width {
+                        window = window.min_width(*w).max_width(*w);
+                    }
+                    if let Some(h) = height {
+                        window = window.min_height(*h).max_height(*h);
+                    }
+                } else {
+                    if let Some(w) = width {
+                        window = window.default_width(*w);
+                    }
+                    if let Some(h) = height {
+                        window = window.default_height(*h);
+                    }
                 }
-                if *closable {
+                // Closed by Kotlin it fades out, as when its close button is clicked
+                if *closable || !*kotlin_open {
                     window = window.open(&mut open);
                 }
-                let shown = window.show(ui.ctx(), |ui| self.inside(ui, node));
-                if !open {
+                let shown = window.show(ui.ctx(), |ui| {
+                    // egui sizes a window that cannot be resized by its content: its inside takes the size
+                    if *fixed_size {
+                        if let Some(w) = width {
+                            ui.set_width(*w);
+                        }
+                        if let Some(h) = height {
+                            ui.set_height(*h);
+                        }
+                    }
+                    self.inside(ui, node)
+                });
+                if *kotlin_open && !open {
                     self.state
                         .change(Local::Closed, UiEvent::Closed { id: node.id });
                 }
@@ -136,19 +223,8 @@ impl Frame<'_> {
                 dy,
                 frame,
             } => {
-                let align = match anchor {
-                    Anchor::TopLeft => egui::Align2::LEFT_TOP,
-                    Anchor::Top => egui::Align2::CENTER_TOP,
-                    Anchor::TopRight => egui::Align2::RIGHT_TOP,
-                    Anchor::Left => egui::Align2::LEFT_CENTER,
-                    Anchor::Center => egui::Align2::CENTER_CENTER,
-                    Anchor::Right => egui::Align2::RIGHT_CENTER,
-                    Anchor::BottomLeft => egui::Align2::LEFT_BOTTOM,
-                    Anchor::Bottom => egui::Align2::CENTER_BOTTOM,
-                    Anchor::BottomRight => egui::Align2::RIGHT_BOTTOM,
-                };
                 let r = egui::Area::new(id)
-                    .anchor(align, [*dx, *dy])
+                    .anchor(align2(*anchor), [*dx, *dy])
                     .show(ui.ctx(), |ui| {
                         // An area is as wide as its content: a frame time near the edge does not wrap
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
@@ -172,10 +248,128 @@ impl Frame<'_> {
         if !node.enabled {
             builder = builder.disabled();
         }
-        let scope = ui.scope_builder(builder, |ui| self.widget(ui, node));
-        let response = scope.inner.unwrap_or(scope.response);
-        self.state.bounds.insert(node.id, response.rect.into());
-        tooltip(response, node);
+        let modifier = node.modifier.as_ref();
+        if modifier.is_some_and(|m| m.invisible) {
+            builder = builder.invisible();
+        }
+        let scope = ui.scope_builder(builder, |ui| match modifier {
+            // A button wider than its text has it in the middle, as in Compose
+            Some(m) => modified(ui, m, matches!(node.widget, Widget::Button { .. }), |ui| {
+                self.widget(ui, node)
+            }),
+            None => self.widget(ui, node),
+        });
+        // With a modifier the node is all of it, its frame too
+        let rect = match (modifier, &scope.inner) {
+            (None, Some(r)) => r.rect,
+            _ => scope.response.rect,
+        };
+        self.state.bounds.insert(node.id, rect.into());
+        tooltip(scope.inner.unwrap_or(scope.response), node);
+    }
+
+    /// The nodes of a row or a column in their order, gathered at the start, in the middle or at the end.
+    #[allow(clippy::too_many_arguments)]
+    fn flow(
+        &mut self,
+        ui: &mut Ui,
+        node: &UiNode,
+        horizontal: bool,
+        wrap: bool,
+        cross: egui::Align,
+        arrangement: Option<Arrangement>,
+        spacing: Option<f32>,
+    ) -> Response {
+        let available = ui.available_size_before_wrap();
+        let along = if horizontal { available.x } else { available.y };
+        // The middle and the end need the room along it, which a scroll area does not have; lines that wrap fill it
+        let arrangement = match arrangement {
+            Some(Arrangement::Center) if wrap => Arrangement::Start,
+            Some(a) if along.is_finite() => a,
+            _ => Arrangement::Start,
+        };
+        let end = arrangement == Arrangement::End;
+        let layout = match (horizontal, end) {
+            (true, false) => Layout::left_to_right(cross),
+            (true, true) => Layout::right_to_left(cross),
+            (false, false) => Layout::top_down(cross),
+            (false, true) => Layout::bottom_up(cross),
+        }
+        .with_main_wrap(wrap);
+        // As egui's horizontal and vertical: a row as high as a button to start with, a column as wide as its container;
+        // at the bottom a column needs all the height
+        let initial = match (horizontal, end) {
+            (true, _) => egui::vec2(available.x, ui.spacing().interact_size.y),
+            (false, false) => egui::vec2(available.x, 0.0),
+            (false, true) => available,
+        };
+        // In the middle the length of the last pass decides where it starts: egui lays out in one go
+        let measured = node_id(node).with("length");
+        let before = if arrangement == Arrangement::Center {
+            ui.data(|d| d.get_temp::<f32>(measured))
+        } else {
+            None
+        };
+        let tree = self.tree;
+        let r = ui.allocate_ui_with_layout(initial, layout, |ui| {
+            if let Some(s) = spacing {
+                if horizontal {
+                    ui.spacing_mut().item_spacing.x = s;
+                } else {
+                    ui.spacing_mut().item_spacing.y = s;
+                }
+            }
+            if let Some(length) = before {
+                ui.add_space(((along - length) / 2.0).max(0.0));
+            }
+            let start = if horizontal {
+                ui.cursor().min.x
+            } else {
+                ui.cursor().min.y
+            };
+            let children = tree.children(node.id);
+            // From the end in reverse, so that they keep their order
+            let order: Box<dyn Iterator<Item = &usize>> = if end {
+                Box::new(children.iter().rev())
+            } else {
+                Box::new(children.iter())
+            };
+            for &child in order {
+                let id = tree.nodes[child].id;
+                // A node draws in a scope of its own, which egui cannot wrap before it knows its size: the size of
+                // the last frame decides whether it starts a new line
+                if wrap {
+                    let at_start = ui.cursor().min.x <= ui.max_rect().min.x + 0.5;
+                    match self.state.previous.get(&id) {
+                        Some(last)
+                            if !at_start && last.width > ui.available_size_before_wrap().x =>
+                        {
+                            ui.end_row()
+                        }
+                        Some(_) => {}
+                        None => ui
+                            .ctx()
+                            .request_discard("a node in a row that wraps has no size yet"),
+                    }
+                }
+                self.node(ui, &tree.nodes[child]);
+            }
+            let rect = ui.min_rect();
+            if horizontal {
+                rect.max.x - start
+            } else {
+                rect.max.y - start
+            }
+        });
+        if arrangement == Arrangement::Center {
+            let length = r.inner;
+            if before.is_none_or(|b| (b - length).abs() > 0.5) {
+                ui.data_mut(|d| d.insert_temp(measured, length));
+                ui.ctx()
+                    .request_discard("a row or column in the middle measured its length");
+            }
+        }
+        r.response
     }
 
     /// Draws one widget, returns its response (`None`: the scope's).
@@ -183,21 +377,93 @@ impl Frame<'_> {
         let id = node.id;
         let state = &mut *self.state;
         Some(match &node.widget {
-            Widget::Row => ui.horizontal(|ui| self.children(ui, node)).response,
-            Widget::Column => ui.vertical(|ui| self.children(ui, node)).response,
-            Widget::Grid { columns, striped } => {
-                let columns = *columns as usize;
-                egui::Grid::new(node_id(node))
-                    .striped(*striped)
-                    .show(ui, |ui| {
-                        for (i, &child) in self.tree.children(node.id).iter().enumerate() {
-                            self.node(ui, &self.tree.nodes[child]);
-                            if (i + 1) % columns == 0 {
-                                ui.end_row();
-                            }
+            Widget::Row {
+                wrap,
+                align,
+                arrangement,
+                spacing,
+            } => {
+                let cross = align.map_or(egui::Align::Center, Into::into);
+                self.flow(ui, node, true, *wrap, cross, *arrangement, *spacing)
+            }
+            Widget::Column {
+                align,
+                arrangement,
+                spacing,
+            } => {
+                let cross = align.map_or(egui::Align::Min, Into::into);
+                self.flow(ui, node, false, false, cross, *arrangement, *spacing)
+            }
+            Widget::Columns => {
+                let tree = self.tree;
+                let children = tree.children(node.id);
+                if children.is_empty() {
+                    return None;
+                }
+                ui.scope(|ui| {
+                    ui.columns(children.len(), |columns| {
+                        for (column, &child) in columns.iter_mut().zip(children) {
+                            self.node(column, &tree.nodes[child]);
                         }
                     })
+                })
+                .response
+            }
+            Widget::Sides => {
+                // Tree::new made sure of two
+                let tree = self.tree;
+                let children = tree.children(node.id);
+                let (left, right) = (&tree.nodes[children[0]], &tree.nodes[children[1]]);
+                // egui calls one side after the other
+                let this = std::cell::RefCell::new(&mut *self);
+                ui.scope(|ui| {
+                    egui::Sides::new().show(
+                        ui,
+                        |ui| this.borrow_mut().node(ui, left),
+                        |ui| this.borrow_mut().node(ui, right),
+                    )
+                })
+                .response
+            }
+            Widget::Indent => {
+                ui.indent(node_id(node), |ui| self.children(ui, node))
                     .response
+            }
+            Widget::Resize { width, height } => {
+                ui.scope(|ui| {
+                    egui::Resize::default()
+                        .id_salt(node_id(node))
+                        .default_size([*width, *height])
+                        .show(ui, |ui| self.children(ui, node))
+                })
+                .response
+            }
+            Widget::Grid {
+                columns,
+                striped,
+                column_spacing,
+                row_spacing,
+                min_column_width,
+            } => {
+                let columns = *columns as usize;
+                let mut grid = egui::Grid::new(node_id(node)).striped(*striped);
+                if column_spacing.is_some() || row_spacing.is_some() {
+                    let s = ui.spacing().item_spacing;
+                    grid =
+                        grid.spacing([column_spacing.unwrap_or(s.x), row_spacing.unwrap_or(s.y)]);
+                }
+                if let Some(w) = min_column_width {
+                    grid = grid.min_col_width(*w);
+                }
+                grid.show(ui, |ui| {
+                    for (i, &child) in self.tree.children(node.id).iter().enumerate() {
+                        self.node(ui, &self.tree.nodes[child]);
+                        if (i + 1) % columns == 0 {
+                            ui.end_row();
+                        }
+                    }
+                })
+                .response
             }
             Widget::Collapsible { title, open } => {
                 egui::CollapsingHeader::new(title.as_str())
@@ -206,28 +472,62 @@ impl Frame<'_> {
                     .show(ui, |ui| self.children(ui, node))
                     .header_response
             }
-            Widget::ScrollArea { max_height } => {
-                egui::ScrollArea::vertical()
+            Widget::ScrollArea {
+                max_height,
+                direction,
+                max_width,
+                stick_to_end,
+            } => {
+                let [x, y] = match direction.unwrap_or(ScrollDirection::Vertical) {
+                    ScrollDirection::Vertical => [false, true],
+                    ScrollDirection::Horizontal => [true, false],
+                    ScrollDirection::Both => [true, true],
+                };
+                egui::ScrollArea::new([x, y])
                     .id_salt(node_id(node))
                     .max_height(max_height.unwrap_or(f32::INFINITY))
+                    .max_width(max_width.unwrap_or(f32::INFINITY))
+                    .stick_to_bottom(*stick_to_end && y)
+                    .stick_to_right(*stick_to_end && x)
                     .show(ui, |ui| self.children(ui, node));
                 return None;
             }
             Widget::Group => ui.group(|ui| self.children(ui, node)).response,
-            Widget::Text { text, style, color } => {
-                let mut rich = RichText::new(text.as_str());
-                rich = match style {
-                    TextStyle::Body => rich,
-                    TextStyle::Heading => rich.heading(),
-                    TextStyle::Strong => rich.strong(),
-                    TextStyle::Small => rich.small(),
-                    TextStyle::Weak => rich.weak(),
-                    TextStyle::Monospace => rich.monospace(),
+            Widget::Text {
+                text,
+                style,
+                color,
+                spans,
+                wrap,
+                selectable,
+            } => {
+                let mut label = if spans.is_empty() {
+                    egui::Label::new(styled(text, *style, *color))
+                } else {
+                    // The parts after one another in one layout, each in its own format
+                    let mut job = egui::text::LayoutJob::default();
+                    let style_of_ui = ui.style().clone();
+                    let mut append = |rich: RichText| {
+                        rich.append_to(
+                            &mut job,
+                            &style_of_ui,
+                            egui::FontSelection::Default,
+                            egui::Align::Center,
+                        )
+                    };
+                    if !text.is_empty() {
+                        append(styled(text, *style, *color));
+                    }
+                    for span in spans {
+                        append(span_text(span, *style, *color));
+                    }
+                    egui::Label::new(job)
                 };
-                if let Some(color) = color {
-                    rich = rich.color(argb(*color));
+                label = label.selectable(*selectable);
+                if let Some(wrap) = wrap {
+                    label = label.wrap_mode((*wrap).into());
                 }
-                ui.label(rich)
+                ui.add(label)
             }
             Widget::Separator => ui.separator(),
             Widget::Spacer { size } => {
@@ -445,12 +745,182 @@ impl Frame<'_> {
             }
             // Tree::new keeps them at the top
             Widget::SidePanel { .. }
-            | Widget::TopBar
-            | Widget::BottomBar
+            | Widget::TopBar { .. }
+            | Widget::BottomBar { .. }
+            | Widget::CentralPanel { .. }
             | Widget::Window { .. }
             | Widget::Area { .. } => return None,
         })
     }
+}
+
+/// A text in its style and color.
+fn styled(text: &str, style: TextStyle, color: Option<u32>) -> RichText {
+    let rich = RichText::new(text);
+    let rich = match style {
+        TextStyle::Body => rich,
+        TextStyle::Heading => rich.heading(),
+        TextStyle::Strong => rich.strong(),
+        TextStyle::Small => rich.small(),
+        TextStyle::Weak => rich.weak(),
+        TextStyle::Monospace => rich.monospace(),
+    };
+    match color {
+        Some(color) => rich.color(argb(color)),
+        None => rich,
+    }
+}
+
+/// A part of a text: what it leaves out from the text.
+fn span_text(span: &TextSpan, style: TextStyle, color: Option<u32>) -> RichText {
+    let mut rich = styled(
+        &span.text,
+        span.style.unwrap_or(style),
+        span.color.or(color),
+    );
+    if let Some(background) = span.background {
+        rich = rich.background_color(argb(background));
+    }
+    if let Some(size) = span.size {
+        rich = rich.size(size);
+    }
+    if span.italic {
+        rich = rich.italics();
+    }
+    if span.underline {
+        rich = rich.underline();
+    }
+    if span.strikethrough {
+        rich = rich.strikethrough();
+    }
+    if span.code {
+        rich = rich.code();
+    }
+    if span.raised {
+        rich = rich.small_raised();
+    }
+    rich
+}
+
+/// A node with its modifier: its opacity, its place across its container, its frame and its size.
+/// `centered`: a fixed size puts the content in the middle (a button's text).
+fn modified<R>(ui: &mut Ui, m: &UiModifier, centered: bool, add: impl FnOnce(&mut Ui) -> R) -> R {
+    if let Some(opacity) = m.opacity {
+        ui.multiply_opacity(opacity);
+    }
+    match m.align {
+        // The container's direction with another place across it
+        Some(align) => {
+            let layout = ui.layout().with_cross_align(align.into());
+            ui.with_layout(layout, |ui| framed(ui, m, centered, add))
+                .inner
+        }
+        None => framed(ui, m, centered, add),
+    }
+}
+
+/// Points of a margin, which egui keeps as whole numbers.
+fn margin(insets: Option<UiInsets>) -> egui::Margin {
+    let p = |v: f32| v.round().clamp(i8::MIN as f32, i8::MAX as f32) as i8;
+    insets.map_or(egui::Margin::ZERO, |i| egui::Margin {
+        left: p(i.left),
+        right: p(i.right),
+        top: p(i.top),
+        bottom: p(i.bottom),
+    })
+}
+
+/// The frame of a modifier with a background, a border, a shadow or room around.
+fn framed<R>(ui: &mut Ui, m: &UiModifier, centered: bool, add: impl FnOnce(&mut Ui) -> R) -> R {
+    if !m.has_frame() {
+        return sized(ui, m, centered, add);
+    }
+    let mut frame = egui::Frame::new()
+        .outer_margin(margin(m.margin))
+        .inner_margin(margin(m.padding))
+        .corner_radius(m.corner_radius);
+    if let Some(background) = m.background {
+        frame = frame.fill(argb(background));
+    }
+    if let Some(border) = m.border {
+        frame = frame.stroke(egui::Stroke::new(border.width, argb(border.color)));
+    }
+    if let Some(s) = m.shadow {
+        let i = |v: f32| v.round().clamp(i8::MIN as f32, i8::MAX as f32) as i8;
+        let u = |v: f32| v.round().clamp(0.0, u8::MAX as f32) as u8;
+        frame = frame.shadow(egui::Shadow {
+            offset: [i(s.dx), i(s.dy)],
+            blur: u(s.blur),
+            spread: u(s.spread),
+            color: argb(s.color),
+        });
+    }
+    frame.show(ui, |ui| sized(ui, m, centered, add)).inner
+}
+
+/// The size of a modifier, padding and border included: a button or a field fills it.
+fn sized<R>(ui: &mut Ui, m: &UiModifier, centered: bool, add: impl FnOnce(&mut Ui) -> R) -> R {
+    if !m.has_size() {
+        return add(ui);
+    }
+    let pad = m.padding.unwrap_or_default();
+    let border = m.border.map_or(0.0, |b| b.width);
+    let (dx, dy) = (
+        pad.left + pad.right + 2.0 * border,
+        pad.top + pad.bottom + 2.0 * border,
+    );
+    let inner = |v: f32, d: f32| (v - d).max(0.0);
+    let finite = |v: f32| v.is_finite().then_some(v);
+    // Filling takes what is left inside the frame already
+    let width = m
+        .width
+        .map(|w| inner(w, dx))
+        .or_else(|| m.fill_width.then(|| finite(ui.available_width())).flatten());
+    let height = m.height.map(|h| inner(h, dy)).or_else(|| {
+        m.fill_height
+            .then(|| finite(ui.available_height()))
+            .flatten()
+    });
+    // The room it may take: the container places it there (across as its other nodes), its widgets fill it where the
+    // size is fixed, and what is not fixed shrinks to the content
+    let room = egui::vec2(
+        width.unwrap_or_else(|| {
+            let available = ui.available_size_before_wrap().x;
+            m.max_width
+                .map_or(available, |max| inner(max, dx).min(available))
+        }),
+        height.unwrap_or_else(|| m.max_height.map_or(0.0, |max| inner(max, dy))),
+    );
+    let cross = if centered {
+        egui::Align::Center
+    } else if ui.layout().is_vertical() {
+        ui.layout().cross_align
+    } else {
+        egui::Align::Min
+    };
+    let layout = Layout::top_down(cross)
+        .with_cross_justify(width.is_some())
+        .with_main_justify(height.is_some());
+    ui.allocate_ui_with_layout(room, layout, |ui| {
+        match width {
+            Some(w) => ui.set_min_width(w),
+            None => {
+                if let Some(min) = m.min_width {
+                    ui.set_min_width(inner(min, dx));
+                }
+            }
+        }
+        match height {
+            Some(h) => ui.set_min_height(h),
+            None => {
+                if let Some(min) = m.min_height {
+                    ui.set_min_height(inner(min, dy));
+                }
+            }
+        }
+        add(ui)
+    })
+    .inner
 }
 
 /// The plot of a [Widget::Plot] node, with its series in their order.
