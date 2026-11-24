@@ -44,6 +44,8 @@ struct Painting {
     /// The context it paints on; contexts differ by their caches of programs.
     context: Context,
     started: Instant,
+    /// The viewport of the last frame egui ran in; `None` before the first.
+    viewport: Option<Viewport>,
 }
 
 ///
@@ -305,6 +307,7 @@ impl EguiOverlay {
                 gui,
                 context: context.clone(),
                 started: Instant::now(),
+                viewport: None,
             }));
             let mut shared = lock(&self.shared);
             shared.style_changed = shared.style.is_some();
@@ -313,6 +316,18 @@ impl EguiOverlay {
         painting.with_mut(|p| -> Result<(), UiError> {
             let mut shared = lock(&self.shared);
             let shared = &mut *shared;
+            // Nothing changed since the last frame (no tree, no input, no animation of egui, the same size): its
+            // meshes are painted again without running egui
+            let unchanged = !shared.ui.dirty
+                && shared.input.is_empty()
+                && events.is_empty()
+                && p.viewport == Some(viewport)
+                && !p.gui.context().has_requested_repaint();
+            if unchanged {
+                // p.viewport is only set after a frame egui ran in, so there are meshes
+                write(&|| p.gui.render_previous().map(|_| ()))?;
+                return Ok(());
+            }
             shared.apply_style(p.gui.context());
             let height = viewport.height as f32;
             let mut all: Vec<Event> = Vec::new();
@@ -333,6 +348,7 @@ impl EguiOverlay {
             }
             drop(all);
             write(&|| p.gui.render())?;
+            p.viewport = Some(viewport);
             Ok(())
         })?
     }

@@ -59,7 +59,7 @@ impl Run {
         run
     }
 
-    fn frame(&mut self, events: Vec<egui::Event>) {
+    fn frame(&mut self, events: Vec<egui::Event>) -> egui::FullOutput {
         self.time += 1.0 / 60.0;
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -71,7 +71,7 @@ impl Run {
             ..Default::default()
         };
         let state = &mut self.state;
-        let _ = self.egui.run_ui(input, |ui| crate::draw::draw(ui, state));
+        self.egui.run_ui(input, |ui| crate::draw::draw(ui, state))
     }
 
     fn center(&self, id: u64) -> egui::Pos2 {
@@ -549,6 +549,18 @@ fn every_widget_draws() {
             striped: true,
         },
         Widget::Column,
+        plot(vec![
+            series("Frame", line(), vec![], vec![12.0, 14.0, 13.0]),
+            series(
+                "Points",
+                SeriesKind::Points { radius: 2.0 },
+                vec![0.5, 1.5],
+                vec![1.0, 2.0],
+            ),
+            series("Bars", bars(None), vec![], vec![3.0, 4.0, 5.0]),
+            series("Boxes", boxes(), vec![], vec![1.0, 2.0, 3.0, 4.0, 5.0]),
+            series("60 fps", SeriesKind::HLine, vec![], vec![16.7]),
+        ]),
     ];
     let containers = [100 + 12, 100 + 13, 100 + 14, 100 + 15, 100 + 16];
     for (i, widget) in widgets.into_iter().enumerate() {
@@ -620,4 +632,268 @@ fn text_in_an_area_at_the_edge_does_not_wrap() {
     run.frame(vec![]);
     let line = run.state.bounds[&2];
     assert!(line.height < 20.0 && line.width > 100.0, "{line:?}");
+}
+
+fn series(name: &str, kind: SeriesKind, x: Vec<f64>, y: Vec<f64>) -> PlotSeries {
+    PlotSeries {
+        name: name.into(),
+        kind,
+        x,
+        y,
+        color: None,
+    }
+}
+
+fn line() -> SeriesKind {
+    SeriesKind::Line {
+        width: 1.5,
+        fill: false,
+    }
+}
+
+fn bars(stack: Option<&str>) -> SeriesKind {
+    SeriesKind::Bars {
+        width: 0.6,
+        stack: stack.map(Into::into),
+    }
+}
+
+fn boxes() -> SeriesKind {
+    SeriesKind::Boxes { width: 0.5 }
+}
+
+fn plot(series: Vec<PlotSeries>) -> Widget {
+    Widget::Plot {
+        series,
+        height: 150.0,
+        width: None,
+        x_label: String::new(),
+        y_label: String::new(),
+        x_unit: String::new(),
+        y_unit: String::new(),
+        categories: vec![],
+        legend: true,
+        interactive: true,
+        link: None,
+        include_x: vec![],
+        include_y: vec![0.0],
+    }
+}
+
+/// The texts egui painted in a frame (labels, axis marks, tooltips).
+fn texts(output: &egui::FullOutput) -> Vec<String> {
+    fn collect(shape: &egui::Shape, into: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(t) => into.push(t.galley.text().to_owned()),
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, into)),
+            _ => {}
+        }
+    }
+    let mut into = Vec::new();
+    for clipped in &output.shapes {
+        collect(&clipped.shape, &mut into);
+    }
+    into
+}
+
+/// Where a value of the plot `id` is on the screen, as egui_plot drew it in the last frame.
+fn on_screen(run: &Run, id: u64, x: f64, y: f64) -> egui::Pos2 {
+    let memory = egui_plot::PlotMemory::load(&run.egui, egui::Id::new(("three-d-egui", id)))
+        .expect("the plot was drawn");
+    memory
+        .transform()
+        .position_from_point(&egui_plot::PlotPoint::new(x, y))
+}
+
+/// What the plot shows when the pointer rests at `pos`.
+fn hover(run: &mut Run, pos: egui::Pos2) -> Vec<String> {
+    run.frame(vec![egui::Event::PointerMoved(pos)]);
+    let output = run.frame(vec![]);
+    texts(&output)
+}
+
+#[test]
+fn plots_refuse_series_whose_values_do_not_fit() {
+    let tree = |widget| vec![panel(), node(2, Some(1), widget)];
+    let one = |s| plot(vec![s]);
+    assert!(
+        invalid(tree(one(series("Spread", boxes(), vec![], vec![1.0; 7]))))
+            .contains("Plot 2: the boxes 'Spread' need five values each, they have 7")
+    );
+    assert!(invalid(tree(one(series(
+        "Spread",
+        boxes(),
+        vec![0.0, 1.0, 2.0],
+        vec![1.0; 10]
+    ))))
+    .contains("the boxes 'Spread' have 3 places for 2 boxes"));
+    assert!(invalid(tree(one(series(
+        "Frame",
+        line(),
+        vec![0.0, 1.0],
+        vec![1.0; 3]
+    ))))
+    .contains("'Frame' has 2 x values for 3 y values"));
+    assert!(invalid(tree(one(series(
+        "60 fps",
+        SeriesKind::HLine,
+        vec![1.0],
+        vec![16.7]
+    ))))
+    .contains("the lines across '60 fps' take no x values"));
+    let mut flat = plot(vec![]);
+    if let Widget::Plot { height, .. } = &mut flat {
+        *height = 0.0;
+    }
+    assert!(invalid(tree(flat)).contains("a plot needs a height above 0, it has 0"));
+    assert!(Tree::new(tree(one(series(
+        "Spread",
+        boxes(),
+        vec![0.0, 2.0],
+        vec![1.0; 10]
+    ))))
+    .is_ok());
+}
+
+#[test]
+fn a_bar_chart_names_its_categories_and_stacks_bars_of_a_group() {
+    let mut chart = plot(vec![
+        series("Trace", bars(Some("frame")), vec![], vec![10.0, 20.0]),
+        series("Denoise", bars(Some("frame")), vec![], vec![5.0, 5.0]),
+        series("Alone", bars(None), vec![2.0], vec![4.0]),
+    ]);
+    if let Widget::Plot {
+        categories, y_unit, ..
+    } = &mut chart
+    {
+        *categories = vec!["Cloister".into(), "Garden".into(), "Hall".into()];
+        *y_unit = " ms".into();
+    }
+    let mut run = Run::new(vec![panel(), node(2, Some(1), chart)]);
+    let shown = texts(&run.frame(vec![]));
+    for name in ["Cloister", "Garden", "Hall"] {
+        assert!(
+            shown.iter().any(|t| t == name),
+            "no {name} under the bars: {shown:?}"
+        );
+    }
+    // The denoise part stands on the trace part: low in the column the pointer finds the trace, above it the denoise
+    let low = on_screen(&run, 2, 0.0, 2.0);
+    let high = on_screen(&run, 2, 0.0, 12.5);
+    assert!(hover(&mut run, low)
+        .iter()
+        .any(|t| t == "Trace\nCloister: 10 ms"));
+    assert!(hover(&mut run, high)
+        .iter()
+        .any(|t| t == "Denoise\nCloister: 5 ms"));
+    let second = on_screen(&run, 2, 1.0, 22.0);
+    assert!(hover(&mut run, second)
+        .iter()
+        .any(|t| t == "Denoise\nGarden: 5 ms"));
+    let alone = on_screen(&run, 2, 2.0, 1.0);
+    assert!(hover(&mut run, alone)
+        .iter()
+        .any(|t| t == "Alone\nHall: 4 ms"));
+}
+
+#[test]
+fn the_pointer_on_a_line_or_a_box_shows_its_values() {
+    let mut chart = plot(vec![
+        series("Frame time", line(), vec![], vec![12.0, 12.5, 13.0, 12.0]),
+        series(
+            "Spread",
+            boxes(),
+            vec![6.0],
+            vec![10.0, 11.0, 12.0, 13.0, 15.0],
+        ),
+    ]);
+    if let Widget::Plot {
+        x_label, y_unit, ..
+    } = &mut chart
+    {
+        *x_label = "Frame".into();
+        *y_unit = " ms".into();
+    }
+    let mut run = Run::new(vec![panel(), node(2, Some(1), chart)]);
+    let point = on_screen(&run, 2, 1.0, 12.5);
+    let shown = hover(&mut run, point);
+    assert!(
+        shown.iter().any(|t| t == "Frame time\nFrame 1: 12.50 ms"),
+        "{shown:?}"
+    );
+    let median = on_screen(&run, 2, 6.0, 12.0);
+    let shown = hover(&mut run, median);
+    assert!(
+        shown
+            .iter()
+            .any(|t| t.starts_with("Spread\nFrame 6\nmax 15 ms\nQ3 13 ms\nmedian 12 ms")),
+        "{shown:?}"
+    );
+    // Away from the series the plot shows no values
+    let empty = on_screen(&run, 2, 4.5, 2.0);
+    let shown = hover(&mut run, empty);
+    assert!(!shown.iter().any(|t| t.contains(" ms")), "{shown:?}");
+}
+
+#[test]
+fn linked_plots_move_together_and_fixed_ones_stay() {
+    let linked = |interactive| {
+        let mut p = plot(vec![series(
+            "Frame",
+            line(),
+            vec![],
+            (0..100).map(f64::from).collect(),
+        )]);
+        if let Widget::Plot {
+            link,
+            interactive: i,
+            ..
+        } = &mut p
+        {
+            *link = Some("time".into());
+            *i = interactive;
+        }
+        p
+    };
+    let mut fixed = linked(false);
+    if let Widget::Plot { link, .. } = &mut fixed {
+        *link = None;
+    }
+    let mut run = Run::new(vec![
+        panel(),
+        node(2, Some(1), linked(true)),
+        node(3, Some(1), linked(true)),
+        node(4, Some(1), fixed),
+    ]);
+    let x_range = |run: &Run, id: u64| {
+        let memory =
+            egui_plot::PlotMemory::load(&run.egui, egui::Id::new(("three-d-egui", id))).unwrap();
+        let b = memory.bounds();
+        (b.min()[0], b.max()[0])
+    };
+    let before = [x_range(&run, 2), x_range(&run, 3), x_range(&run, 4)];
+    let drag = |run: &mut Run, id: u64| {
+        let from = run.center(id);
+        let to: Vec<egui::Pos2> = (1..=6)
+            .map(|i| from + egui::vec2(10.0 * i as f32, 0.0))
+            .collect();
+        run.drag(from, &to);
+        run.frame(vec![]);
+    };
+    drag(&mut run, 2);
+    let after = [x_range(&run, 2), x_range(&run, 3), x_range(&run, 4)];
+    assert!(
+        after[0].0 < before[0].0 - 1.0,
+        "dragging did not move the plot: {before:?} -> {after:?}"
+    );
+    assert!(
+        (after[1].0 - after[0].0).abs() < 1e-6 && (after[1].1 - after[0].1).abs() < 1e-6,
+        "{after:?}"
+    );
+    drag(&mut run, 4);
+    assert_eq!(
+        x_range(&run, 4),
+        before[2],
+        "the plot without interaction moved"
+    );
 }

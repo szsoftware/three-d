@@ -13,6 +13,8 @@ pub struct GUI {
     painter: GuiPainter,
     egui_context: egui::Context,
     output: RefCell<Option<egui::FullOutput>>,
+    /// The meshes of the last [render](GUI::render) and their scale, for [render_previous](GUI::render_previous).
+    previous: RefCell<Option<(Vec<egui::ClippedPrimitive>, f32)>>,
     viewport: Viewport,
     modifiers: Modifiers,
 }
@@ -46,6 +48,7 @@ impl GUI {
                 super::core_painter::CorePainter::new(context).unwrap(),
             )),
             output: RefCell::new(None),
+            previous: RefCell::new(None),
             viewport: Viewport::new_at_origo(1, 1),
             modifiers: Modifiers::default(),
         }
@@ -59,6 +62,7 @@ impl GUI {
             egui_context: egui::Context::default(),
             painter: GuiPainter::Glow(RefCell::new(Painter::new(context, "", None, true).unwrap())),
             output: RefCell::new(None),
+            previous: RefCell::new(None),
             viewport: Viewport::new_at_origo(1, 1),
             modifiers: Modifiers::default(),
         }
@@ -296,23 +300,49 @@ impl GUI {
             .expect("need to call GUI::update before GUI::render");
         let scale = self.egui_context.pixels_per_point();
         let clipped_meshes = self.egui_context.tessellate(output.shapes, scale);
+        self.paint(&clipped_meshes, scale, &output.textures_delta);
+        *self.previous.borrow_mut() = Some((clipped_meshes, scale));
+        Ok(())
+    }
+
+    ///
+    /// Render the meshes of the last [render](Self::render) again, without running egui: for a frame in which
+    /// nothing of the GUI changed (no events, no repaint requested by egui, the same viewport).
+    /// Returns `false` and draws nothing if the GUI was never rendered.
+    /// Must be called in the callback given as input to a [RenderTarget], [ColorTarget] or [DepthTarget] write method.
+    ///
+    pub fn render_previous(&self) -> Result<bool, crate::CoreError> {
+        let previous = self.previous.borrow();
+        let Some((clipped_meshes, scale)) = previous.as_ref() else {
+            return Ok(false);
+        };
+        self.paint(clipped_meshes, *scale, &egui::TexturesDelta::default());
+        Ok(true)
+    }
+
+    fn paint(
+        &self,
+        clipped_meshes: &[egui::ClippedPrimitive],
+        scale: f32,
+        textures_delta: &egui::TexturesDelta,
+    ) {
         let painter = match &self.painter {
             GuiPainter::Glow(painter) => painter,
             GuiPainter::Core(painter) => {
                 painter.borrow_mut().paint_and_update_textures(
                     self.viewport,
                     scale,
-                    &clipped_meshes,
-                    &output.textures_delta,
+                    clipped_meshes,
+                    textures_delta,
                 );
-                return Ok(());
+                return;
             }
         };
         painter.borrow_mut().paint_and_update_textures(
             [self.viewport.width, self.viewport.height],
             scale,
-            &clipped_meshes,
-            &output.textures_delta,
+            clipped_meshes,
+            textures_delta,
         );
         #[cfg(not(target_arch = "wasm32"))]
         #[allow(unsafe_code)]
@@ -320,7 +350,6 @@ impl GUI {
             use glow::HasContext as _;
             painter.borrow().gl().disable(glow::FRAMEBUFFER_SRGB);
         }
-        Ok(())
     }
 }
 

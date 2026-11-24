@@ -26,8 +26,28 @@ bindings, with Compose as the model.
 At the top stand `SidePanel`, `TopBar`, `BottomBar`, `Window` and `Area` (pinned to a corner, an edge or the center).
 Inside them: the containers `Row`, `Column`, `Grid`, `Collapsible`, `ScrollArea`, `Group` and the widgets `Text` (body,
 heading, strong, small, weak, monospace), `Separator`, `Spacer`, `Button`, `Checkbox`, `Radio`, `ComboBox`, `SliderInt`,
-`SliderFloat`, `DragValue`, `TextField`, `ProgressBar`, `Spinner`, `Notice` (info, warning, error). `setTree` refuses a
-tree with an id twice, a parent that is not there or holds no nodes, a panel inside a node, or values that do not fit.
+`SliderFloat`, `DragValue`, `TextField`, `ProgressBar`, `Spinner`, `Notice` (info, warning, error) and `Plot`. `setTree`
+refuses a tree with an id twice, a parent that is not there or holds no nodes, a panel inside a node, or values that do
+not fit.
+
+## Plots
+
+`Plot` draws diagrams with [egui_plot](https://github.com/emilk/egui_plot) (0.35, the one for egui 0.34), for benchmarks:
+frame times over time, a bar per scene. Its `series` are drawn in their order:
+
+| `SeriesKind` | What it draws |
+| --- | --- |
+| `Line(width, fill)` | the points joined by a line, `fill` shades the area down to 0 |
+| `Points(radius)` | a dot per point |
+| `Bars(width, stack)` | a bar per value; bars with the same `stack` group stand on each other (bar i on bar i) |
+| `Boxes(width)` | a box plot per five values of `y` (lower whisker, Q1, median, Q3, upper whisker) |
+| `HLine` | a dashed line across the plot at each `y`, a budget such as 16.7 ms |
+
+`x` empty counts 0, 1, 2 …; with `categories` the x axis names these places ("Cloister", "Garden") instead of numbers.
+The pointer on a series shows its values with `x_unit` and `y_unit`; the legend hides a series on a click. With
+`interactive` dragging moves the plot, Ctrl and the wheel zoom and a double click shows everything again; plots with the
+same `link` show the same part of the x axis and the pointer together. `include_x` and `include_y` are values the axes
+always show (0 for frame times). The axes count in steps of 1, 2 and 5. Plots report no events.
 
 Ids are Kotlin's and stay the same from one tree to the next (the DSL derives them from the position and a key), so that
 egui keeps focus, scroll positions and open sections.
@@ -49,7 +69,9 @@ overlay.paint(&context, &RenderTarget::screen(&context, width, height), Viewport
 
 `paint_color` paints onto a `ColorTarget` (the texture of a view that is read back), `paint_with_events` takes a window's
 three-d events as well and marks those egui uses as handled, like three-d's `GUI`.
-OpenGL/WebGL paint with egui_glow, the wgpu backend with three-d's own painter. Painting belongs to the thread that
+A frame in which nothing changed (no new tree, no input, no animation of egui, the same size) paints egui's meshes of
+the frame before again without running egui (three-d's `GUI::render_previous`), so a resting panel costs only its
+drawing. OpenGL/WebGL paint with egui_glow, the wgpu backend with three-d's own painter. Painting belongs to the thread that
 painted first; on another three-d context the overlay makes a new egui (and loses what egui remembered).
 
 The crate uses `cargo-uniffi-support` with the same tag as `three-d-raytrace-uniffi`, so that an application with both

@@ -32,4 +32,4 @@ pub use input::UiInput;
 pub use overlay::*;
 pub use state::{UiEvent, UiRect};
 pub(crate) use tree::Tree;
-pub use tree::{Anchor, NoticeLevel, Side, TextStyle, UiNode, Widget};
+pub use tree::{Anchor, NoticeLevel, PlotSeries, SeriesKind, Side, TextStyle, UiNode, Widget};
