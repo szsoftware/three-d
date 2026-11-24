@@ -295,6 +295,30 @@ pub enum Side {
     Right,
 }
 
+/// Where a [Widget::Popup] opens next to its parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum PopupSide {
+    /// Under it.
+    Below,
+    /// Over it.
+    Above,
+    /// At its left.
+    Left,
+    /// At its right.
+    Right,
+}
+
+/// Which clicks close a [Widget::Popup].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum PopupClose {
+    /// Any click, also on its nodes: a list to choose from.
+    Click,
+    /// A click beside it: a popup with settings.
+    ClickOutside,
+    /// None, only Escape and Kotlin.
+    Never,
+}
+
 /// Where a [Widget::Area] is pinned: a corner, the middle of an edge or the center of the picture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum Anchor {
@@ -524,6 +548,14 @@ pub enum Widget {
         /// A background with a border, as a popup has.
         frame: bool,
     },
+    /// A dialog in the middle over everything, the rest dimmed and blocked until it is gone (egui's `Modal`). It is
+    /// shown while it is in the tree; with `dismissible` a click beside it or Escape reports [crate::UiEvent::Closed]
+    /// and hides it until the next tree.
+    Modal {
+        /// Escape and a click on the dimmed rest close it.
+        #[uniffi(default = true)]
+        dismissible: bool,
+    },
     /// Its nodes side by side.
     Row {
         /// Goes on in a new line where the room ends (egui's `horizontal_wrapped`), as words do.
@@ -605,6 +637,40 @@ pub enum Widget {
     },
     /// Its nodes in a frame.
     Group,
+    /// A bar of [Widget::Menu]s, as at the top of an application window: a click opens one, the pointer moves on to the
+    /// next.
+    MenuBar,
+    /// A button with `text` that opens its nodes in a menu (egui's `menu_button`): buttons with a `shortcut` as items,
+    /// checkboxes, separators. Inside a menu it is a submenu that opens to the side. A click on an item closes the
+    /// menu.
+    Menu {
+        /// The text of the button.
+        text: String,
+    },
+    /// Its nodes as the menu of a right click (or a long touch) on its parent, which may be any node.
+    ContextMenu,
+    /// Its nodes in a tooltip while the pointer rests on its parent, which may be any node: a tooltip with a picture,
+    /// a value in color, several lines. Instead of [UiNode::tooltip].
+    Tooltip,
+    /// Its nodes in a popup next to its parent, which may be any node, while `open` (Compose's `DropdownMenu`). When
+    /// the user closes it (Escape, a click beside it) it reports [crate::UiEvent::Closed] and stays closed until the
+    /// next tree.
+    Popup {
+        /// Shown.
+        open: bool,
+        /// Where next to the parent, `None` below it.
+        #[uniffi(default)]
+        side: Option<PopupSide>,
+        /// Along that side at the start, in the middle or at the end, `None` at the start.
+        #[uniffi(default)]
+        align: Option<Align>,
+        /// Which clicks close it, `None` [PopupClose::ClickOutside].
+        #[uniffi(default)]
+        close: Option<PopupClose>,
+        /// Its width in points, `None` that of its nodes.
+        #[uniffi(default)]
+        width: Option<f32>,
+    },
     /// Text, in one style or in parts of their own styles.
     Text {
         /// What it says; [Widget::Text::spans] follow it.
@@ -964,10 +1030,15 @@ impl Widget {
                 | Self::CentralPanel { .. }
                 | Self::Window { .. }
                 | Self::Area { .. }
+                | Self::Modal { .. }
         )
     }
 
-    /// May have nodes inside.
+    /// Belongs to its parent, which may be any node, instead of standing inside it: menus, tooltips and popups.
+    pub(crate) fn is_attached(&self) -> bool {
+        matches!(self, Self::ContextMenu | Self::Tooltip | Self::Popup { .. })
+    }
+
     /// A widget that egui draws in a frame of its own, which starts at the height of a button and grows down: across a
     /// row it needs its height of the last pass, as a container does.
     pub(crate) fn grows_down(&self) -> bool {
@@ -977,6 +1048,7 @@ impl Widget {
         )
     }
 
+    /// May have nodes inside.
     pub(crate) fn is_container(&self) -> bool {
         self.is_root()
             || matches!(
@@ -991,7 +1063,10 @@ impl Widget {
                     | Self::Collapsible { .. }
                     | Self::ScrollArea { .. }
                     | Self::Group
+                    | Self::MenuBar
+                    | Self::Menu { .. }
             )
+            || self.is_attached()
     }
 
     fn name(&self) -> &'static str {
@@ -1002,6 +1077,12 @@ impl Widget {
             Self::CentralPanel { .. } => "CentralPanel",
             Self::Window { .. } => "Window",
             Self::Area { .. } => "Area",
+            Self::Modal { .. } => "Modal",
+            Self::MenuBar => "MenuBar",
+            Self::Menu { .. } => "Menu",
+            Self::ContextMenu => "ContextMenu",
+            Self::Tooltip => "Tooltip",
+            Self::Popup { .. } => "Popup",
             Self::Row { .. } => "Row",
             Self::Column { .. } => "Column",
             Self::Columns => "Columns",
@@ -1138,6 +1219,7 @@ impl Widget {
             Self::Shortcut { key, .. } if crate::input::key_named(key).is_none() => Some(format!(
                 "the key '{key}' is none egui knows (\"S\", \"F5\", \"Delete\", \"ArrowUp\")"
             )),
+            Self::Popup { width, .. } => negative("width", width),
             _ => None,
         }
     }
@@ -1231,6 +1313,8 @@ pub(crate) struct Tree {
     pub roots: Vec<usize>,
     /// The nodes inside each container, in the order of the list.
     pub children: HashMap<u64, Vec<usize>>,
+    /// The menus, tooltips and popups that belong to each node ([Widget::is_attached]), in the order of the list.
+    pub attached: HashMap<u64, Vec<usize>>,
     pub ids: HashSet<u64>,
 }
 
@@ -1246,6 +1330,7 @@ impl Tree {
         }
         let mut roots = Vec::new();
         let mut children: HashMap<u64, Vec<usize>> = HashMap::new();
+        let mut attached: HashMap<u64, Vec<usize>> = HashMap::new();
         for (index, node) in nodes.iter().enumerate() {
             let what = || format!("{} {}", node.widget.name(), node.id);
             if let Some(why) = node
@@ -1259,9 +1344,15 @@ impl Tree {
                 None if node.widget.is_root() || matches!(node.widget, Widget::Shortcut { .. }) => {
                     roots.push(index)
                 }
+                None if node.widget.is_attached() => {
+                    return Err(invalid(format!(
+                        "{} has no parent: it belongs to the node it opens on",
+                        what()
+                    )))
+                }
                 None => {
                     return Err(invalid(format!(
-                        "{} has no parent: only SidePanel, TopBar, BottomBar, CentralPanel, Window, Area and Shortcut stand at the top",
+                        "{} has no parent: only SidePanel, TopBar, BottomBar, CentralPanel, Window, Area, Modal and Shortcut stand at the top",
                         what()
                     )))
                 }
@@ -1277,6 +1368,33 @@ impl Tree {
                             "{} is inside {parent}, which is not in the tree",
                             what()
                         )))
+                    }
+                    Some(p) if node.widget.is_attached() => {
+                        let kind = std::mem::discriminant(&node.widget);
+                        let mine = attached.entry(parent).or_default();
+                        if p.is_attached() || matches!(p, Widget::Shortcut { .. } | Widget::Modal { .. }) {
+                            return Err(invalid(format!(
+                                "{} belongs to {} {parent}, which cannot open it",
+                                what(),
+                                p.name()
+                            )));
+                        }
+                        let popup = matches!(node.widget, Widget::Popup { .. });
+                        if !popup && mine.iter().any(|&i| std::mem::discriminant(&nodes[i].widget) == kind) {
+                            return Err(invalid(format!(
+                                "{} is the second {} of {parent}: a node has one",
+                                what(),
+                                node.widget.name()
+                            )));
+                        }
+                        let text = nodes.iter().find(|n| n.id == parent).and_then(|n| n.tooltip.as_ref());
+                        if matches!(node.widget, Widget::Tooltip) && text.is_some() {
+                            return Err(invalid(format!(
+                                "{} belongs to {parent}, which has a tooltip text as well: one of them",
+                                what()
+                            )));
+                        }
+                        mine.push(index);
                     }
                     Some(p) if !p.is_container() => {
                         return Err(invalid(format!(
@@ -1294,9 +1412,14 @@ impl Tree {
         let mut stack: Vec<usize> = roots.clone();
         while let Some(index) = stack.pop() {
             reached += 1;
-            if let Some(inside) = children.get(&nodes[index].id) {
-                stack.extend(inside);
-            }
+            let id = nodes[index].id;
+            stack.extend(
+                children
+                    .get(&id)
+                    .into_iter()
+                    .chain(attached.get(&id))
+                    .flatten(),
+            );
         }
         if reached != nodes.len() {
             return Err(invalid(format!(
@@ -1332,6 +1455,7 @@ impl Tree {
             nodes,
             roots,
             children,
+            attached,
         })
     }
 
