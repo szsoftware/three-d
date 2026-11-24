@@ -23,6 +23,7 @@ mod error;
 mod input;
 mod output;
 mod overlay;
+mod pictures;
 mod state;
 #[cfg(test)]
 mod tests;
@@ -32,11 +33,12 @@ pub use error::*;
 pub use input::UiInput;
 pub use output::{UiCursor, UiLink, UiOutput, UiTextInput};
 pub use overlay::*;
-pub use state::{UiEvent, UiRect};
+pub use state::{UiEvent, UiPoint, UiRect};
 pub(crate) use tree::Tree;
 pub use tree::{
-    Align, Anchor, Arrangement, ColumnWidth, NoticeLevel, PlotSeries, PopupClose, PopupSide,
-    ScrollDirection, SeriesKind, Side, SliderClamping, SliderHandle, StripSize, TableColumn,
-    TableSelection, TableSort, TextSpan, TextStyle, TextWrap, UiDate, UiInsets, UiModifier, UiNode,
-    UiShadow, UiStroke, Widget,
+    Align, Anchor, Arrangement, CanvasShape, CanvasStroke, ColumnWidth, ImageFit, NoticeLevel,
+    PlotLineStyle, PlotSeries, PointShape, PopupClose, PopupSide, ScrollDirection, SeriesKind,
+    Side, SliderClamping, SliderHandle, StripSize, TableColumn, TableSelection, TableSort,
+    TextSpan, TextStyle, TextWrap, UiDate, UiInsets, UiModifier, UiNode, UiShadow, UiStroke,
+    Widget,
 };

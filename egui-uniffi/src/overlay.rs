@@ -166,6 +166,68 @@ impl EguiOverlay {
         }
     }
 
+    /// An image for [crate::Widget::Image] and the other nodes that name `key`: the bytes of a PNG, JPEG, GIF, WebP or
+    /// SVG file, which egui_extras decodes when it is first drawn (natively on a thread of its own, a spinner shows
+    /// until then). Replaces what `key` had. Kotlin sends an image once, the tree only names it.
+    pub fn set_image(&self, key: String, bytes: Vec<u8>) -> Result<(), UiError> {
+        lock(&self.shared).ui.set_image(key, bytes)
+    }
+
+    /// An image from pixels: `width` × `height` colors of four bytes each (red, green, blue, alpha, not premultiplied),
+    /// row by row from the top; a preview of the 3D view, for example. Replaces what `key` had.
+    pub fn set_image_rgba(
+        &self,
+        key: String,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    ) -> Result<(), UiError> {
+        lock(&self.shared)
+            .ui
+            .set_image_rgba(key, width, height, rgba)
+    }
+
+    /// Forgets the image of `key`; nodes that still name it show nothing.
+    pub fn remove_image(&self, key: String) {
+        let mut shared = lock(&self.shared);
+        if let Some(old) = shared.ui.images.remove(&key) {
+            shared.ui.forget_image(old);
+            shared.ui.dirty = true;
+        }
+    }
+
+    /// Shapes for every [crate::Widget::Canvas] whose `data` is `key`, drawn under its own shapes: many shapes that
+    /// seldom change (a floor plan) go once, not with every tree. Replaces what `key` had.
+    pub fn set_canvas_shapes(
+        &self,
+        key: String,
+        shapes: Vec<crate::CanvasShape>,
+    ) -> Result<(), UiError> {
+        if let Some((i, why)) = shapes
+            .iter()
+            .enumerate()
+            .find_map(|(i, s)| s.check().map(|why| (i, why)))
+        {
+            return Err(UiError::InvalidData {
+                why: format!("shape {i} of '{key}': {why}"),
+            });
+        }
+        let mut shared = lock(&self.shared);
+        if shared.ui.shapes.get(&key) != Some(&shapes) {
+            shared.ui.shapes.insert(key, shapes);
+            shared.ui.dirty = true;
+        }
+        Ok(())
+    }
+
+    /// Forgets the shapes of `key`.
+    pub fn remove_canvas_shapes(&self, key: String) {
+        let mut shared = lock(&self.shared);
+        if shared.ui.shapes.remove(&key).is_some() {
+            shared.ui.dirty = true;
+        }
+    }
+
     /// Hands an event to egui with the next frame. `true` if egui uses it: then the application leaves it alone (does
     /// not turn the camera, for example).
     pub fn input(&self, event: UiInput) -> bool {
@@ -241,12 +303,16 @@ impl EguiOverlay {
     pub fn bounds(&self, id: u64) -> Option<UiRect> {
         let shared = lock(&self.shared);
         let s = shared.pixels_per_point;
-        shared.ui.bounds.get(&id).map(|r| UiRect {
-            x: r.x * s,
-            y: r.y * s,
-            width: r.width * s,
-            height: r.height * s,
-        })
+        let ui = &shared.ui;
+        ui.screen_bounds
+            .get(&id)
+            .or_else(|| ui.bounds.get(&id))
+            .map(|r| UiRect {
+                x: r.x * s,
+                y: r.y * s,
+                width: r.width * s,
+                height: r.height * s,
+            })
     }
 }
 

@@ -12,12 +12,15 @@ publish = false
 crate-type = ["lib", "cdylib"]
 
 [features]
-default = ["wgpu"]
+default = ["wgpu", "images"]
 # Draws on contexts of three-d's wgpu backend too (with three-d's core painter); OpenGL/WebGL always works
 wgpu = ["three-d/wgpu"]
 # Colors code of every language syntect knows in Widget::TextField (C#, Java, JavaScript, SQL, …); without it egui_extras
 # colors Rust, TOML, Python, C and C++. It makes the library about 1 MB larger.
 syntect = ["egui_extras/syntect"]
+# Widget::Image and the other images from the bytes of PNG, JPEG, GIF and WebP files (moving ones too) and SVG (sharp
+# at any size), decoded by egui_extras' loaders; without it only images from pixels (set_image_rgba)
+images = ["egui_extras/image", "egui_extras/gif", "egui_extras/webp", "egui_extras/svg", "dep:image"]
 
 [dependencies]
 uniffi = "0.32"
@@ -29,6 +32,8 @@ web-time = "1"
 egui_plot = { version = "0.35", default-features = false }
 # The calendar of Widget::DatePicker and the colors of code in Widget::TextField; 0.34 as egui
 egui_extras = { version = "0.34", default-features = false, features = ["datepicker"] }
+# PNG and JPEG for egui_extras' image loader (which takes the image crate without formats)
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
 # The days of Widget::DatePicker, as egui_extras has them
 jiff = { version = "0.2.23", default-features = false, features = ["std"] }
 
